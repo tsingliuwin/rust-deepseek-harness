@@ -1729,6 +1729,8 @@ impl AppView {
                             if let Some(MsgBlock::Tool(tool)) =
                                 v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
                             {
+                                // web 行为：点击工具行在下方原地展开/收起 IO 卡，
+                                // 不强制打开右侧详情面板
                                 tool.open = !tool.open;
                                 v.selected_tool = Some(ToolDetail {
                                     name: tool.name.clone(),
@@ -1736,7 +1738,6 @@ impl AppView {
                                     result: tool.result.clone(),
                                     error: tool.error,
                                 });
-                                v.details_open = true;
                             }
                             cx.notify();
                         });

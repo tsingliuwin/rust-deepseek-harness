@@ -361,7 +361,8 @@ pub(crate) fn first_line(text: &str) -> String {
     line.chars().take(120).collect()
 }
 
-/// 当前目录名，hero 工作区行用。
+/// 当前目录名（hero 已换「选择工作区」chip，保留备用）。
+#[allow(dead_code)]
 pub(crate) fn workspace_name() -> String {
     std::env::current_dir()
         .ok()

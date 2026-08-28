@@ -243,6 +243,94 @@ pub(crate) const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
     ProviderCatalogEntry { id: "zai", name: "ZAI", base_url: "", model: "" },
 ];
 
+/// 工作区（web workspace.json 的 tables.workspaces 行）。
+#[derive(Clone)]
+pub(crate) struct WorkspaceInfo {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) path: String,
+    pub(crate) session_ids: Vec<String>,
+}
+
+/// 读写 ~/.dsh/storages/workspace.json（与 web 共享同一份文档）。
+/// 只动 `workspaceIds`（顺序）与 `tables.workspaces`，其余原样。
+pub(crate) fn load_workspaces() -> Vec<WorkspaceInfo> {
+    let path = dsh_home().join("storages").join("workspace.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
+    let order: Vec<String> = doc
+        .get("global")
+        .and_then(|g| g.get("workspaceIds"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let tables = doc.get("tables").and_then(|tt| tt.get("workspaces"));
+    let mut out = Vec::new();
+    for id in &order {
+        if let Some(row) = tables.and_then(|w| w.get(id)) {
+            out.push(WorkspaceInfo {
+                id: id.clone(),
+                title: row.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                path: row.get("path").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                session_ids: row
+                    .get("sessionIds")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    out
+}
+
+/// 把内存工作区树写回 workspace.json（保留其它字段）。
+pub(crate) fn save_workspaces(workspaces: &[WorkspaceInfo]) {
+    let dir = dsh_home().join("storages");
+    let path = dir.join("workspace.json");
+    let _ = std::fs::create_dir_all(&dir);
+    let mut doc: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({
+            "unit": { "name": "workspace", "version": 2 },
+            "global": { "initialized": true, "workspaceIds": [], "archivedSessionIds": [] },
+            "tables": { "workspaces": {} },
+        }));
+    let ids: Vec<serde_json::Value> = workspaces
+        .iter()
+        .map(|w| serde_json::Value::String(w.id.clone()))
+        .collect();
+    if let Some(g) = doc.get_mut("global") {
+        g.as_object_mut().map(|o| {
+            o.insert("workspaceIds".into(), serde_json::Value::Array(ids));
+        });
+    }
+    let mut table = serde_json::Map::new();
+    for w in workspaces {
+        table.insert(
+            w.id.clone(),
+            serde_json::json!({
+                "path": w.path,
+                "title": w.title,
+                "sessionIds": w.session_ids,
+            }),
+        );
+    }
+    if let Some(tt) = doc.get_mut("tables") {
+        tt.as_object_mut().map(|o| {
+            o.insert("workspaces".into(), serde_json::Value::Object(table));
+        });
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// 新建会话 id 对齐 web 会话 id 形态（session-<uuid>）。
+pub(crate) fn new_web_session_id() -> dsh_llm::SessionId {
+    dsh_llm::SessionId::new(format!("session-{}", uuid::Uuid::new_v4()))
+}
+
 /// Harness home（对齐 dsh home-paths）：`$DSH_HOME` 优先（空白视为未设），
 /// 否则 `~/.dsh`。所有用户数据在这一个根下。
 pub(crate) fn dsh_home() -> std::path::PathBuf {
@@ -686,6 +774,19 @@ struct AppView {
     recorder: Arc<SessionRecorder>,
     llm: Arc<LlmRuntime>,
     sessions: Vec<SessionMeta>,
+    /// 工作区列表（与 web 共享 storages/workspace.json）
+    workspaces: Vec<WorkspaceInfo>,
+    /// 折叠的工作区 id 集合（默认全部展开）
+    collapsed_workspaces: std::collections::HashSet<String>,
+    /// 当前工作区（hero「选择工作区」；新建会话归属）
+    current_workspace: Option<String>,
+    /// 侧栏弹出的行菜单（会话 … / 工作区 … 均用 Option<MenuTarget>）
+    sidebar_menu: Option<(String, String, f32)>,
+    /// 工作区重命名中的目标 id（弹出小对话框）
+    renaming_workspace: Option<String>,
+    /// hero「选择工作区」菜单开合
+    hero_ws_menu: bool,
+    rename_input: Entity<InputState>,
     entries: Vec<ChatEntry>,
     input: Entity<InputState>,
     #[allow(dead_code)] // 被 DeepSeek 卡引用
@@ -763,6 +864,8 @@ impl AppView {
         llm_configured: bool,
         env_key_locked: bool,
         deepseek_key: String,
+        workspaces: Vec<WorkspaceInfo>,
+        rename_input: Entity<InputState>,
         adopt_key: Entity<InputState>,
         adopt_base: Entity<InputState>,
         dc_route: Entity<InputState>,
@@ -802,6 +905,13 @@ impl AppView {
             llm_configured,
             env_key_locked,
             deepseek_key,
+            workspaces,
+            collapsed_workspaces: Default::default(),
+            current_workspace: None,
+            sidebar_menu: None,
+            renaming_workspace: None,
+            hero_ws_menu: false,
+            rename_input,
             adding: AddingMode::None,
             adopt_pick: 0,
             adopt_dropdown_open: false,
@@ -854,6 +964,84 @@ impl AppView {
             });
         }
         view
+    }
+
+    /// 会话属于哪个工作区（预留：后续会话移动用）。
+    #[allow(dead_code)]
+    fn workspace_of_session(&self, id: &SessionId) -> Option<&WorkspaceInfo> {
+        self.workspaces
+            .iter()
+            .find(|w| w.session_ids.iter().any(|s| s == id.as_str()))
+    }
+
+    /// 新建会话的 id（web 形态）+ 归属当前工作区。
+    fn alloc_session_id(&self) -> SessionId {
+        new_web_session_id()
+    }
+
+    /// 把会话归入工作区并落盘。
+    fn assign_session_to_workspace(&mut self, sid: &SessionId, ws_id: Option<&str>) {
+        for w in self.workspaces.iter_mut() {
+            w.session_ids.retain(|s| s != sid.as_str());
+        }
+        if let Some(ws_id) = ws_id
+            && let Some(w) = self.workspaces.iter_mut().find(|w| w.id == ws_id)
+        {
+            w.session_ids.insert(0, sid.as_str().to_string());
+        }
+        save_workspaces(&self.workspaces);
+    }
+
+    /// 添加工作区（web 添加工作区的 pick → adopt 路由）。
+    fn create_workspace(&mut self, path: String, cx: &mut Context<Self>) {
+        let title = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| path.clone());
+        let id = uuid::Uuid::new_v4().to_string();
+        self.workspaces.push(WorkspaceInfo {
+            id: id.clone(),
+            title,
+            path,
+            session_ids: Vec::new(),
+        });
+        self.current_workspace = Some(id);
+        save_workspaces(&self.workspaces);
+        cx.notify();
+    }
+
+    /// 工作区重命名。
+    fn rename_workspace(&mut self, id: &str, title: String) {
+        if let Some(w) = self.workspaces.iter_mut().find(|w| w.id == id) {
+            w.title = title;
+        }
+        self.renaming_workspace = None;
+        save_workspaces(&self.workspaces);
+    }
+
+    /// 删除工作区（会话归未分组，web 同语义）。
+    fn delete_workspace(&mut self, id: &str) {
+        self.workspaces.retain(|w| w.id != id);
+        if self.current_workspace.as_deref() == Some(id) {
+            self.current_workspace = None;
+        }
+        save_workspaces(&self.workspaces);
+    }
+
+    /// 删除会话：清 JSONL + 列表 + 工作区归属。
+    fn delete_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        let _ = self.recorder.delete(id);
+        self.sessions.retain(|s| &s.id != id);
+        for w in self.workspaces.iter_mut() {
+            w.session_ids.retain(|s| s != id.as_str());
+        }
+        save_workspaces(&self.workspaces);
+        if self.current_session_id() == *id {
+            // 当前会话被删：建一个新的空会话
+            self.new_session(cx);
+        }
+        cx.notify();
     }
 
     /// Rebuild the transcript from the agent's session log (restore/switch).
@@ -948,7 +1136,8 @@ impl AppView {
 
     /// Create a fresh session and make it current.
     fn new_session(&mut self, cx: &mut Context<Self>) {
-        let id = SessionId::new(uuid::Uuid::new_v4().to_string());
+        let id = self.alloc_session_id();
+        let ws = self.current_workspace.clone();
         self.agent.set_session(Session::new(id.clone()));
         self.entries.clear();
         self.running = false;
@@ -957,6 +1146,7 @@ impl AppView {
         self.stats_turns = 0;
         self.stats_tools = 0;
         self.tab = CenterTab::Conversation;
+        self.assign_session_to_workspace(&id, ws.as_deref());
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into() });
         cx.notify();
     }
@@ -1816,6 +2006,55 @@ impl Render for AppView {
             root = root.child(drag_handle(DragSide::Details));
             root = root.child(self.render_details(dw, this.clone()));
         }
+        if let Some(ws_id) = self.renaming_workspace.clone() {
+            let _settings_this = this.clone();
+            let this2 = this.clone();
+            let t_cancel = this2.clone();
+            let t_save = this2.clone();
+            let id = ws_id.clone();
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .top_0()
+                    .left_0()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.3))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(360.0))
+                            .v_flex()
+                            .gap_3()
+                            .p_4()
+                            .rounded(px(16.0))
+                            .bg(theme::t().surface)
+                            .border_1()
+                            .border_color(theme::t().border_l2)
+                            .shadow_lg()
+                            .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).font_weight(FontWeight::MEDIUM).text_color(theme::t().text).child("重命名工作区"))
+                            .child(Input::new(&self.rename_input).w_full())
+                            .child(
+                                div().flex().justify_end().gap_2()
+                                    .child({
+                                        let t = t_cancel.clone();
+                                        action_btn_lite("ws-rename-cancel", "取消", false, move |_, _, cx| {
+                                            t.update(cx, |v, cx| { v.renaming_workspace = None; cx.notify(); });
+                                        })
+                                    })
+                                    .child(action_btn_lite("ws-rename-save", "保存", true, move |_, window, cx| {
+                                        let title = t_save.read_with(cx, |v, _| v.rename_input.read_with(cx, |s, _| s.value().trim().to_string()));
+                                        t_save.update(cx, |v, cx| {
+                                            v.rename_workspace(&id, title.clone());
+                                            v.rename_input.update(cx, |s, cx| s.set_value("", window, cx));
+                                            cx.notify();
+                                        });
+                                    })),
+                            ),
+                    ),
+            );
+        }
         if self.settings_open {
             root = root.child(settings::render_settings(self, this, window, cx));
         }
@@ -1882,20 +2121,157 @@ impl AppView {
             let t_new = this.clone();
             let t_settings = this.clone();
             let current_id = self.current_session_id();
-            let session_rows: Vec<Stateful<Div>> = self
-                .sessions
+            // 分组构建：每个工作区 = 34px 行（folder/title/折叠 chevron/
+            //   hover +/…）+ 展开时的会话行；未分组会话排末尾。
+            let t_pick = this.clone();
+            let mut all_rows: Vec<AnyElement> = Vec::new();
+            let mut row_index = 0usize;
+            for w in &self.workspaces {
+                let wid = w.id.clone();
+                let wtitle = w.title.clone();
+                let wid3 = wid.clone();
+                let wcollapsed = self.collapsed_workspaces.contains(&wid);
+                // --- 工作区行 ---
+                {
+                    let t_toggle = this.clone();
+                    let t_plus = this.clone();
+                    let t_more = this.clone();
+                    let group: SharedString = format!("ws-{wid}").into();
+                    let g2 = group.clone();
+                    let _g3 = group.clone();
+                    all_rows.push(
+                        div()
+                            .id(SharedString::from(format!("ws-row-{wid}")))
+                            .group(group)
+                            .h(px(34.0))
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_2()
+                            .rounded(px(8.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::t().hover))
+                            .on_click(move |_, _, cx| {
+                                let id = wid3.clone();
+                                t_toggle.update(cx, |v, cx| {
+                                    if !v.collapsed_workspaces.remove(&id) {
+                                        v.collapsed_workspaces.insert(id);
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .child(Icon::new(IconName::Folder).size(px(16.0)).text_color(theme::t().accent))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(theme::FONT_ROW))
+                                    .line_height(px(20.0))
+                                    .text_color(theme::t().text)
+                                    .child(wtitle.clone()),
+                            )
+                            .child(
+                                // hover 出的操作（/…）
+                                div()
+                                    .id(SharedString::from(format!("ws-actions-{wid}")))
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .opacity(0.0)
+                                    .group_hover(g2, |s| s.opacity(1.0))
+                                    .child({
+                                        let w = wid.clone();
+                                        let mut b = div()
+                                            .id(SharedString::from(format!("ws-plus-{w}")))
+                                            .size(px(16.0))
+                                            .rounded(px(4.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(theme::t().active))
+                                            .on_click(move |_, _, cx| {
+                                                let id = w.clone();
+                                                t_plus.update(cx, |v, cx| {
+                                                    v.current_workspace = Some(id.clone());
+                                                    if v.collapsed_workspaces.remove(&id) {}
+                                                    v.new_session(cx);
+                                                });
+                                            });
+                                        b = b.child(Icon::new(IconName::Plus).size(px(12.0)).text_color(theme::t().text_2));
+                                        b
+                                    })
+                                    .child({
+                                        let w = wid.clone();
+                                        let y = (row_index as f32) * 37.0 + 130.0;
+                                        div()
+                                            .id(SharedString::from(format!("ws-more-{w}")))
+                                            .size(px(16.0))
+                                            .rounded(px(4.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(theme::t().active))
+                                            .on_click(move |_, _, cx| {
+                                                let w = w.clone();
+                                                t_more.update(cx, |v, cx| {
+                                                    v.sidebar_menu = Some(("ws".into(), w, y));
+                                                    cx.notify();
+                                                });
+                                            })
+                                            .child(Icon::new(IconName::Ellipsis).size(px(12.0)).text_color(theme::t().text_2))
+                                    }),
+                            )
+                            .child(Icon::new(if wcollapsed { IconName::ChevronRight } else { IconName::ChevronDown })
+                                .size(px(12.0))
+                                .text_color(theme::t().caption))
+                            .into_any_element(),
+                    );
+                    row_index += 1;
+                }
+                // --- 该组会话行 ---
+                if !wcollapsed {
+                    for sid in &w.session_ids {
+                        if let Some(meta) = self.sessions.iter().find(|m| m.id.as_str() == sid) {
+                            let t_sw = this.clone();
+                            let id = meta.id.clone();
+                            let active = meta.id == current_id;
+                            all_rows.push(
+                                session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                                    let id = id.clone();
+                                    t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
+                                })
+                                .into_any_element(),
+                            );
+                            row_index += 1;
+                        }
+                    }
+                }
+            }
+            // 未分组会话
+            let grouped: std::collections::HashSet<&str> = self
+                .workspaces
                 .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let t = this.clone();
-                    let id = s.id.clone();
-                    let active = s.id == current_id;
-                    session_row(i, s.title.clone(), s.time_label.clone(), active, move |_, _, cx| {
-                        let id = id.clone();
-                        t.update(cx, |v, cx| { v.switch_session(id, cx); });
-                    })
-                })
+                .flat_map(|w| w.session_ids.iter().map(|s| s.as_str()))
                 .collect();
+            for meta in self.sessions.iter().filter(|m| !grouped.contains(m.id.as_str())) {
+                let t_sw = this.clone();
+                let id = meta.id.clone();
+                let active = meta.id == current_id;
+                all_rows.push(
+                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                        let id = id.clone();
+                        t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
+                    })
+                    .into_any_element(),
+                );
+                row_index += 1;
+            }
+            let _ = t_pick.clone();
             col = col
                 .v_flex()
                 .px_3()
@@ -1992,33 +2368,20 @@ impl AppView {
                         )
                         .child(icon_btn("sb-search", IconName::Search, theme::t().text_2, "搜索会话", |_, _, _| {}))
                         .child(icon_btn("sb-view", IconName::Ellipsis, theme::t().text_2, "视图选项", |_, _, _| {}))
-                        .child(icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", |_, _, _| {})),
-                )
-                .child(
-                    // 工作区行（folder + 名称 + 展开指示）
-                    div()
-                        .h(px(34.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .px_2()
-                        .rounded(px(8.0))
-                        .child(
-                            Icon::new(IconName::Folder)
-                                .size(px(16.0))
-                                .text_color(theme::t().accent),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(theme::FONT_ROW))
-                                .line_height(px(20.0))
-                                .text_color(theme::t().text)
-                                .child("DSH"),
-                        )
-                        .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption)),
+                        .child({
+                            let t_add_ws = this.clone();
+                            icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, _, cx| {
+                                t_add_ws.update(cx, |v, cx| {
+                                    // web 添加工作区唯一路径：选一个主机目录
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        let p = path.to_string_lossy().to_string();
+                                        if !v.workspaces.iter().any(|w| w.path == p) {
+                                            v.create_workspace(p, cx);
+                                        }
+                                    }
+                                });
+                            })
+                        }),
                 )
                 .child(
                     // 会话列表 + 底部渐隐（web .fade）
@@ -2033,7 +2396,7 @@ impl AppView {
                                 .overflow_y_scroll()
                                 .v_flex()
                                 .gap_0p5()
-                                .children(session_rows),
+                                .children(all_rows),
                         )
                         .child(
                             // 底部渐隐（web .fade）：起点必须是与 sidebar_bg 同
@@ -2058,6 +2421,60 @@ impl AppView {
                                 )),
                         ),
                 )
+                .when_some(self.sidebar_menu.clone(), |col, (kind, target, y)| {
+                    col.child(
+                        div()
+                            .id("sb-menu")
+                            .absolute()
+                            .top(px(y))
+                            .left(px(8.0))
+                            .right(px(8.0))
+                            .v_flex()
+                            .p(px(4.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme::t().border_l2)
+                            .bg(theme::t().surface)
+                            .shadow_lg()
+                            .children(if kind == "ws" {
+                                let t1 = this.clone();
+                                let t2 = this.clone();
+                                let id1 = target.clone();
+                                let id2 = target.clone();
+                                vec![
+                                    sb_menu_row("ws-rename", "重命名", false, move |_, _, cx| {
+                                        let id = id1.clone();
+                                        t1.update(cx, |v, cx| {
+                                            v.sidebar_menu = None;
+                                            v.renaming_workspace = Some(id);
+                                            cx.notify();
+                                        });
+                                    }).into_any_element(),
+                                    sb_menu_row("ws-delete", "删除工作区", true, move |_, _, cx| {
+                                        let id = id2.clone();
+                                        t2.update(cx, |v, cx| {
+                                            v.sidebar_menu = None;
+                                            v.delete_workspace(&id);
+                                            cx.notify();
+                                        });
+                                    }).into_any_element(),
+                                ]
+                            } else {
+                                let t1 = this.clone();
+                                let id1 = target.clone();
+                                vec![
+                                    sb_menu_row("sess-del", "删除会话", true, move |_, _, cx| {
+                                        let id = id1.clone();
+                                        t1.update(cx, |v, cx| {
+                                            v.sidebar_menu = None;
+                                            let sid = dsh_llm::SessionId::new(id);
+                                            v.delete_session(&sid, cx);
+                                        });
+                                    }).into_any_element(),
+                                ]
+                            }),
+                    )
+                })
                 .child(
                     // 底部设置
                     div()
@@ -2402,22 +2819,118 @@ impl AppView {
                         ),
                     )
                     .child(
-                        // 工作区行：folder + 目录名 + chevron + 标准模式 chip（web hero 同排）
+                        // 工作区行：「选择工作区」chip（web WorkspacePicker 锚）
                         div()
+                            .relative()
                             .flex()
                             .items_center()
                             .pl(px(20.0))
                             .gap_1()
-                            .child(Icon::new(IconName::FolderClosed).size(px(14.0)).text_color(theme::t().text))
-                            .child(
+                            .child({
+                                let t = this.clone();
+                                let label = self
+                                    .current_workspace
+                                    .as_ref()
+                                    .and_then(|id| self.workspaces.iter().find(|w| &w.id == id))
+                                    .map(|w| w.title.clone())
+                                    .unwrap_or_else(|| "选择工作区".into());
                                 div()
-                                    .text_size(px(theme::FONT_TAB))
-                                    .line_height(px(theme::FONT_ROW_LEADING))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::t().text)
-                                    .child(workspace_name()),
-                            )
-                            .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption))
+                                    .id("hero-ws-pick")
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .h(px(28.0))
+                                    .rounded(px(14.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::t().hover))
+                                    .on_click(move |_, _, cx| {
+                                        t.update(cx, |v, cx| { v.hero_ws_menu = !v.hero_ws_menu; cx.notify(); });
+                                    })
+                                    .child(Icon::new(IconName::FolderClosed).size(px(14.0)).text_color(theme::t().text))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_TAB))
+                                            .line_height(px(theme::FONT_ROW_LEADING))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme::t().text)
+                                            .child(label),
+                                    )
+                                    .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption))
+                            })
+                            .when(self.hero_ws_menu, |row| {
+                                let mut menu = div()
+                                    .id("hero-ws-menu")
+                                    .absolute()
+                                    .top(px(32.0))
+                                    .left(px(20.0))
+                                    .w(px(220.0))
+                                    .v_flex()
+                                    .p(px(4.0))
+                                    .rounded(px(8.0))
+                                    .border_1()
+                                    .border_color(theme::t().border_l2)
+                                    .bg(theme::t().surface)
+                                    .shadow_lg();
+                                for w in &self.workspaces {
+                                    let t = this.clone();
+                                    let id = w.id.clone();
+                                    let title = w.title.clone();
+                                    let selected = self.current_workspace.as_deref() == Some(id.as_str());
+                                    menu = menu.child(
+                                        div()
+                                            .id(SharedString::from(format!("hero-ws-{id}")))
+                                            .h(px(32.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px(px(10.0))
+                                            .rounded(px(6.0))
+                                            .cursor_pointer()
+                                            .map(|d| if selected { d.bg(theme::t().hover) } else { d })
+                                            .when(!selected, |d| d.hover(|s| s.bg(theme::t().hover)))
+                                            .on_click(move |_, _, cx| {
+                                                let id = id.clone();
+                                                t.update(cx, |v, cx| {
+                                                    v.current_workspace = Some(id);
+                                                    v.hero_ws_menu = false;
+                                                    cx.notify();
+                                                });
+                                            })
+                                            .child(Icon::new(IconName::FolderClosed).size(px(14.0)).text_color(theme::t().text_2))
+                                            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child(title)),
+                                    );
+                                }
+                                let t_add = this.clone();
+                                menu = menu
+                                    .child(div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2))
+                                    .child(
+                                        div()
+                                            .id("hero-ws-add")
+                                            .h(px(32.0))
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px(px(10.0))
+                                            .rounded(px(6.0))
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(theme::t().hover))
+                                            .on_click(move |_, _, cx| {
+                                                t_add.update(cx, |v, cx| {
+                                                    v.hero_ws_menu = false;
+                                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                        let p = path.to_string_lossy().to_string();
+                                                        if !v.workspaces.iter().any(|w| w.path == p) {
+                                                            v.create_workspace(p, cx);
+                                                        }
+                                                    }
+                                                });
+                                            })
+                                            .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
+                                            .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),
+                                    );
+                                row.child(menu)
+                            })
                             .child(
                                 div()
                                     .id("hero-mode")
@@ -2707,6 +3220,57 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
 }
 
 
+/// 行菜单条目（web Menu entry：h32、hover 浅底、危险项红色）。
+/// 简易胶囊按钮（重命名对话框用）。
+fn action_btn_lite(
+    id: &'static str,
+    label: &'static str,
+    primary: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(32.0))
+        .px(px(14.0))
+        .flex()
+        .items_center()
+        .rounded(px(16.0))
+        .map(|d| {
+            if primary {
+                d.bg(theme::t().accent).text_color(gpui::white()).hover(|s| s.bg(theme::t().accent_hover))
+            } else {
+                d.border_1().border_color(theme::t().border_l2).text_color(theme::t().text).hover(|s| s.bg(theme::t().hover))
+            }
+        })
+        .text_size(px(theme::FONT_ROW))
+        .line_height(px(22.0))
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(label)
+}
+
+fn sb_menu_row(
+    id: &'static str,
+    label: &'static str,
+    danger: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(32.0))
+        .flex()
+        .items_center()
+        .px(px(10.0))
+        .rounded(px(6.0))
+        .text_size(px(theme::FONT_ROW))
+        .line_height(px(22.0))
+        .text_color(if danger { theme::t().error } else { theme::t().text })
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::t().hover))
+        .on_click(on_click)
+        .child(label)
+}
+
 fn attach_tool_result(
     last: Option<&mut ChatEntry>,
     call_id: &str,
@@ -2826,6 +3390,10 @@ fn main() {
         AppearanceMode::System => gpui_component::ThemeMode::Dark, // 实际值由首帧 render 按窗口外观校正
     };
 
+    // 工作区（与 web 共享 storages/workspace.json，进入窗口闭包用）
+    let startup_workspaces = load_workspaces();
+    let _ = &stored_deepseek_key;
+
     // 注册用户声明的自定义提供方（OpenAI 兼容，复用 DeepSeek adapter）
     for p in &user_settings.providers {
         if !p.base_url.is_empty() {
@@ -2898,6 +3466,9 @@ fn main() {
                 let api_input = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).masked(true).placeholder("输入 API 密钥，或留空使用环境认证")
                 });
+                let rename_input = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("工作区名称")
+                });
                 let adopt_key = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).masked(true).placeholder("输入 API 密钥，或留空使用环境认证")
                 });
@@ -2941,6 +3512,8 @@ fn main() {
                         provider == "deepseek" || !stored_deepseek_key.is_empty() || !user_settings.providers.is_empty(),
                         deepseek_env_locked,
                         stored_deepseek_key.clone(),
+                        startup_workspaces.clone(),
+                        rename_input.clone(),
                         adopt_key.clone(),
                         adopt_base.clone(),
                         dc_route.clone(),

@@ -71,4 +71,9 @@ impl SessionRecorder {
         metas.sort_by(|a, b| b.0.cmp(&a.0));
         Ok(metas.into_iter().map(|(_, id)| SessionId::new(id)).collect())
     }
+
+    /// Remove a session's JSONL log (web 会话删除)。
+    pub fn delete(&self, id: &SessionId) -> io::Result<()> {
+        fs::remove_file(self.path_for(id))
+    }
 }

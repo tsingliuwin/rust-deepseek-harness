@@ -288,6 +288,8 @@ struct AppView {
     editing_provider: Option<String>,
     /// 待删除确认（web deleteDialog：删除前弹确认）。
     confirm_delete: Option<String>,
+    /// 「创建提供方」的失败原因（web 卡内 error 行）。
+    declare_error: Option<String>,
     // adopt 卡输入
     adopt_key: Entity<InputState>,
     adopt_base: Entity<InputState>,
@@ -378,6 +380,7 @@ impl AppView {
             edit_customized_open: false,
             editing_provider: None,
             confirm_delete: None,
+            declare_error: None,
             adopt_key,
             adopt_base,
             dc_models: Vec::new(),

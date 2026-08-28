@@ -1156,6 +1156,15 @@ fn declare_card(app: &AppView, this: &Entity<AppView>, cx: &App) -> Div {
                 )
                 .children(needs_hint.map(hint)),
         )
+        .when_some(app.declare_error.clone(), |d, e| {
+            d.child(
+                div()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .line_height(px(theme::FONT_CAPTION_LEADING))
+                    .text_color(tk.error)
+                    .child(e),
+            )
+        })
         .child(
             div()
                 .flex()
@@ -1177,15 +1186,21 @@ fn declare_card(app: &AppView, this: &Entity<AppView>, cx: &App) -> Div {
                 }))
                 .child(action_button("declare-create", "创建提供方", true, move |_, window, cx| {
                     let outcome = t_create.update(cx, |v, cx| {
-                        let r = v.declare_provider(cx);
-                        if r.is_ok() {
-                            v.adding = AddingMode::None;
-                            v.dc_models.clear();
+                        match v.declare_provider(cx) {
+                            Ok(()) => {
+                                v.adding = AddingMode::None;
+                                v.dc_models.clear();
+                                v.declare_error = None;
+                                true
+                            }
+                            Err(e) => {
+                                v.declare_error = Some(e);
+                                false
+                            }
                         }
-                        cx.notify();
-                        r
                     });
-                    if outcome.is_ok() {
+                    t_create.update(cx, |_, cx| cx.notify());
+                    if outcome {
                         let ents = t_create.read_with(cx, |v, _| {
                             (v.dc_route.clone(), v.dc_name.clone(), v.dc_base.clone(), v.dc_key.clone(), v.dc_new_model.clone())
                         });

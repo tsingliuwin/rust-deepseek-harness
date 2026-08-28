@@ -1795,9 +1795,26 @@ impl AppView {
                 .pb_1p5()
                 .gap_3()
                 .child(
-                    rail_icon("sb-expand", IconName::PanelLeftOpen, "展开侧边栏", move |_, _, cx| {
-                        t_expand.update(cx, |v, cx| { v.sidebar_collapsed = false; cx.notify(); });
-                    }),
+                    // web rail：折叠态 toggle 呈现鲸鱼标记
+                    div()
+                        .id("sb-expand")
+                        .size(px(36.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(10.0))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::t().hover))
+                        .tooltip(tip("展开侧边栏"))
+                        .on_click(move |_, _, cx| {
+                            t_expand.update(cx, |v, cx| { v.sidebar_collapsed = false; cx.notify(); });
+                        })
+                        .child(
+                            gpui::svg()
+                                .path("brands/fish.svg")
+                                .w(px(24.0)).h(px(17.65))
+                                .text_color(theme::t().text),
+                        ),
                 )
                 .child(
                     rail_icon("sb-new", IconName::Plus, "新建会话", move |_, _, cx| {
@@ -1844,24 +1861,30 @@ impl AppView {
                         .pl_1()
                         .child(
                             div().flex_1().min_w_0().flex().items_center().gap_2()
-                                .child(div().text_size(px(theme::FONT_BRAND)).child("🐟"))
+                                .child(
+                                    // 官方鲸鱼标记（web FishLogo，currentColor 随主题）
+                                    gpui::svg()
+                                        .path("brands/fish.svg")
+                                        .w(px(24.0)).h(px(17.65))
+                                        .text_color(theme::t().text),
+                                )
                                 .child(
                                     div()
                                         .text_size(px(theme::FONT_BRAND))
                                         .line_height(px(24.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .child("DSH"),
+                                        .child("deepseek"),
                                 )
                                 .child(
+                                    // 徽牌（web buildRevision：品牌色底 + 反色字）
                                     div()
-                                        .px_1()
+                                        .px(px(4.0))
                                         .rounded(px(3.0))
-                                        .border_1()
-                                        .border_color(theme::t().border_l2)
-                                        .text_color(theme::t().text_2)
+                                        .bg(theme::t().text)
+                                        .text_color(theme::t().bg_base)
                                         .font_family(theme_mono())
-                                        .text_size(px(9.0))
-                                        .line_height(px(14.0))
+                                        .text_size(px(8.0))
+                                        .line_height(px(16.0))
                                         .child("HARNESS"),
                                 ),
                         )
@@ -2252,7 +2275,13 @@ impl AppView {
                                 .line_height(px(theme::FONT_HERO_LEADING))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::t().text)
-                                .child("🐟 探索未至之境")
+                                .child(
+                                    gpui::svg()
+                                        .path("brands/fish.svg")
+                                        .w(px(34.0)).h(px(25.0))
+                                        .text_color(theme::t().text),
+                                )
+                                .child("探索未至之境")
                                 .child(
                                     div()
                                         .mt(px(2.0))

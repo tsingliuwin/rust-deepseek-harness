@@ -81,7 +81,7 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
                 .hover(|s| s.bg(tk.hover))
                 .on_click(move |_, _, _cx| {
                     // 打开配置目录（settings.json / sessions 所在）
-                    let dir = crate::config_dir();
+                    let dir = crate::dsh_home();
                     let _ = std::process::Command::new("explorer").arg(dir).spawn();
                     let _ = &t_open;
                 })

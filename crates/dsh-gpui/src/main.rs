@@ -36,7 +36,6 @@ use gpui::*;
 use gpui_component::{Icon, IconName, Root, StyledExt};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -240,20 +239,111 @@ pub(crate) const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
     ProviderCatalogEntry { id: "zai", name: "ZAI", base_url: "", model: "" },
 ];
 
-/// 配置目录（settings.json / 会话 JSONL 所在）。
-pub(crate) fn config_dir() -> std::path::PathBuf {
-    std::env::var("DSH_SESSIONS_DIR")
-        .map(std::path::PathBuf::from)
-        .map(|p| p.parent().map(|d| d.to_path_buf()).unwrap_or(p))
-        .unwrap_or_else(|_| {
-            std::env::var("LOCALAPPDATA")
-                .map(|p| std::path::PathBuf::from(p).join("dsh-rust"))
-                .unwrap_or_else(|_| "dsh-rust".into())
-        })
+/// Harness home（对齐 dsh home-paths）：`$DSH_HOME` 优先（空白视为未设），
+/// 否则 `~/.dsh`。所有用户数据在这一个根下。
+pub(crate) fn dsh_home() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("DSH_HOME") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".dsh")
 }
 
+/// settings.json —— 配置文档（不含密钥；扩展名决定格式，dsh 约定）。
 fn settings_path() -> std::path::PathBuf {
-    config_dir().join("settings.json")
+    dsh_home().join("settings.json")
+}
+
+/// credentials.json —— 密钥独立文档（对齐 dsh credentials-local 的
+/// `.credentials.yaml` 职责：settings 只存声明，密钥另管）。
+fn credentials_path() -> std::path::PathBuf {
+    dsh_home().join("credentials.json")
+}
+
+/// 会话目录（默认 `{home}/sessions`；DSH_SESSIONS_DIR 显式设置时覆盖）。
+pub(crate) fn sessions_dir() -> std::path::PathBuf {
+    std::env::var("DSH_SESSIONS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| dsh_home().join("sessions"))
+}
+
+/// 读凭证文档：provider id -> api key。
+fn load_credentials() -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(credentials_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|o| {
+            o.into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 写凭证文档（幂等合并：只改提供的 key，其余保留）。
+fn save_credentials(patch: &[(String, String)]) {
+    let mut doc = load_credentials();
+    for (k, v) in patch {
+        doc.insert(k.clone(), v.clone());
+    }
+    let _ = std::fs::create_dir_all(dsh_home());
+    if let Ok(json) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(credentials_path(), json);
+    }
+}
+
+/// 旧版 {LOCALAPPDATA}/dsh-rust 一次性迁移到 {home}（有数据才动）。
+fn migrate_legacy() {
+    let home = dsh_home();
+    if home.join("settings.json").exists() {
+        return; // 新布局已在用
+    }
+    let Ok(local) = std::env::var("LOCALAPPDATA") else { return };
+    let legacy = std::path::PathBuf::from(local).join("dsh-rust");
+    if !legacy.exists() || !legacy.join("settings.json").exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&home);
+    if let Ok(raw) = std::fs::read_to_string(legacy.join("settings.json")) {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let mut keys: Vec<(String, String)> = Vec::new();
+            if let Some(provs) = v.get_mut("providers").and_then(|p| p.as_array_mut()) {
+                for p in provs.iter_mut() {
+                    let id = p.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                    if let Some(key) = p.get_mut("api_key").and_then(|k| k.as_str()) {
+                        if !id.is_empty() {
+                            keys.push((id, key.to_string()));
+                        }
+                    }
+                    if let Some(o) = p.as_object_mut() {
+                        o.remove("api_key");
+                    }
+                }
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&v) {
+                let _ = std::fs::write(home.join("settings.json"), json);
+                if !keys.is_empty() {
+                    save_credentials(&keys);
+                }
+            }
+        }
+    }
+    let old_s = legacy.join("sessions");
+    if old_s.exists() {
+        let new_s_dir = home.join("sessions");
+        let _ = std::fs::create_dir_all(&new_s_dir);
+        if let Ok(entries) = std::fs::read_dir(&old_s) {
+            for e in entries.flatten() {
+                let _ = std::fs::copy(e.path(), new_s_dir.join(e.file_name()));
+            }
+        }
+    }
 }
 
 /// AppView 的运行期依赖（打包传入以控制构造参数个数）。
@@ -279,6 +369,8 @@ struct AppView {
     llm_configured: bool,
     /// DEEPSEEK_API_KEY 由启动环境提供（web keyEnvLocked：只读）。
     env_key_locked: bool,
+    /// 用户输入的 DeepSeek 密钥（内存态；落盘在 credentials.json）。
+    deepseek_key: String,
     // 模型页添加/编辑卡状态（对齐 web ModelsSection 的 adding/declaring/editing）
     adding: AddingMode,
     adopt_pick: usize,
@@ -335,6 +427,7 @@ impl AppView {
         settings: AppSettings,
         llm_configured: bool,
         env_key_locked: bool,
+        deepseek_key: String,
         adopt_key: Entity<InputState>,
         adopt_base: Entity<InputState>,
         dc_route: Entity<InputState>,
@@ -373,6 +466,7 @@ impl AppView {
             settings,
             llm_configured,
             env_key_locked,
+            deepseek_key,
             adding: AddingMode::None,
             adopt_pick: 0,
             adopt_dropdown_open: false,
@@ -715,10 +809,11 @@ impl AppView {
         if key.is_empty() {
             return;
         }
-        let adapter = DeepSeekAdapter::new(key);
+        let adapter = DeepSeekAdapter::new(key.clone());
         let _ = self.llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter));
         self.agent.set_provider_and_model("deepseek", self.desired_model.clone());
         self.llm_configured = true;
+        self.deepseek_key = key;
         self.settings.model = self.desired_model.clone();
         self.persist_settings();
     }
@@ -870,12 +965,27 @@ impl AppView {
     }
 
 
-    /// 写盘 settings.json（失败静默——设置是尽力持久化）。
+    /// 写盘：settings.json（剥离密钥）+ credentials.json（密钥分流）。
     fn persist_settings(&self) {
-        let path = settings_path();
-        let _ = std::fs::create_dir_all(config_dir());
-        if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
-            let _ = std::fs::write(path, json);
+        let _ = std::fs::create_dir_all(dsh_home());
+        let mut creds: Vec<(String, String)> = Vec::new();
+        if !self.deepseek_key.is_empty() && !self.env_key_locked {
+            creds.push(("deepseek".into(), self.deepseek_key.clone()));
+        }
+        for p in &self.settings.providers {
+            if !p.api_key.is_empty() {
+                creds.push((p.id.clone(), p.api_key.clone()));
+            }
+        }
+        if !creds.is_empty() {
+            save_credentials(&creds);
+        }
+        let mut clean = self.settings.clone();
+        for p in clean.providers.iter_mut() {
+            p.api_key = String::new();
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&clean) {
+            let _ = std::fs::write(settings_path(), json);
         }
     }
 
@@ -2176,6 +2286,22 @@ fn main() {
     // agent/request-error 退避重试（参考 dsh-llm-retry 的角色）
     let _retry_disposer = dsh_agent_loop::retry::attach_retry(&events);
     let llm = Arc::new(LlmRuntime::with_events(events.clone()));
+
+    // 存储布局对齐 dsh：{DSH_HOME|~/.dsh}/settings.json + credentials.json + sessions/
+    migrate_legacy();
+    let mut user_settings: AppSettings = std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let credentials = load_credentials();
+    for p in user_settings.providers.iter_mut() {
+        if let Some(key) = credentials.get(&p.id) {
+            p.api_key = key.clone();
+        }
+    }
+    let stored_deepseek_key = credentials.get("deepseek").cloned().unwrap_or_default();
+    let deepseek_env_locked = DeepSeekAdapter::from_env().is_some();
+
     let (provider, model) = match DeepSeekAdapter::from_env() {
         Some(adapter) => {
             let _h = llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter)).expect("register deepseek");
@@ -2183,8 +2309,17 @@ fn main() {
             ("deepseek".to_string(), model)
         }
         None => {
-            let _h = llm.register_adapter(&["mock".to_string()], Arc::new(MockAdapter)).expect("register mock");
-            ("mock".to_string(), "mock".to_string())
+            if !stored_deepseek_key.is_empty() {
+                let adapter = DeepSeekAdapter::new(stored_deepseek_key.clone());
+                let _h = llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter))
+                    .expect("register deepseek from credentials");
+                let model = std::env::var("DSH_MODEL")
+                    .unwrap_or_else(|_| user_settings.model.clone());
+                ("deepseek".to_string(), model)
+            } else {
+                let _h = llm.register_adapter(&["mock".to_string()], Arc::new(MockAdapter)).expect("register mock");
+                ("mock".to_string(), "mock".to_string())
+            }
         }
     };
 
@@ -2196,14 +2331,7 @@ fn main() {
     let demo_prompt = std::env::var("DSH_PROMPT").ok().filter(|s| !s.trim().is_empty());
 
     // --- 会话持久化：恢复最近的会话，或新建 ---
-    let sessions_dir = std::env::var("DSH_SESSIONS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("LOCALAPPDATA")
-                .map(|p| PathBuf::from(p).join("dsh-rust").join("sessions"))
-                .unwrap_or_else(|_| PathBuf::from("dsh-rust-sessions"))
-        });
-    let recorder = Arc::new(SessionRecorder::new(sessions_dir));
+    let recorder = Arc::new(SessionRecorder::new(sessions_dir()));
     let existing = recorder.list().unwrap_or_default();
     let (initial_session, sessions_meta, is_fresh) = if let Some(id) = existing.first() {
         let meta: Vec<SessionMeta> = existing
@@ -2253,11 +2381,7 @@ fn main() {
     let event_rx = agent.subscribe();
     agent.spawn();
 
-    // 用户设置：settings.json（尽力加载，失败用默认）
-    let user_settings: AppSettings = std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    // （设置加载已前置到 agent 构造前，见下方 storage 段）
     let startup_theme = match user_settings.appearance {
         AppearanceMode::Light => gpui_component::ThemeMode::Light,
         AppearanceMode::Dark => gpui_component::ThemeMode::Dark,
@@ -2347,7 +2471,8 @@ fn main() {
                         startup_active.clone(),
                         user_settings.clone(),
                         provider == "deepseek" || !user_settings.providers.is_empty(),
-                        provider == "deepseek",
+                        deepseek_env_locked,
+                        stored_deepseek_key.clone(),
                         adopt_key.clone(),
                         adopt_base.clone(),
                         dc_route.clone(),

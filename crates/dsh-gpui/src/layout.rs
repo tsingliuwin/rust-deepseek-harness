@@ -71,17 +71,8 @@ pub(crate) fn drag_handle(side: DragSide) -> Stateful<Div> {
         .mx(px(-8.0))
         .cursor_col_resize()
         .hover(|s| s.bg(theme::t().hover))
-        .relative()
-        .child(
-            // 视觉中线 2px（hover 时淡化，拖拽光标由 gpui drag 全程锁定 col-resize）
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .w(px(2.0))
-                .mx_auto()
-                .bg(theme::t().border_l2),
-        )
+        // 分界视觉线由栏容器自身的 1px 边框提供（sidebar border_r /
+        // details border_l），把手只提供 16px 命中带与 hover 高亮。
         .on_drag(
             ColumnDrag { side },
             |_drag, _offset, _window, cx| cx.new(|_| gpui::Empty),

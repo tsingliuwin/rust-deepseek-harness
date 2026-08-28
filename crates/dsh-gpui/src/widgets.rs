@@ -814,6 +814,256 @@ pub(crate) fn web_fetch_card(uid: u64, url: &str, truncated: bool) -> Div {
         })
 }
 
+/// grep 结果的结构化还原（web 经结果 presentationMeta 结构化传递；本实现
+/// 从模型可见文本回解析——格式由 dsh-search 定义，确定性可解析）。
+pub(crate) struct GrepSearch {
+    pub truncated: bool,
+    pub total: usize,
+    pub groups: Vec<(String, Vec<(usize, String)>)>,
+}
+
+/// 解析 `Found N matches` / `Found K of N matches` 头 + `path` + `Line N:
+/// text` 分组正文；`No matches found` → 空 groups。非 grep 文本返回 None。
+pub(crate) fn parse_grep_result(text: &str) -> Option<GrepSearch> {
+    let mut lines = text.lines();
+    let header = lines.next()?;
+    if header == "No matches found" {
+        return Some(GrepSearch { truncated: false, total: 0, groups: Vec::new() });
+    }
+    let truncated = header.contains(" of ");
+    let total: usize = if truncated {
+        let after = header.split(" of ").nth(1)?;
+        after.split(' ').next()?.parse().ok()?
+    } else {
+        let body = header.strip_prefix("Found ")?.strip_suffix(" matches")
+            .or_else(|| header.strip_prefix("Found ")?.strip_suffix(" match"))?;
+        body.parse().ok()?
+    };
+    let mut groups: Vec<(String, Vec<(usize, String)>)> = Vec::new();
+    for section in lines.collect::<Vec<_>>().join("\n").split("\n\n") {
+        let mut sec = section.lines();
+        let path = sec.next()?.to_string();
+        let mut matches: Vec<(usize, String)> = Vec::new();
+        for row in sec {
+            let rest = row.strip_prefix("Line ")?;
+            let (num, text) = rest.split_once(": ")?;
+            matches.push((num.parse().ok()?, text.to_string()));
+        }
+        groups.push((path, matches));
+    }
+    Some(GrepSearch { truncated, total, groups })
+}
+
+/// 文件组折叠回调（每次按组下标构造）。
+pub(crate) type GroupToggleFactory =
+    Box<dyn Fn(usize) -> Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>;
+
+/// 搜索卡（web SearchBlock kind='matches'：banner 底头行（摘要 + 复制）+
+/// 分组正文（文件头 600 weight + 计数，可点击折叠该组；匹配行行号 tertiary
+/// 前缀），mono 13/22，8 行上限头 4 尾 4，尾片落进组内时补还文件头行）。
+pub(crate) fn search_card(
+    uid: u64,
+    search: &GrepSearch,
+    expanded: bool,
+    collapsed_groups: &[usize],
+    on_fold: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + Clone,
+    on_group: GroupToggleFactory,
+) -> Div {
+    let groups = &search.groups;
+    let total = search.total;
+    let truncated = search.truncated;
+    let shown: usize = groups.iter().map(|(_, m)| m.len()).sum();
+    let summary = if truncated {
+        format!("显示 {shown} / 共 {total} 处匹配 · {} 个文件", groups.len())
+    } else {
+        format!("{shown} 处匹配 · {} 个文件", groups.len())
+    };
+    let copy_text = {
+        let mut s = String::new();
+        for (i, (path, matches)) in groups.iter().enumerate() {
+            if i > 0 {
+                s.push_str("\n\n");
+            }
+            s.push_str(path);
+            for (n, line) in matches {
+                s.push_str(&format!("\n{n}: {line}"));
+            }
+        }
+        s
+    };
+    let mut header = div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .px(px(14.0))
+        .py(px(9.0))
+        .bg(theme::t().code_banner)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(13.0))
+                .line_height(px(18.0))
+                .text_color(theme::t().text_2)
+                .child(summary),
+        );
+    if shown > 0 {
+        header = header.child(
+            div()
+                .id(("search-copy", uid))
+                .flex_none()
+                .cursor_pointer()
+                .text_size(px(13.0))
+                .line_height(px(18.0))
+                .text_color(theme::t().text_2)
+                .hover(|s| s.text_color(theme::t().text))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                })
+                .child("复制"),
+        );
+    }
+    // 扁平行序：File(gi) 头 + 组内 Match 行（折叠组只留头）
+    enum SRow {
+        File(usize),
+        Match(usize, usize, String),
+    }
+    let mut rows: Vec<SRow> = Vec::new();
+    for (gi, (_, matches)) in groups.iter().enumerate() {
+        let collapsed = collapsed_groups.contains(&gi);
+        rows.push(SRow::File(gi));
+        if collapsed {
+            continue;
+        }
+        for (n, line) in matches {
+            rows.push(SRow::Match(gi, *n, line.clone()));
+        }
+    }
+    let total_rows = rows.len();
+    let hidden = total_rows.saturating_sub(CARD_MAX_LINES);
+    let capped = hidden > 0 && !expanded;
+    let (head, tail_range) = if capped {
+        let h = CARD_MAX_LINES - CARD_MAX_LINES / 2;
+        (h, total_rows - (CARD_MAX_LINES - h)..total_rows)
+    } else {
+        (total_rows, 0..0)
+    };
+    let render_row = |row: &SRow, on_group: &GroupToggleFactory| -> AnyElement {
+        match row {
+            SRow::File(gi) => {
+                let (path, matches) = &groups[*gi];
+                let count = matches.len();
+                div()
+                    .id(SharedString::from(format!("search-g-{uid}-{gi}")))
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .px(px(14.0))
+                    .min_h(px(22.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::t().hover))
+                    .on_click(on_group(*gi))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .font_family(theme_mono())
+                            .text_size(px(13.0))
+                            .line_height(px(22.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::t().text)
+                            .child(path.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme_mono())
+                            .text_size(px(13.0))
+                            .line_height(px(22.0))
+                            .text_color(theme::t().text_3)
+                            .child(count.to_string()),
+                    )
+                    .into_any_element()
+            }
+            SRow::Match(_, n, line) => div()
+                .flex()
+                .items_baseline()
+                .min_h(px(22.0))
+                .whitespace_nowrap()
+                .pl(px(14.0))
+                .font_family(theme_mono())
+                .text_size(px(13.0))
+                .line_height(px(22.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme::t().text_3)
+                        .child(format!("{n}: ")),
+                )
+                .child(div().min_w_0().text_color(theme::t().text).child(line.clone()))
+                .into_any_element(),
+        }
+    };
+    let mut body = div()
+        .id(("search-body", uid))
+        .pt(px(8.0))
+        .pr(px(14.0))
+        .pb(px(12.0))
+        .overflow_x_scroll()
+        .font_family(theme_mono())
+        .text_size(px(13.0))
+        .line_height(px(22.0));
+    let head_rows: Vec<&SRow> = rows[..head.min(rows.len())].iter().collect();
+    for row in &head_rows {
+        body = body.child(render_row(row, &on_group));
+    }
+    // 尾片首行是匹配行且其组头不在头片时：补还文件头行并消耗一个尾位
+    // （web SearchBlock 的 tailHeader 语义），可见行数与 hidden 保持不变
+    let mut tail_rows: Vec<&SRow> = rows[tail_range].iter().collect();
+    let tail_header: Option<&SRow> = match tail_rows.first() {
+        Some(SRow::Match(gi, ..)) if !head_rows.iter().any(|r| matches!(r, SRow::File(g2) if g2 == gi)) => {
+            rows.iter().find(|r| matches!(r, SRow::File(g2) if g2 == gi))
+        }
+        _ => None,
+    };
+    if tail_header.is_some() {
+        tail_rows.remove(0);
+    }
+    if hidden > 0 {
+        body = body.child(fold_toggle(uid, hidden, expanded, on_fold).px(px(14.0)));
+    }
+    if let Some(header_row) = tail_header {
+        body = body.child(render_row(header_row, &on_group));
+    }
+    for row in &tail_rows {
+        body = body.child(render_row(row, &on_group));
+    }
+    div()
+        .ml_1()
+        .mt_1()
+        .mb_1()
+        .overflow_hidden()
+        .rounded(px(12.0))
+        .bg(theme::t().code_bg)
+        .child(header)
+        .when(shown == 0, |card| {
+            card.child(
+                div()
+                    .px(px(14.0))
+                    .py(px(12.0))
+                    .font_family(theme_mono())
+                    .text_size(px(13.0))
+                    .line_height(px(22.0))
+                    .text_color(theme::t().text_3)
+                    .child("未找到结果"),
+            )
+        })
+        .when(shown > 0, |card| card.child(body))
+}
+
 /// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
 pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {    let mut card = div()
         .ml_1()
@@ -922,6 +1172,11 @@ pub(crate) fn tool_row_texts(name: &str, args: &str) -> (String, String, Option<
         "web_fetch" => (
             "网页获取".into(),
             pick(&["url"]).unwrap_or_else(|| first_line(args)),
+            None,
+        ),
+        "grep" => (
+            "搜索".into(),
+            pick(&["pattern"]).unwrap_or_else(|| first_line(args)),
             None,
         ),
         "fs" => {

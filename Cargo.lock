@@ -1540,6 +1540,7 @@ dependencies = [
  "dsh-llm",
  "dsh-llm-deepseek",
  "dsh-persist",
+ "dsh-search",
  "dsh-session",
  "dsh-shell",
  "dsh-system-prompt",
@@ -1594,6 +1595,20 @@ dependencies = [
  "dsh-session",
  "serde_json",
  "zstd",
+]
+
+[[package]]
+name = "dsh-search"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dsh-llm",
+ "dsh-tools",
+ "globset",
+ "ignore",
+ "regex",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

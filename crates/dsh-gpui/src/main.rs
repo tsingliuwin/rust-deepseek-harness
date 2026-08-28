@@ -53,8 +53,10 @@ struct ToolBlock {
     result: Option<String>,
     error: bool,
     open: bool,
-    /// 读取/差异卡的 8 行折叠展开态（web 每实例 useState 的对应物）
+    /// 读取/差异/搜索卡的 8 行折叠展开态（web 每实例 useState 的对应物）
     expanded: bool,
+    /// 搜索卡里被折叠的文件组下标（升序；web collapsed Set 的对应物）
+    collapsed_groups: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -1157,6 +1159,7 @@ impl AppView {
                                     error: false,
                                     open: false,
                                     expanded: false,
+                                    collapsed_groups: Vec::new(),
                                 }))
                             }
                             _ => {}
@@ -1338,6 +1341,7 @@ impl AppView {
                     error: false,
                     open: false,
                     expanded: false,
+                    collapsed_groups: Vec::new(),
                 }));
             }
             AgentEvent::ToolResult { tool_call_id, is_error } => {
@@ -1865,6 +1869,11 @@ impl AppView {
                             .to_string()
                     };
                     let uid = (ei * 1000 + bi) as u64;
+                    // web deriveBody：IO 卡的输入 = pretty JSON（解析失败回退原文）
+                    let pretty_args = serde_json::from_str::<serde_json::Value>(&tool.arguments)
+                        .ok()
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                        .unwrap_or_else(|| tool.arguments.clone());
                     let element = match tool.name.as_str() {
                         "shell" => widgets::terminal_card(
                             uid,
@@ -1929,7 +1938,61 @@ impl AppView {
                                 }
                                 _ => widgets::io_card(
                                     uid,
-                                    &tool.arguments,
+                                    &pretty_args,
+                                    tool.result.as_deref(),
+                                    tool.error,
+                                )
+                                .into_any_element(),
+                            }
+                        }
+                        "grep" if !tool.error && tool.result.is_some() => {
+                            match widgets::parse_grep_result(tool.result.as_deref().unwrap_or("")) {
+                                Some(search) => {
+                                    let t_fold = this.clone();
+                                    let this_grp = this.clone();
+                                    let mk_group = move |gi: usize| {
+                                        let t = this_grp.clone();
+                                        Box::new(move |_: &gpui::ClickEvent, _: &mut gpui::Window, cx: &mut gpui::App| {
+                                            t.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    // 升序表内折叠/展开文件组
+                                                    match tool.collapsed_groups.binary_search(&gi) {
+                                                        Ok(pos) => {
+                                                            tool.collapsed_groups.remove(pos);
+                                                        }
+                                                        Err(pos) => {
+                                                            tool.collapsed_groups.insert(pos, gi);
+                                                        }
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        }) as Box<dyn Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App)>
+                                    };
+                                    widgets::search_card(
+                                        uid,
+                                        &search,
+                                        tool.expanded,
+                                        &tool.collapsed_groups,
+                                        move |_, _, cx| {
+                                            t_fold.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    tool.expanded = !tool.expanded;
+                                                }
+                                                cx.notify();
+                                            });
+                                        },
+                                        Box::new(mk_group),
+                                    )
+                                    .into_any_element()
+                                }
+                                None => widgets::io_card(
+                                    uid,
+                                    &pretty_args,
                                     tool.result.as_deref(),
                                     tool.error,
                                 )
@@ -1944,7 +2007,7 @@ impl AppView {
                         .into_any_element(),
                         _ => widgets::io_card(
                             uid,
-                            &tool.arguments,
+                            &pretty_args,
                             tool.result.as_deref(),
                             tool.error,
                         )
@@ -3862,7 +3925,13 @@ fn main() {
     let _fs = tools.register(Arc::new(FsTool)).unwrap();
     let _shell = tools.register(Arc::new(ShellTool)).unwrap();
     let _web = tools.register(Arc::new(WebTool::new())).unwrap();
+    let _grep = tools.register(Arc::new(dsh_search::GrepTool)).unwrap();
     let prompt = Arc::new(SystemPrompt::new());
+    // web tool:grep section：引导模型用 grep 工具而非 shell grep
+    let _grep_section = prompt.add_section(dsh_system_prompt::PromptSection {
+        name: "tool:grep".into(),
+        text: "Use the grep tool — not shell grep or rg — to search file contents. Use read on a matched file when you need surrounding context.".into(),
+    });
     let demo_prompt = std::env::var("DSH_PROMPT").ok().filter(|s| !s.trim().is_empty());
 
     // --- 会话持久化：与 web 完全共享（--key--/sid/session.jsonl.zstd）---

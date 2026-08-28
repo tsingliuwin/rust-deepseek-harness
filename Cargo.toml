@@ -13,6 +13,7 @@ members = [
   "crates/dsh-fs",
   "crates/dsh-shell",
   "crates/dsh-web",
+  "crates/dsh-search",
   "crates/dsh-persist",
 ]
 

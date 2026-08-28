@@ -1,0 +1,15 @@
+[package]
+name = "dsh-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-tools = { path = "../dsh-tools" }
+dsh-llm = { path = "../dsh-llm" }
+async-trait.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ignore = "0.4"
+globset = "0.4"

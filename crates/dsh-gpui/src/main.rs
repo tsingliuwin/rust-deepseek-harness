@@ -111,6 +111,14 @@ pub(crate) enum SettingsTab {
     Presets,
 }
 
+/// 模型页添加卡的两种来源（web：adopt known / declare custom）。
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum AddingMode {
+    None,
+    Adopt,
+    Declare,
+}
+
 /// 外观模式（通用设置 → 外观分段）。
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum AppearanceMode {
@@ -156,15 +164,51 @@ impl Default for AppSettings {
 /// 一个自定义（OpenAI 兼容）提供方声明。
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CustomProvider {
-    /// 路由标识（唯一）。
+    /// 路由标识（唯一，小写字母开头）。
     pub(crate) id: String,
     /// 显示名。
     pub(crate) name: String,
     /// OpenAI 兼容 base URL（…/v1）。
     pub(crate) base_url: String,
     pub(crate) api_key: String,
-    pub(crate) model: String,
+    /// 线协议（当前恒为 openai——对齐 web pi-ai 的协议字段）。
+    #[serde(default = "default_protocol")]
+    pub(crate) protocol: String,
+    /// 模型目录（至少一项；路由默认使用第一项）。
+    #[serde(default)]
+    pub(crate) models: Vec<CustomModel>,
 }
+
+fn default_protocol() -> String {
+    "openai".into()
+}
+
+/// 模型目录中的一行（web ModelListEditor 的 modelEntry）。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CustomModel {
+    pub(crate) id: String,
+    #[serde(default)]
+    pub(crate) display_name: String,
+    #[serde(default)]
+    pub(crate) context_window: String,
+    #[serde(default)]
+    pub(crate) max_tokens: String,
+}
+
+/// 「添加提供方」的内置目录（OpenAI 兼容、可被 adopt 的提供方）。
+pub(crate) struct ProviderCatalogEntry {
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) base_url: &'static str,
+    pub(crate) model: &'static str,
+}
+
+pub(crate) const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
+    ProviderCatalogEntry { id: "kimi", name: "Moonshot Kimi", base_url: "https://api.moonshot.cn/v1", model: "kimi-k2-0905-preview" },
+    ProviderCatalogEntry { id: "glm", name: "智谱 GLM", base_url: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.6" },
+    ProviderCatalogEntry { id: "doubao", name: "火山方舟", base_url: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-1-6" },
+    ProviderCatalogEntry { id: "openai", name: "OpenAI 兼容", base_url: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+];
 
 /// 配置目录（settings.json / 会话 JSONL 所在）。
 pub(crate) fn config_dir() -> std::path::PathBuf {
@@ -195,6 +239,7 @@ struct AppView {
     sessions: Vec<SessionMeta>,
     entries: Vec<ChatEntry>,
     input: Entity<InputState>,
+    #[allow(dead_code)] // 被 DeepSeek 卡引用
     api_input: Entity<InputState>,
     desired_model: String,
     active_provider: String,
@@ -202,12 +247,25 @@ struct AppView {
     settings_tab: SettingsTab,
     settings: AppSettings,
     llm_configured: bool,
-    // 模型页「添加提供方」编辑卡（展开时显示）
-    adding_provider: bool,
-    np_name: Entity<InputState>,
-    np_base: Entity<InputState>,
-    np_key: Entity<InputState>,
-    np_model: Entity<InputState>,
+    // 模型页添加/编辑卡状态（对齐 web ModelsSection 的 adding/declaring/editing）
+    adding: AddingMode,
+    adopt_pick: usize,
+    adopt_customized_open: bool,
+    edit_customized_open: bool,
+    editing_provider: Option<String>,
+    // adopt 卡输入
+    adopt_key: Entity<InputState>,
+    adopt_base: Entity<InputState>,
+    // declare（自定义提供方）卡：已添加的模型行
+    dc_models: Vec<String>,
+    dc_route: Entity<InputState>,
+    dc_name: Entity<InputState>,
+    dc_base: Entity<InputState>,
+    dc_key: Entity<InputState>,
+    dc_new_model: Entity<InputState>,
+    // 编辑卡输入
+    edit_key: Entity<InputState>,
+    edit_base: Entity<InputState>,
     pending_clear: bool,
     _input_subscription: Subscription,
     chat_scroll: ScrollHandle,
@@ -233,15 +291,21 @@ impl AppView {
         deps: AppDeps,
         sessions: Vec<SessionMeta>,
         input: Entity<InputState>,
-        api_input: Entity<InputState>,
+        #[allow(dead_code)] // 被 DeepSeek 卡引用
+    api_input: Entity<InputState>,
         desired_model: String,
         active_provider: String,
         settings: AppSettings,
         llm_configured: bool,
-        np_name: Entity<InputState>,
-        np_base: Entity<InputState>,
-        np_key: Entity<InputState>,
-        np_model: Entity<InputState>,
+        adopt_key: Entity<InputState>,
+        adopt_base: Entity<InputState>,
+        dc_route: Entity<InputState>,
+        dc_name: Entity<InputState>,
+        dc_base: Entity<InputState>,
+        dc_key: Entity<InputState>,
+        dc_new_model: Entity<InputState>,
+        edit_key: Entity<InputState>,
+        edit_base: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
         let subscription = cx.subscribe(&input, |chat, input, event, cx| {
@@ -270,11 +334,21 @@ impl AppView {
             settings_tab: SettingsTab::General,
             settings,
             llm_configured,
-            adding_provider: false,
-            np_name,
-            np_base,
-            np_key,
-            np_model,
+            adding: AddingMode::None,
+            adopt_pick: 0,
+            adopt_customized_open: false,
+            edit_customized_open: false,
+            editing_provider: None,
+            adopt_key,
+            adopt_base,
+            dc_models: Vec::new(),
+            dc_route,
+            dc_name,
+            dc_base,
+            dc_key,
+            dc_new_model,
+            edit_key,
+            edit_base,
             pending_clear: false,
             _input_subscription: subscription,
             chat_scroll: ScrollHandle::new(),
@@ -592,6 +666,7 @@ impl AppView {
     }
 
     /// 模型页「保存并启用」：注册 DeepSeek adapter 并切换路由。
+    #[allow(dead_code)] // 保留：未来 on-demand 保存路径
     fn apply_api_key(&mut self, cx: &App) {
         let key: String = self.api_input.read_with(cx, |s, _| s.value().to_string());
         let key = key.trim().to_string();
@@ -607,33 +682,123 @@ impl AppView {
     }
 
     /// 添加自定义提供方：注册 adapter + 入 settings + 启用。
-    fn add_custom_provider(&mut self, cx: &App) {
-        let read = |e: &Entity<InputState>| e.read_with(cx, |s, _| s.value().trim().to_string());
-        let name = read(&self.np_name);
-        let base = read(&self.np_base);
-        let key = read(&self.np_key);
-        let model = read(&self.np_model);
-        if name.is_empty() || base.is_empty() || key.is_empty() {
-            return; // 三项必填；model 空时用占位
+    /// adopt：从目录添加一个已知提供方（web addCard + ProviderEditor 的 apply）。
+    /// 返回错误文案；Ok(()) 表示已保存。
+    fn adopt_provider(&mut self, cx: &App) -> Result<(), String> {
+        let entry = &PROVIDER_CATALOG[self.adopt_pick.min(PROVIDER_CATALOG.len() - 1)];
+        if self.settings.providers.iter().any(|p| p.id == entry.id) || entry.id == "deepseek" {
+            return Err("已有提供方使用了这个 ID。".into());
         }
-        let id = format!("custom-{}", name.to_lowercase().replace([' ', '/'], "-"));
-        let model = if model.is_empty() { "default".to_string() } else { model };
+        let key = self.adopt_key.read_with(cx, |s, _| s.value().trim().to_string());
+        let base = {
+            let v = self.adopt_base.read_with(cx, |s, _| s.value().trim().to_string());
+            if v.is_empty() { entry.base_url.to_string() } else { v }
+        };
         let provider = CustomProvider {
-            id: id.clone(),
-            name,
+            id: entry.id.to_string(),
+            name: entry.name.to_string(),
             base_url: base,
             api_key: key,
-            model: model.clone(),
+            protocol: "openai".into(),
+            models: vec![CustomModel {
+                id: entry.model.to_string(),
+                display_name: String::new(),
+                context_window: String::new(),
+                max_tokens: String::new(),
+            }],
         };
-        let adapter = DeepSeekAdapter::with_base_url(&provider.api_key, &provider.base_url);
-        let _ = self.llm.register_adapter(&[id.clone()], Arc::new(adapter));
-        self.agent.set_provider_and_model(id.clone(), model.clone());
-        self.active_provider = id;
-        self.desired_model = model;
-        self.llm_configured = true;
+        self.register_custom(&provider);
         self.settings.providers.push(provider);
         self.persist_settings();
-        self.adding_provider = false;
+        Ok(())
+    }
+
+    /// declare：创建自定义提供方（web CustomProviderCard 的 create）。
+    fn declare_provider(&mut self, cx: &App) -> Result<(), String> {
+        let route = self.dc_route.read_with(cx, |s, _| s.value().trim().to_string());
+        let base = self.dc_base.read_with(cx, |s, _| s.value().trim().to_string());
+        let key = self.dc_key.read_with(cx, |s, _| s.value().trim().to_string());
+        let name = self.dc_name.read_with(cx, |s, _| s.value().trim().to_string());
+        if route.is_empty() {
+            return Err("以小写字母开头的标识，在请求中唯一标识该提供方，并用于派生凭据名。".into());
+        }
+        if !valid_route_id(&route) {
+            return Err("需以小写字母开头，之后可用小写字母、数字和短横线。".into());
+        }
+        if self.settings.providers.iter().any(|p| p.id == route) || route == "deepseek" {
+            return Err("已有提供方使用了这个 ID。".into());
+        }
+        if base.is_empty() {
+            return Err("自定义提供方需要填写 API 地址。".into());
+        }
+        if self.dc_models.is_empty() {
+            return Err("自定义提供方至少需要一个模型。".into());
+        }
+        let provider = CustomProvider {
+            id: route,
+            name: if name.is_empty() { String::new() } else { name },
+            base_url: base,
+            api_key: key,
+            protocol: "openai".into(),
+            models: self
+                .dc_models
+                .iter()
+                .map(|id| CustomModel {
+                    id: id.clone(),
+                    display_name: String::new(),
+                    context_window: String::new(),
+                    max_tokens: String::new(),
+                })
+                .collect(),
+        };
+        self.register_custom(&provider);
+        self.settings.providers.push(provider);
+        self.persist_settings();
+        Ok(())
+    }
+
+    /// 注册一个自定义提供方的 adapter（OpenAI 兼容）。
+    fn register_custom(&self, p: &CustomProvider) {
+        let adapter = DeepSeekAdapter::with_base_url(&p.api_key, &p.base_url);
+        let _ = self.llm.register_adapter(&[p.id.clone()], Arc::new(adapter));
+    }
+
+    /// 向 declare 卡追加一行模型（查重）。
+    fn dc_push_model(&mut self, cx: &App) {
+        let id = self.dc_new_model.read_with(cx, |s, _| s.value().trim().to_string());
+        if !id.is_empty() && !self.dc_models.contains(&id) {
+            self.dc_models.push(id);
+        }
+    }
+
+    /// 编辑卡保存（web ProviderEditor apply：换 key / 改 API 地址）。
+    fn save_edit(&mut self, cx: &App) {
+        let Some(id) = self.editing_provider.clone() else { return };
+        let key = self.edit_key.read_with(cx, |s, _| s.value().trim().to_string());
+        let base = self.edit_base.read_with(cx, |s, _| s.value().trim().to_string());
+        if id == "deepseek" {
+            if !key.is_empty() {
+                let adapter = DeepSeekAdapter::new(&key);
+                let _ = self.llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter));
+                self.llm_configured = true;
+            }
+        } else if let Some(p) = self.settings.providers.iter_mut().find(|p| p.id == id) {
+            let mut changed = false;
+            if !key.is_empty() {
+                p.api_key = key;
+                changed = true;
+            }
+            if !base.is_empty() {
+                p.base_url = base;
+                changed = true;
+            }
+            if changed {
+                let snapshot = p.clone();
+                self.register_custom(&snapshot);
+            }
+        }
+        self.persist_settings();
+        self.editing_provider = None;
     }
 
     /// 启用某个已声明的提供方（deepseek 或 custom-*）。
@@ -643,9 +808,10 @@ impl AppView {
             self.active_provider = "deepseek".into();
             self.llm_configured = true;
         } else if let Some(p) = self.settings.providers.iter().find(|p| p.id == id).cloned() {
-            self.agent.set_provider_and_model(p.id.clone(), p.model.clone());
+            let model = p.models.first().map(|m| m.id.clone()).unwrap_or_default();
+            self.agent.set_provider_and_model(p.id.clone(), model.clone());
             self.active_provider = p.id;
-            self.desired_model = p.model;
+            self.desired_model = model;
             self.llm_configured = true;
         }
         self.persist_settings();
@@ -660,6 +826,7 @@ impl AppView {
         }
         self.persist_settings();
     }
+
 
     /// 写盘 settings.json（失败静默——设置是尽力持久化）。
     fn persist_settings(&self) {
@@ -2027,7 +2194,8 @@ fn main() {
     };
     if startup_active != "deepseek" && startup_active != "mock" {
         if let Some(p) = user_settings.providers.iter().find(|p| p.id == startup_active) {
-            agent.set_provider_and_model(p.id.clone(), p.model.clone());
+            let model = p.models.first().map(|m| m.id.clone()).unwrap_or_default();
+            agent.set_provider_and_model(p.id.clone(), model);
         }
     }
 
@@ -2051,19 +2219,34 @@ fn main() {
                         .auto_grow(1, 14)
                 });
                 let api_input = cx.new(|cx: &mut Context<InputState>| {
-                    InputState::new(window, cx).placeholder("sk-… (DeepSeek API Key)")
+                    InputState::new(window, cx).masked(true).placeholder("输入 API 密钥")
                 });
-                let np_name = cx.new(|cx: &mut Context<InputState>| {
-                    InputState::new(window, cx).placeholder("名称，如 Kimi")
+                let adopt_key = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).masked(true).placeholder("输入 API 密钥")
                 });
-                let np_base = cx.new(|cx: &mut Context<InputState>| {
-                    InputState::new(window, cx).placeholder("https://api.moonshot.cn/v1")
+                let adopt_base = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("提供方默认")
                 });
-                let np_key = cx.new(|cx: &mut Context<InputState>| {
-                    InputState::new(window, cx).placeholder("API Key")
+                let dc_route = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("acme-gateway")
                 });
-                let np_model = cx.new(|cx: &mut Context<InputState>| {
-                    InputState::new(window, cx).placeholder("默认模型，如 kimi-k2-0905-preview")
+                let dc_name = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("显示名称")
+                });
+                let dc_base = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("https://gateway.example/v1")
+                });
+                let dc_key = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).masked(true).placeholder("输入 API 密钥，或留空使用环境认证")
+                });
+                let dc_new_model = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("模型 ID")
+                });
+                let edit_key = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).masked(true).placeholder("已配置——输入新值可替换")
+                });
+                let edit_base = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("提供方默认")
                 });
                 let desired_model = std::env::var("DSH_MODEL")
                     .unwrap_or_else(|_| user_settings.model.clone());
@@ -2079,10 +2262,15 @@ fn main() {
                         startup_active.clone(),
                         user_settings.clone(),
                         provider == "deepseek" || !user_settings.providers.is_empty(),
-                        np_name.clone(),
-                        np_base.clone(),
-                        np_key.clone(),
-                        np_model.clone(),
+                        adopt_key.clone(),
+                        adopt_base.clone(),
+                        dc_route.clone(),
+                        dc_name.clone(),
+                        dc_base.clone(),
+                        dc_key.clone(),
+                        dc_new_model.clone(),
+                        edit_key.clone(),
+                        edit_base.clone(),
                         cx,
                     )
                 });
@@ -2129,6 +2317,18 @@ fn main() {
         )
         .expect("failed to open window");
     });
+}
+
+/// web CustomProviderCard 的 ROUTE_PATTERN：小写字母开头，后接小写/数字/短横线段。
+fn valid_route_id(route: &str) -> bool {
+    let bytes = route.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    route
+        .split('-')
+        .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
+        && !route.ends_with('-')
 }
 
 /// 会话 JSONL 的修改时间 → web 侧栏的相对时间文案。

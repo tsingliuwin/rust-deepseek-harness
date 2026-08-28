@@ -7,7 +7,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{Icon, IconName, StyledExt, input::{Input, InputState}};
 
-use crate::{AppView, AppearanceMode, EnterBehavior, SettingsTab};
+use crate::{AppView, AppearanceMode, AddingMode, EnterBehavior, SettingsTab, PROVIDER_CATALOG, valid_route_id};
 use crate::theme;
 
 /// 设置弹层（挂在根视图最上层）。
@@ -334,284 +334,127 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
         ))
 }
 
-/// 模型页（web ModelsSection：标题 + 说明 + provider 卡 + 添加区）。
-fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, _cx: &mut App) -> Div {
-    let tk = theme::t();
-    let t_save = this.clone();
-    let t_model = this.clone();
-    let t_add = this.clone();
-    let t_custom = this.clone();
+/// 模型页（web ModelsSection）：标题/说明 + 已配置提供方 rowCard 列表 +
+/// addBlock（两枚虚线按钮 / adopt 卡 / declare 卡）。
+fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, cx: &mut App) -> Div {
 
-    let model_seg = segmented(
-        "set-model",
-        &[
-            ("deepseek-chat", app.desired_model == "deepseek-chat", true),
-            ("deepseek-reasoner", app.desired_model == "deepseek-reasoner", true),
-        ],
-        move |i, _, _, cx| {
-            let model = if i == 0 { "deepseek-chat" } else { "deepseek-reasoner" };
-            t_model.update(cx, |v, cx| {
-                v.desired_model = model.to_string();
-                v.agent.set_provider_and_model("deepseek", model.to_string());
-                v.active_provider = "deepseek".into();
-                v.llm_configured = true;
-                v.persist_settings();
-                cx.notify();
-            });
-        },
+    // --- 已配置提供方：DeepSeek rowCard + 自定义 rowCards ---
+    let deepseek_row = provider_row(
+        app,
+        this,
+        "deepseek",
+        "DeepSeek",
+        false, // 自定义 tag
+        app.llm_configured,
+        Some(()), // 可编辑，不可删除（内置路由）
     );
 
-    // DeepSeek 卡（l2 描边、r12、pad 12/14）
-    let deepseek_card = div()
-        .v_flex()
-        .gap_3()
-        .rounded(px(12.0))
-        .border_1()
-        .border_color(tk.border_l2)
-        .px(px(14.0))
-        .py_3()
-        .child(provider_head(
-            "DeepSeek",
-            if app.active_provider == "deepseek" { "使用中" } else if app.llm_configured { "已连接" } else { "未配置（使用 mock）" },
-            app.active_provider == "deepseek",
-            app.llm_configured,
-        ))
-        .child(field("API Key", Input::new(&app.api_input).appearance(false).w_full()))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(pill_button("set-save-key", "保存并启用", true, move |_, _, cx| {
-                    t_save.update(cx, |v, cx| {
-                        v.apply_api_key(cx);
-                        v.active_provider = "deepseek".into();
-                        cx.notify();
-                    });
-                }))
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .line_height(px(theme::FONT_CAPTION_LEADING))
-                        .text_color(tk.text_3)
-                        .child("留空则保持当前路由。"),
-                ),
-        )
-        .child(field("模型", model_seg));
-
-    // 已声明的自定义提供方卡
-    let custom_cards: Vec<Div> = app
+    let custom_rows: Vec<Div> = app
         .settings
         .providers
         .iter()
         .map(|p| {
-            let tc = t_custom.clone();
-            let id = p.id.clone();
-            let td = t_custom.clone();
-            let id2 = p.id.clone();
-            let _ = &tc;
-            let active = app.active_provider == p.id;
-            let base_url = p.base_url.clone();
-            let model = p.model.clone();
-            let name = p.name.clone();
-            let _ = (&tc, &td);
-            div()
-                .v_flex()
-                .gap_2()
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(tk.border_l2)
-                .px(px(14.0))
-                .py_3()
-                .child(provider_head(&name, &format!("{base_url} · {model}"), true, true))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(if active {
-                            div()
-                                .id(SharedString::from(format!("prov-active-{}", id)))
-                                .text_size(px(theme::FONT_CAPTION))
-                                .line_height(px(theme::FONT_CAPTION_LEADING))
-                                .text_color(tk.green)
-                                .child("使用中")
-                                .into_any_element()
-                        } else {
-                            pill_button(
-                                SharedString::from(format!("prov-enable-{}", id)),
-                                "启用",
-                                false,
-                                move |_, _, cx| {
-                                    let id = id.clone();
-                                    tc.update(cx, |v, cx| {
-                                        v.activate_provider(&id);
-                                        cx.notify();
-                                    });
-                                },
-                            )
-                            .into_any_element()
-                        })
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("prov-del-{}", id2)))
-                                .h(px(28.0))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .rounded(px(14.0))
-                                .border_1()
-                                .border_color(tk.border_l2)
-                                .text_size(px(theme::FONT_TAB))
-                                .line_height(px(20.0))
-                                .text_color(tk.text_2)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(tk.hover))
-                                .on_click(move |_, _, cx| {
-                                    let id = id2.clone();
-                                    td.update(cx, |v, cx| {
-                                        v.remove_provider(&id);
-                                        cx.notify();
-                                    });
-                                })
-                                .child("删除"),
-                        ),
-                )
+            provider_row(
+                app,
+                this,
+                &p.id,
+                if p.name.is_empty() { &p.id } else { &p.name },
+                true,
+                !p.api_key.is_empty(),
+                None, // 可编辑 + 可删除
+            )
         })
         .collect();
 
-    // 添加区（web .addBlock：编辑卡 或 两枚等宽虚线按钮）
-    let add_block: Div = if app.adding_provider {
-        let t_cancel = this.clone();
-        let t_preset = this.clone();
-        div()
-            .v_flex()
-            .gap_3()
-            .rounded(px(12.0))
-            .bg(tk.layer1)
-            .px(px(16.0))
-            .py(px(14.0))
-            .child(
-                div()
-                    .text_size(px(theme::FONT_ROW))
-                    .line_height(px(22.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(tk.text)
-                    .child("添加提供方"),
-            )
-            .child(
-                div()
-                    .v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .line_height(px(theme::FONT_CAPTION_LEADING))
-                            .text_color(tk.text_3)
-                            .child("预设（点击填充，OpenAI 兼容）"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(preset_chip("chip-moonshot", "Moonshot Kimi", "Kimi", "https://api.moonshot.cn/v1", "kimi-k2-0905-preview", &t_preset))
-                            .child(preset_chip("chip-zhipu", "智谱 GLM", "GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-4.6", &t_preset))
-                            .child(preset_chip("chip-ark", "火山方舟", "方舟", "https://ark.cn-beijing.volces.com/api/v3", "doubao-seed-1-6", &t_preset))
-                            .child(preset_chip("chip-openai", "OpenAI 兼容", "", "", "", &t_preset)),
-                    ),
-            )
-            .child(field("名称", Input::new(&app.np_name).appearance(false).w_full()))
-            .child(field("Base URL", Input::new(&app.np_base).appearance(false).w_full()))
-            .child(field("API Key", Input::new(&app.np_key).appearance(false).w_full()))
-            .child(field("默认模型", Input::new(&app.np_model).appearance(false).w_full()))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(pill_button("set-add-provider", "保存并启用", true, move |_, window, cx| {
-                        // 保存后清空编辑卡（此闭包同时持有 window）
-                        let entities = t_add.read_with(cx, |v, _| {
-                            (v.np_name.clone(), v.np_base.clone(), v.np_key.clone(), v.np_model.clone())
-                        });
-                        t_add.update(cx, |v, cx| {
-                            v.add_custom_provider(cx);
-                            cx.notify();
-                        });
-                        let (a, b, c, d) = entities;
-                        for e in [a, b, c, d] {
-                            e.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
-                        }
-                    }))
-                    .child(pill_button("set-add-cancel", "取消", false, move |_, _, cx| {
-                        t_cancel.update(cx, |v, cx| {
-                            v.adding_provider = false;
-                            cx.notify();
-                        });
-                    })),
-            )
-    } else {
-        let t_open1 = this.clone();
-        let t_open2 = this.clone();
-        div()
-            .flex()
-            .flex_wrap()
-            .gap(px(10.0))
-            .child(add_button("set-add-known", "添加提供方", IconName::Plus, move |_, _, cx| {
-                t_open1.update(cx, |v, cx| {
-                    v.adding_provider = true;
-                    cx.notify();
-                });
-            }))
-            .child(add_button("set-add-custom", "添加自定义提供方", IconName::Plus, move |_, _, cx| {
-                t_open2.update(cx, |v, cx| {
-                    v.adding_provider = true;
-                    cx.notify();
-                });
-            }))
+    // --- addBlock ---
+    let add_block = match app.adding {
+        AddingMode::Adopt => adopt_card(app, this, cx),
+        AddingMode::Declare => declare_card(app, this, cx),
+        AddingMode::None => {
+            let t1 = this.clone();
+            let t2 = this.clone();
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(10.0))
+                .child(add_button("set-add-known", "添加提供方", move |_, _, cx| {
+                    t1.update(cx, |v, cx| {
+                        v.adding = AddingMode::Adopt;
+                        cx.notify();
+                    });
+                }))
+                .child(add_button("set-add-custom", "添加自定义提供方", move |_, _, cx| {
+                    t2.update(cx, |v, cx| {
+                        v.adding = AddingMode::Declare;
+                        cx.notify();
+                    });
+                }))
+        }
     };
 
     div()
         .v_flex()
         .pt_2()
         .gap_3()
-        .child(
-            div()
-                .text_size(px(16.0))
-                .line_height(px(24.0))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(tk.text)
-                .child("模型"),
-        )
-        .child(
-            div()
-                .text_size(px(theme::FONT_ROW))
-                .line_height(px(22.0))
-                .text_color(tk.text_3)
-                .child("配置模型提供方；保存后对新会话生效。"),
-        )
-        .child(deepseek_card)
-        .children(custom_cards)
+        .child(page_title("模型"))
+        .child(page_intro("填入各提供方的 API 密钥即可使用其模型。"))
+        .child(deepseek_row)
+        .children(custom_rows)
         .child(add_block)
 }
 
-/// provider 卡头（图标 + 名称 + 右侧状态/URL）。
-fn provider_head(name: &str, status: &str, active: bool, configured: bool) -> Div {
+/// 页标题 / 说明（web .title 16/24 wt500、.intro 14/22 tertiary）。
+fn page_title(text: &str) -> Div {
     let tk = theme::t();
-    let color = if active {
-        tk.green
-    } else if configured {
-        tk.text_2
-    } else {
-        tk.text_3
-    };
     div()
+        .text_size(px(16.0))
+        .line_height(px(24.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(tk.text)
+        .child(text.to_string())
+}
+
+fn page_intro(text: &str) -> Div {
+    let tk = theme::t();
+    div()
+        .text_size(px(theme::FONT_ROW))
+        .line_height(px(22.0))
+        .text_color(tk.text_3)
+        .child(text.to_string())
+}
+
+/// 已配置提供方行卡（web .rowCard：l2 描边 r12 pad 12/14 gap 12）。
+/// `deletable`=None 表示内置路由（DeepSeek）只可编辑。
+#[allow(clippy::too_many_arguments)]
+fn provider_row(
+    app: &AppView,
+    this: &Entity<AppView>,
+    id: &str,
+    name: &str,
+    custom: bool,
+    has_key: bool,
+    _builtin: Option<()>,
+) -> Div {
+    let tk = theme::t();
+    let is_deepseek = id == "deepseek";
+    let active = app.active_provider == id;
+    let editing = app.editing_provider.as_deref() == Some(id);
+
+    // 行头：凭据点 + 名称 + route 标注 + 自定义 tag + 操作
+    let t_edit = this.clone();
+    let edit_id = id.to_string();
+    let mut head = div()
         .flex()
         .items_center()
-        .gap_2p5()
-        .min_w_0()
-        .child(Icon::new(IconName::Bot).size(px(16.0)).text_color(tk.accent))
+        .gap(px(10.0))
+        .child(
+            // 凭据点（web .credentialDot：8px 圆，绿=已配置 红=缺失）
+            div()
+                .size(px(8.0))
+                .rounded_full()
+                .flex_none()
+                .bg(if has_key { tk.green } else { tk.error }),
+        )
         .child(
             div()
                 .text_size(px(theme::FONT_ROW))
@@ -619,39 +462,601 @@ fn provider_head(name: &str, status: &str, active: bool, configured: bool) -> Di
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(tk.text)
                 .child(name.to_string()),
-        )
-        .child(div().flex_1())
-        .child(
-            div()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_size(px(theme::FONT_CAPTION))
-                .line_height(px(theme::FONT_CAPTION_LEADING))
-                .text_color(color)
-                .child(status.to_string()),
-        )
-}
-
-/// 字段行（label + 控件）。
-fn field(label: &str, control: impl IntoElement) -> Div {
-    let tk = theme::t();
-    div()
-        .v_flex()
-        .gap_1()
-        .child(
+        );
+    if name != id {
+        head = head.child(
             div()
                 .text_size(px(theme::FONT_CAPTION))
                 .line_height(px(theme::FONT_CAPTION_LEADING))
                 .text_color(tk.text_3)
+                .child(id.to_string()),
+        );
+    }
+    if custom {
+        head = head.child(
+            // 「自定义」tag（web .rowTag：11/16、l3 描边、r4）
+            div()
+                .px(px(6.0))
+                .py(px(1.0))
+                .border_1()
+                .border_color(tk.border_l3)
+                .rounded(px(4.0))
+                .text_size(px(11.0))
+                .line_height(px(16.0))
+                .text_color(tk.text_2)
+                .child("自定义"),
+        );
+    }
+    let mut head = head.child(div().flex_1());
+    if active {
+        head = head.child(
+            div()
+                .text_size(px(theme::FONT_CAPTION))
+                .line_height(px(theme::FONT_CAPTION_LEADING))
+                .text_color(tk.green)
+                .child("使用中"),
+        );
+    } else {
+        let t_act = this.clone();
+        let act_id = id.to_string();
+        head = head.child(
+            link_button(
+                SharedString::from(format!("prov-use-{id}")),
+                "启用",
+                move |_, _, cx| {
+                    let id = act_id.clone();
+                    t_act.update(cx, |v, cx| {
+                        v.activate_provider(&id);
+                        cx.notify();
+                    });
+                },
+            ),
+        );
+    }
+    head = head.child(
+        // 编辑（secondary h36 r18）
+        action_button(
+            SharedString::from(format!("prov-edit-{id}")),
+            "编辑",
+            false,
+            move |_, _, cx| {
+                let id = edit_id.clone();
+                t_edit.update(cx, |v, cx| {
+                    v.editing_provider = if v.editing_provider.as_deref() == Some(&id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                    cx.notify();
+                });
+            },
+        ),
+    );
+    if !is_deepseek {
+        let t_del = this.clone();
+        let del_id = id.to_string();
+        head = head.child(
+            action_button(
+                SharedString::from(format!("prov-del-{id}")),
+                "删除",
+                false,
+                move |_, _, cx| {
+                    let id = del_id.clone();
+                    t_del.update(cx, |v, cx| {
+                        v.remove_provider(&id);
+                        cx.notify();
+                    });
+                },
+            ),
+        );
+    }
+
+    let mut card = div()
+        .v_flex()
+        .gap_3()
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(tk.border_l2)
+        .px(px(14.0))
+        .py_3()
+        .child(head);
+
+    // 展开的编辑卡（web rowCard 内嵌 ProviderEditor）
+    if editing {
+        card = card.child(edit_card(app, this, id, name));
+    }
+    card
+}
+
+/// 编辑卡（web ProviderEditor：密钥 + 自定义设置折叠 + 保存/取消）。
+fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str) -> Div {
+    let tk = theme::t();
+    let t_save = this.clone();
+    let models: Vec<String> = if id == "deepseek" {
+        vec!["deepseek-chat".into(), "deepseek-reasoner".into()]
+    } else {
+        app.settings
+            .providers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.models.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default()
+    };
+
+    div()
+        .v_flex()
+        .gap(px(14.0))
+        .rounded(px(12.0))
+        .bg(tk.surface_2)
+        .px(px(16.0))
+        .py(px(14.0))
+        // editorHeader：标题 + route 标注
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(22.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tk.text)
+                        .child(name.to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(theme::FONT_CAPTION_LEADING))
+                        .text_color(tk.text_3)
+                        .child(id.to_string()),
+                ),
+        )
+        .child(field("API 密钥", Input::new(&app.edit_key).w_full()))
+        .child(hint(if id == "deepseek" {
+            "编辑卡默认 API 地址 https://api.deepseek.com；自定义提供方的 API 地址在折叠区内。"
+        } else {
+            "选择模型目录中的首行作为路由默认模型。"
+        }))
+        .child(
+            // 自定义设置折叠（web details.customized：12/18 wt500 secondary + 旋转 chevron）
+            disclosure(
+                "edit-customized",
+                "自定义设置",
+                app.edit_customized_open,
+                div()
+                    .v_flex()
+                    .gap(px(12.0))
+                    .pt_3()
+                    .child(field("API 地址", Input::new(&app.edit_base).w_full()))
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .line_height(px(theme::FONT_CAPTION_LEADING))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(tk.text_2)
+                                    .child("模型目录"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .line_height(px(theme::FONT_CAPTION_LEADING))
+                                    .text_color(tk.text_3)
+                                    .child(models.join(" · ")),
+                            ),
+                    )
+                    .child(hint("其余字段在 settings.json 中，请直接编辑对应段。")),
+                {
+                    let t = this.clone();
+                    move |cx: &mut App| {
+                        t.update(cx, |v, cx| {
+                            v.edit_customized_open = !v.edit_customized_open;
+                            cx.notify();
+                        });
+                    }
+                },
+            ),
+        )
+        .child(
+            // editorActions：取消 + 保存
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child({
+                    let t = this.clone();
+                    action_button("edit-cancel", "取消", false, move |_, _, cx| {
+                        t.update(cx, |v, cx| {
+                            v.editing_provider = None;
+                            cx.notify();
+                        });
+                    })
+                })
+                .child(action_button("edit-save", "保存", true, move |_, _, cx| {
+                    t_save.update(cx, |v, cx| {
+                        v.save_edit(cx);
+                        cx.notify();
+                    });
+                })),
+        )
+}
+
+/// 「添加提供方」卡（web addCard = 提供方选择 + ProviderEditor hideTitle）。
+fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
+    let tk = theme::t();
+    let t_save = this.clone();
+    let t_cancel = this.clone();
+
+    // 目录里未被 adopt 的提供方（DeepSeek 已内置）
+    let candidates: Vec<usize> = (0..PROVIDER_CATALOG.len())
+        .filter(|i| !app.settings.providers.iter().any(|p| p.id == PROVIDER_CATALOG[*i].id))
+        .collect();
+    let pick = candidates.iter().position(|i| *i == app.adopt_pick).map(|p| candidates[p]).unwrap_or(0);
+    let entry = &PROVIDER_CATALOG[pick];
+
+    let mut chooser = div().flex().flex_wrap().gap_2();
+    for (slot, ci) in candidates.iter().enumerate() {
+        let selected = *ci == pick;
+        let t = this.clone();
+        let idx = *ci;
+        let e = &PROVIDER_CATALOG[idx];
+        chooser = chooser.child(
+            div()
+                .id(SharedString::from(format!("adopt-pick-{idx}")))
+                .h(px(32.0))
+                .px(px(10.0))
+                .flex()
+                .items_center()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(if selected { tk.accent.into() } else { tk.border_l2 })
+                .text_size(px(theme::FONT_ROW))
+                .line_height(px(22.0))
+                .text_color(if selected { tk.accent } else { tk.text })
+                .cursor_pointer()
+                .hover(|s| s.bg(tk.hover))
+                .on_click(move |_, _, cx| {
+                    t.update(cx, |v, cx| {
+                        v.adopt_pick = idx;
+                        cx.notify();
+                    });
+                })
+                .child(e.name),
+        );
+        let _ = slot;
+    }
+
+    div()
+        .v_flex()
+        .gap(px(14.0))
+        .rounded(px(12.0))
+        .bg(tk.surface_2)
+        .px(px(16.0))
+        .py(px(14.0))
+        .child(field("提供方", chooser))
+        .child(field("API 密钥", Input::new(&app.adopt_key).w_full()))
+        .child(
+            disclosure(
+                "adopt-customized",
+                "自定义设置",
+                app.adopt_customized_open,
+                div()
+                    .v_flex()
+                    .gap(px(12.0))
+                    .pt_3()
+                    .child(field("API 地址", Input::new(&app.adopt_base).w_full()))
+                    .child(
+                        div()
+                            .v_flex()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .line_height(px(theme::FONT_CAPTION_LEADING))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(tk.text_2)
+                                    .child("模型目录"),
+                            )
+                            .child(hint(&format!("正在使用适配器默认模型（{}）", entry.model))),
+                    ),
+                {
+                    let t = this.clone();
+                    move |cx: &mut App| {
+                        t.update(cx, |v, cx| {
+                            v.adopt_customized_open = !v.adopt_customized_open;
+                            cx.notify();
+                        });
+                    }
+                },
+            ),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(action_button("adopt-cancel", "取消", false, move |_, _, cx| {
+                    t_cancel.update(cx, |v, cx| {
+                        v.adding = AddingMode::None;
+                        cx.notify();
+                    });
+                }))
+                .child(action_button("adopt-save", "保存", true, move |_, window, cx| {
+                    let (key, base) = t_save.read_with(cx, |v, _| (v.adopt_key.clone(), v.adopt_base.clone()));
+                    let outcome = t_save.update(cx, |v, cx| {
+                        let r = v.adopt_provider(cx);
+                        if r.is_ok() {
+                            v.adding = AddingMode::None;
+                        }
+                        cx.notify();
+                        r
+                    });
+                    if outcome.is_ok() {
+                        key.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                        base.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                    }
+                })),
+        )
+}
+
+/// 「添加自定义提供方」卡（web CustomProviderCard：六字段 + 模型目录 + 创建）。
+fn declare_card(app: &AppView, this: &Entity<AppView>, cx: &App) -> Div {
+    let tk = theme::t();
+    let t_create = this.clone();
+    let t_cancel = this.clone();
+    let t_add_model = this.clone();
+
+    // route 校验提示（web：invalid/taken → error；否则 hint）
+    let route_val = app.dc_route.read_with(cx, |s, _| s.value().trim().to_string());
+    let route_msg = if !route_val.is_empty() && !valid_route_id(&route_val) {
+        ("需以小写字母开头，之后可用小写字母、数字和短横线。", true)
+    } else if app.settings.providers.iter().any(|p| p.id == route_val) || route_val == "deepseek" {
+        ("已有提供方使用了这个 ID。", true)
+    } else {
+        ("以小写字母开头的标识，在请求中唯一标识该提供方，并用于派生凭据名。", false)
+    };
+
+    // 模型行列表（web .modelList/.modelEntry：l2 描边 r8 pad6 + 删除）
+    let mut model_list = div().v_flex().gap_2();
+    for (i, m) in app.dc_models.iter().enumerate() {
+        let t = this.clone();
+        model_list = model_list.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(tk.border_l2)
+                .px(px(10.0))
+                .py(px(6.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(22.0))
+                        .text_color(tk.text)
+                        .child(m.clone()),
+                )
+                .child({
+                    let t = t.clone();
+                    div()
+                        .id(SharedString::from(format!("dc-model-del-{i}")))
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(theme::FONT_CAPTION_LEADING))
+                        .text_color(tk.text_3)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(tk.text_2).bg(tk.hover))
+                        .on_click(move |_, _, cx| {
+                            let i = i;
+                            t.update(cx, |v, cx| {
+                                v.dc_models.remove(i);
+                                cx.notify();
+                            });
+                        })
+                        .child("删除模型")
+                }),
+        );
+    }
+
+    let needs_hint = if app.dc_models.is_empty() {
+        Some("自定义提供方至少需要一个模型。")
+    } else {
+        None
+    };
+
+    div()
+        .v_flex()
+        .gap(px(14.0))
+        .rounded(px(12.0))
+        .bg(tk.surface_2)
+        .px(px(16.0))
+        .py(px(14.0))
+        // editorHeader
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(22.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tk.text)
+                        .child("自定义提供方"),
+                ),
+        )
+        .child(field("Provider ID", Input::new(&app.dc_route).w_full()))
+        .child(
+            div()
+                .text_size(px(theme::FONT_CAPTION))
+                .line_height(px(theme::FONT_CAPTION_LEADING))
+                .text_color(if route_msg.1 { tk.error } else { tk.text_3 })
+                .child(route_msg.0),
+        )
+        .child(field("显示名称", Input::new(&app.dc_name).w_full()))
+        .child(field("API 地址", Input::new(&app.dc_base).w_full()))
+        .child(field("API 协议", protocol_field("openai")))
+        .child(field("API 密钥", Input::new(&app.dc_key).w_full()))
+        // 模型目录
+        .child(
+            div()
+                .v_flex()
+                .gap(px(10.0))
+                .pt_3()
+                .border_t_1()
+                .border_color(tk.border_l2)
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(theme::FONT_CAPTION_LEADING))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tk.text_2)
+                        .child("模型目录"),
+                )
+                .child(model_list)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Input::new(&app.dc_new_model).w(px(240.0)))
+                        .child(link_button("dc-add-model", "添加模型", move |_, window, cx| {
+                            let entities = t_add_model.read_with(cx, |v, _| v.dc_new_model.clone());
+                            t_add_model.update(cx, |v, cx| {
+                                v.dc_push_model(cx);
+                                cx.notify();
+                            });
+                            entities.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                        })),
+                )
+                .children(needs_hint.map(hint)),
+        )
+        .child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(action_button("declare-cancel", "取消", false, move |_, window, cx| {
+                    let ents = t_cancel.read_with(cx, |v, _| {
+                        (v.dc_route.clone(), v.dc_name.clone(), v.dc_base.clone(), v.dc_key.clone(), v.dc_new_model.clone())
+                    });
+                    t_cancel.update(cx, |v, cx| {
+                        v.adding = AddingMode::None;
+                        v.dc_models.clear();
+                        cx.notify();
+                    });
+                    let (a, b, c, d, e) = ents;
+                    for ent in [a, b, c, d, e] {
+                        ent.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                    }
+                }))
+                .child(action_button("declare-create", "创建提供方", true, move |_, window, cx| {
+                    let outcome = t_create.update(cx, |v, cx| {
+                        let r = v.declare_provider(cx);
+                        if r.is_ok() {
+                            v.adding = AddingMode::None;
+                            v.dc_models.clear();
+                        }
+                        cx.notify();
+                        r
+                    });
+                    if outcome.is_ok() {
+                        let ents = t_create.read_with(cx, |v, _| {
+                            (v.dc_route.clone(), v.dc_name.clone(), v.dc_base.clone(), v.dc_key.clone(), v.dc_new_model.clone())
+                        });
+                        let (a, b, c, d, e) = ents;
+                        for ent in [a, b, c, d, e] {
+                            ent.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                        }
+                    }
+                })),
+        )
+}
+
+/// 字段行（web .field：label 12/18 wt500 secondary + 控件 gap6）。
+fn field(label: &str, control: impl IntoElement) -> Div {
+    let tk = theme::t();
+    div()
+        .v_flex()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(theme::FONT_CAPTION))
+                .line_height(px(theme::FONT_CAPTION_LEADING))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(tk.text_2)
                 .child(label.to_string()),
         )
         .child(control)
 }
 
-/// 胶囊按钮（主色填充 / 描边两型）。
-fn pill_button(
+/// 12/18 tertiary 提示行（web .advancedHint）。
+fn hint(text: &str) -> Div {
+    let tk = theme::t();
+    div()
+        .text_size(px(theme::FONT_CAPTION))
+        .line_height(px(theme::FONT_CAPTION_LEADING))
+        .text_color(tk.text_3)
+        .child(text.to_string())
+}
+
+/// 协议字段（web select：右侧 12px chevron 的胶囊框，恒 openai）。
+fn protocol_field(value: &'static str) -> Div {
+    let tk = theme::t();
+    div()
+        .w(px(240.0))
+        .h(px(32.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .px(px(10.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(tk.border_l2)
+        .bg(tk.layer1)
+        .text_size(px(theme::FONT_ROW))
+        .line_height(px(22.0))
+        .text_color(tk.text)
+        .child(value)
+        .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(tk.caption))
+}
+
+/// 折叠区（web details.customized：summary 12/18 wt500 secondary + 旋转 chevron）。
+fn disclosure(id: &'static str, label: &'static str, open: bool, body: Div, on_toggle: impl Fn(&mut App) + 'static) -> Div {
+    let tk = theme::t();
+    let mut col = div().v_flex().child(
+        div()
+            .id(id)
+                        .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px_1()
+            .text_size(px(theme::FONT_CAPTION))
+            .line_height(px(theme::FONT_CAPTION_LEADING))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(tk.text_2)
+            .cursor_pointer()
+            .hover(|s| s.text_color(tk.text))
+            .on_click(move |_, _, cx| on_toggle(cx))
+            .child(if open { "▾" } else { "▸" })
+            .child(label),
+    );
+    if open {
+        col = col.child(body);
+    }
+    col
+}
+
+/// h36 r18 动作按钮（web .primaryButton/.secondaryButton）。
+/// primary = 品牌填充（暗色主题为浅底深字的反转设计）。
+fn action_button(
     id: impl Into<ElementId>,
     label: &'static str,
     primary: bool,
@@ -660,25 +1065,51 @@ fn pill_button(
     let tk = theme::t();
     div()
         .id(id)
-        .h(px(28.0))
-        .px_3()
+        .h(px(36.0))
+        .px(px(14.0))
         .flex()
         .items_center()
-        .rounded(px(14.0))
+        .justify_center()
+        .rounded(px(18.0))
         .map(|d| {
             if primary {
-                d.bg(tk.accent).text_color(gpui::white()).hover(|s| s.bg(tk.accent_hover))
+                // web button-primary：fill=brand-primary（暗=近白/亮=墨），字=foreground 反色
+                d.bg(tk.text)
+                    .text_color(tk.bg_base)
+                    .hover(|s| s.opacity(0.9))
             } else {
                 d.border_1()
                     .border_color(tk.border_l2)
-                    .text_color(tk.text_2)
+                    .text_color(tk.text)
                     .hover(|s| s.bg(tk.hover))
             }
         })
-        .text_size(px(theme::FONT_TAB))
-        .line_height(px(20.0))
-        .font_weight(if primary { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+        .text_size(px(theme::FONT_ROW))
+        .line_height(px(22.0))
         .cursor_pointer()
+        .on_click(on_click)
+        .child(label)
+}
+
+/// h28 linkButton（web .linkButton：透明、12/18 tertiary、hover 白8%）。
+fn link_button(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let tk = theme::t();
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .rounded(px(14.0))
+        .text_size(px(theme::FONT_CAPTION))
+        .line_height(px(theme::FONT_CAPTION_LEADING))
+        .text_color(tk.text_3)
+        .cursor_pointer()
+        .hover(|s| s.bg(tk.hover).text_color(tk.text_2))
         .on_click(on_click)
         .child(label)
 }
@@ -687,7 +1118,6 @@ fn pill_button(
 fn add_button(
     id: &'static str,
     label: &'static str,
-    icon: IconName,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let tk = theme::t();
@@ -710,50 +1140,10 @@ fn add_button(
         .cursor_pointer()
         .hover(|s| s.bg(tk.hover))
         .on_click(on_click)
-        .child(Icon::new(icon).size(px(14.0)).text_color(tk.text_2))
+        .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(tk.text_2))
         .child(label)
 }
 
-/// 预设 chip（点击把预设填进编辑卡）。
-fn preset_chip(
-    id: &'static str,
-    label: &'static str,
-    name: &'static str,
-    base: &'static str,
-    model: &'static str,
-    this: &Entity<AppView>,
-) -> Stateful<Div> {
-    let tk = theme::t();
-    let t = this.clone();
-    div()
-        .id(id)
-        .h(px(28.0))
-        .px_3()
-        .flex()
-        .items_center()
-        .rounded(px(14.0))
-        .border_1()
-        .border_color(tk.border_l2)
-        .text_size(px(theme::FONT_TAB))
-        .line_height(px(20.0))
-        .text_color(tk.text_2)
-        .cursor_pointer()
-        .hover(|s| s.bg(tk.hover))
-        .on_click(move |_, window, cx| {
-            let entities = t.read_with(cx, |v, _| (v.np_name.clone(), v.np_base.clone(), v.np_model.clone()));
-            let (a, b, c) = entities;
-            if !name.is_empty() {
-                a.update(cx, |s: &mut InputState, cx| s.set_value(name, window, cx));
-            }
-            if !base.is_empty() {
-                b.update(cx, |s: &mut InputState, cx| s.set_value(base, window, cx));
-            }
-            if !model.is_empty() {
-                c.update(cx, |s: &mut InputState, cx| s.set_value(model, window, cx));
-            }
-        })
-        .child(label)
-}
 
 
 /// 空态页（插件 / Agent 预设）。

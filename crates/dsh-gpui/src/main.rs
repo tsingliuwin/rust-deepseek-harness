@@ -1743,14 +1743,14 @@ impl Render for AppView {
                 drag_target.update(cx, |v, cx| match side {
                     DragSide::Sidebar => {
                         let w = x.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-                        if (w - v.sidebar_width).abs() > 0.5 {
+                        if (w - v.sidebar_width).abs() >= 1.0 {
                             v.sidebar_width = w;
                             cx.notify();
                         }
                     }
                     DragSide::Details => {
                         let w = (vw - x).clamp(DETAILS_MIN, DETAILS_MAX);
-                        if (w - v.details_width).abs() > 0.5 {
+                        if (w - v.details_width).abs() >= 1.0 {
                             v.details_width = w;
                             cx.notify();
                         }

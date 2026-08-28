@@ -481,12 +481,15 @@ fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, cx: 
         .providers
         .iter()
         .map(|p| {
+            // web：只有 hand-declared（目录外）的 route 才打「自定义」tag；
+            // 「添加提供方」采用的目录 route 不算自定义。
+            let custom = !PROVIDER_CATALOG.iter().any(|e| e.id == p.id);
             provider_row(
                 app,
                 this,
                 &p.id,
                 if p.name.is_empty() { &p.id } else { &p.name },
-                true,
+                custom,
                 !p.api_key.is_empty(),
                 None, // 可编辑 + 可删除
             )

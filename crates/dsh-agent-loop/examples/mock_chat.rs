@@ -102,6 +102,7 @@ async fn main() {
             model: "mock".into(),
             max_tokens: None,
             system_prompt: Some("You are a concise assistant.".into()),
+            compaction: Default::default(),
         },
         llm,
         tools,

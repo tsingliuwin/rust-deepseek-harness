@@ -428,6 +428,13 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
             );
             Some(SessionEvent::ToolResult { turn: 0, step: 0, message: msg })
         }
+        // 我们自己的压缩/步末事件（step/end 落盘保证 seq 1:1 对齐，
+        // 压缩的 beforeSeq 依赖它；web 端按未知类型忽略）
+        "step/end" => Some(SessionEvent::StepEnd { turn: num(data, "turn"), step: num(data, "step") }),
+        "compaction/summary" => Some(SessionEvent::Compaction {
+            before_seq: num(data, "beforeSeq"),
+            summary: data?.get("summary").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        }),
         _ => None,
     }
 }
@@ -445,7 +452,6 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         SessionEvent::TurnStart { turn } => Some(row("turn/start", serde_json::json!({"turn": turn}))),
         SessionEvent::TurnEnd { turn, .. } => Some(row("turn/end", serde_json::json!({"turn": turn, "reason": {"kind": "completed"}}))),
         SessionEvent::StepStart { turn, step } => Some(row("step/start", serde_json::json!({"turn": turn, "step": step}))),
-        SessionEvent::StepEnd { .. } => None,
         SessionEvent::UserMessage(m) => Some(row("user/message", serde_json::json!({
             "content": blocks_to_web(&m.content),
             "source": {"kind": "user"},
@@ -469,6 +475,12 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
                 "content": blocks_to_web(block.1),
                 "isError": block.2.unwrap_or(false),
             })))
+        }
+        SessionEvent::StepEnd { turn, step } => {
+            Some(row("step/end", serde_json::json!({"turn": turn, "step": step})))
+        }
+        SessionEvent::Compaction { before_seq, summary } => {
+            Some(row("compaction/summary", serde_json::json!({"beforeSeq": before_seq, "summary": summary})))
         }
         _ => None,
     }

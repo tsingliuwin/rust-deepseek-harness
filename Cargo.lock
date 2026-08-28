@@ -1496,6 +1496,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dsh-agent",
+ "dsh-compaction",
  "dsh-cordis",
  "dsh-fs",
  "dsh-llm",
@@ -1510,6 +1511,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "dsh-compaction"
+version = "0.1.0"
+dependencies = [
+ "dsh-llm",
+ "dsh-session",
+ "futures",
 ]
 
 [[package]]
@@ -1535,6 +1545,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "dsh-agent-loop",
+ "dsh-compaction",
  "dsh-cordis",
  "dsh-fs",
  "dsh-llm",

@@ -78,6 +78,7 @@ async fn main() {
             model: "mock".into(),
             max_tokens: None,
             system_prompt: None,
+            compaction: Default::default(),
         },
         llm,
         Arc::new(ToolRegistry::new()),

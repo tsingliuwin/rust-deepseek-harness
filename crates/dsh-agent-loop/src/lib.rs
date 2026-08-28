@@ -40,6 +40,8 @@ pub struct AgentOptions {
     pub max_tokens: Option<u32>,
     /// Base system instructions, rendered ahead of registered prompt sections.
     pub system_prompt: Option<String>,
+    /// 上下文压缩配置（threshold_tokens = 0 禁用；默认 60k/6 条）。
+    pub compaction: dsh_compaction::CompactionConfig,
 }
 
 /// A live event emitted to UI/observers as the loop progresses.
@@ -52,6 +54,8 @@ pub enum AgentEvent {
     ToolResult { tool_call_id: CallId, is_error: bool },
     AssistantMessage { message: Message },
     TurnEnded { turn: u64, reason: TurnEndReason },
+    /// 压缩事务完成：影子区前 `shadowed_messages` 条消息已由检查点替换。
+    Compacted { shadowed_messages: usize },
     Error { message: String, code: String },
 }
 
@@ -262,6 +266,56 @@ impl ReactLoopAgent {
         }
     }
 
+    /// 轮次起点的上下文压缩：估算 token 超阈值时，选影子区（工具配对安全
+    /// 边界）、以当前路由原样重放前缀 + 压缩指令发起辅助调用
+    /// （`AuxiliaryPurpose::Compaction`），摘要落 `SessionEvent::Compaction`
+    /// （derive_messages 侧生效）。失败静默跳过。
+    async fn maybe_compact(&self, assembly: &PromptAssembly) {
+        let config = { self.options.read().unwrap().compaction };
+        if config.threshold_tokens == 0 {
+            return;
+        }
+        let pairs = {
+            let s = self.session.lock().unwrap();
+            s.derive_messages_with_seqs()
+        };
+        if pairs.len() <= config.keep_recent {
+            return;
+        }
+        let msgs: Vec<Message> = pairs.iter().map(|(_, m)| m.clone()).collect();
+        if dsh_compaction::estimate_tokens(&msgs) <= config.threshold_tokens {
+            return;
+        }
+        let boundary = dsh_compaction::select_boundary(&msgs, config.keep_recent);
+        if boundary == 0 {
+            return;
+        }
+        let before_seq = pairs[boundary - 1].0;
+        let shadowed: Vec<Message> = pairs[..boundary].iter().map(|(_, m): &(u64, Message)| m.clone()).collect();
+        let (provider, model) = {
+            let o = self.options.read().unwrap();
+            (o.provider.clone(), o.model.clone())
+        };
+        let signal = self.abort.lock().unwrap().clone();
+        match dsh_compaction::summarize_with_llm(
+            &self.llm,
+            &provider,
+            &model,
+            Some(assembly.system.clone()),
+            Some(assembly.tools.clone()),
+            &shadowed,
+            signal,
+        )
+        .await
+        {
+            Ok(summary) => {
+                self.append_event(SessionEvent::Compaction { before_seq, summary });
+                self.emit_ui(AgentEvent::Compacted { shadowed_messages: boundary });
+            }
+            Err(_) => {}
+        }
+    }
+
     async fn run_turn(&self) {
         let turn = {
             let s = self.session.lock().unwrap();
@@ -269,6 +323,11 @@ impl ReactLoopAgent {
         };
         self.append_event(SessionEvent::TurnStart { turn });
         self.emit_ui(AgentEvent::TurnStarted { turn });
+
+        // 上下文压缩：轮次起点检查估算 token，超阈值则摘要影子区
+        // （失败尽力而为——本轮按未压缩继续）
+        let assembly = self.assemble_prompt();
+        self.maybe_compact(&assembly).await;
 
         let mut target = InboxTarget::NextTurn;
         let mut turn_ends: Option<TurnEndReason> = None;

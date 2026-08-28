@@ -14,6 +14,7 @@ members = [
   "crates/dsh-shell",
   "crates/dsh-web",
   "crates/dsh-search",
+  "crates/dsh-compaction",
   "crates/dsh-persist",
 ]
 

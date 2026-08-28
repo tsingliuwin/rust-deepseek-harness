@@ -17,6 +17,7 @@ dsh-fs = { path = "../dsh-fs" }
 dsh-shell = { path = "../dsh-shell" }
 dsh-web = { path = "../dsh-web" }
 dsh-search = { path = "../dsh-search" }
+dsh-compaction = { path = "../dsh-compaction" }
 dsh-persist = { path = "../dsh-persist" }
 dsh-session = { path = "../dsh-session" }
 tokio.workspace = true

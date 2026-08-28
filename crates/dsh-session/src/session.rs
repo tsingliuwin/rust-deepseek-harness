@@ -85,6 +85,12 @@ pub enum SessionEvent {
         reason: HeaderReason,
     },
     RequestContext(RequestContext),
+    /// 压缩事务：影子区（来源 seq <= before_seq 的消息）由检查点消息替换
+    /// （web compaction/start→summary→end 的合并承载）。
+    Compaction {
+        before_seq: u64,
+        summary: String,
+    },
 }
 
 /// A log entry: the event plus its monotonic sequence number.
@@ -92,6 +98,18 @@ pub enum SessionEvent {
 pub struct SessionEntry {
     pub seq: u64,
     pub event: SessionEvent,
+}
+
+/// 检查点消息帧形（web CHECKPOINT_PREAMBLE + SUMMARY 标签；与
+/// dsh-compaction::frame_checkpoint 保持一致——压缩替换消息的权威构形）。
+pub fn compaction_checkpoint_message(summary: &str) -> dsh_llm::Message {
+    const PREAMBLE: &str = "\
+This is an automatically generated checkpoint condensing an earlier span of the conversation to free up context. \
+Treat the captured context as established background and build on it without restating it. \
+Continue the task directly from the messages that follow, without acknowledging this checkpoint.";
+    dsh_llm::Message::user_text(format!(
+        "{PREAMBLE}\n\n<compacted-summary>\n{summary}\n</compacted-summary>"
+    ))
 }
 
 /// The append-only session log and in-memory store.
@@ -147,18 +165,39 @@ impl Session {
     /// Only message-producing surface events (`user/message`,
     /// `assistant/message` — skipping empty content — and `tool/result`)
     /// derive to a message; boundaries, chunks, and headers do not.
+    /// 压缩事件（`Compaction`）丢弃影子区（来源 seq <= before_seq）并注入
+    /// 检查点消息。
     pub fn derive_messages(&self) -> Vec<dsh_llm::Message> {
-        self.entries
-            .iter()
-            .filter_map(|e| match &e.event {
-                SessionEvent::UserMessage(m) => Some(m.clone()),
-                SessionEvent::AssistantMessage { message, .. } => {
-                    if message.content.is_empty() { None } else { Some(message.clone()) }
-                }
-                SessionEvent::ToolResult { message, .. } => Some(message.clone()),
-                _ => None,
-            })
+        self.derive_messages_with_seqs()
+            .into_iter()
+            .map(|(_, m)| m)
             .collect()
+    }
+
+    /// [`Self::derive_messages`] 的带序版本：每条消息附带其来源事件 seq
+    /// （压缩选区需要知道影子区落点）。
+    pub fn derive_messages_with_seqs(&self) -> Vec<(u64, dsh_llm::Message)> {
+        // is_checkpoint 标记由 Compaction 事件派生的消息：新压缩无条件
+        // 替换所有旧检查点（web 同一语义——合并更新而非叠加）。
+        let mut out: Vec<(u64, dsh_llm::Message, bool)> = Vec::new();
+        for e in &self.entries {
+            match &e.event {
+                SessionEvent::UserMessage(m) => out.push((e.seq, m.clone(), false)),
+                SessionEvent::AssistantMessage { message, .. } => {
+                    if !message.content.is_empty() {
+                        out.push((e.seq, message.clone(), false));
+                    }
+                }
+                SessionEvent::ToolResult { message, .. } => out.push((e.seq, message.clone(), false)),
+                SessionEvent::Compaction { before_seq, summary } => {
+                    out.retain(|(seq, _, checkpoint)| !checkpoint && *seq > *before_seq);
+                    // 影子区是历史前缀：检查点插在保留消息之前（替换其位置）
+                    out.insert(0, (e.seq, compaction_checkpoint_message(summary), true));
+                }
+                _ => {}
+            }
+        }
+        out.into_iter().map(|(seq, m, _)| (seq, m)).collect()
     }
 
     /// The most recent request header epoch, if one was logged.
@@ -239,6 +278,30 @@ mod tests {
         let s2 = Session::from_events(SessionId::new("t"), events);
         assert_eq!(s2.derive_messages().len(), 2);
         assert_eq!(s2.first_user_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn compaction_shadows_region_and_injects_checkpoint() {
+        let mut s = Session::new(SessionId::new("t"));
+        s.append(SessionEvent::UserMessage(Message::user_text("old-1"))); // seq 0
+        s.append(SessionEvent::UserMessage(Message::user_text("old-2"))); // seq 1
+        s.append(SessionEvent::UserMessage(Message::user_text("keep"))); // seq 2
+        s.append(SessionEvent::Compaction { before_seq: 1, summary: "## Current Work\n- x".into() });
+
+        let msgs = s.derive_messages();
+        assert_eq!(msgs.len(), 2);
+        assert!(!msgs.iter().any(|m| m.content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "old-1" || text == "old-2"))));
+        let ContentBlock::Text { text } = &msgs[0].content[0] else { panic!() };
+        assert!(text.contains("<compacted-summary>"));
+        assert!(text.contains("## Current Work"));
+        assert_eq!(msgs[1].content[0], ContentBlock::Text { text: "keep".into() });
+
+        // 第二次压缩替换到更晚的落点
+        s.append(SessionEvent::Compaction { before_seq: 2, summary: "merged".into() });
+        let msgs = s.derive_messages();
+        assert_eq!(msgs.len(), 1);
+        let ContentBlock::Text { text } = &msgs[0].content[0] else { panic!() };
+        assert!(text.contains("merged") && !text.contains("keep"));
     }
 
     #[test]

@@ -1,0 +1,10 @@
+[package]
+name = "dsh-compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-llm = { path = "../dsh-llm" }
+dsh-session = { path = "../dsh-session" }
+futures.workspace = true

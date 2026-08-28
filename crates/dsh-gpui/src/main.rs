@@ -71,6 +71,8 @@ enum Role {
     User,
     Assistant,
     Error,
+    /// 系统提示分隔条（压缩检查点等非消息事件的可视化）
+    Notice,
 }
 
 #[derive(Clone)]
@@ -1188,6 +1190,9 @@ impl AppView {
                         attach_tool_result(self.entries.last_mut(), &tool_call_id.0, &result_text, is_error.unwrap_or(false));
                     }
                 }
+                SessionEvent::Compaction { .. } => {
+                    self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None });
+                }
                 _ => {}
             }
         }
@@ -1369,6 +1374,9 @@ impl AppView {
                     done: true,
                     elapsed: None,
                 });
+            }
+            AgentEvent::Compacted { .. } => {
+                self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None });
             }
         }
         // 智能吸底：只有用户本来就贴在底部时才跟随滚动（web 同款行为）；
@@ -2201,6 +2209,25 @@ impl AppView {
                             div().flex_1().min_w_0().text_color(theme::t().text_2).child(text),
                         ),
                 )
+            }
+            Role::Notice => {
+                // 压缩分隔条：居中 hairline + 说明文字（web compaction 提示行）
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .py(px(4.0))
+                    .child(div().flex_1().h(px(1.0)).bg(theme::t().border_l2))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .line_height(px(theme::FONT_CAPTION_LEADING))
+                            .text_color(theme::t().text_3)
+                            .child("上下文已压缩 · 已生成摘要检查点"),
+                    )
+                    .child(div().flex_1().h(px(1.0)).bg(theme::t().border_l2))
             }
         }
     }
@@ -4045,6 +4072,7 @@ fn main() {
             model: model.clone(),
             max_tokens: None,
             system_prompt: Some("You are DeepSeek Harness (Rust), a helpful coding agent.".into()),
+            compaction: dsh_compaction::CompactionConfig::default(),
         },
         Arc::clone(&llm),
         tools,

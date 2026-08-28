@@ -1639,7 +1639,9 @@ impl AppView {
                 } else {
                     None
                 };
-                let mut row = div()
+                // web 结构：root(v_flex) > row(24px header) + thinkBody(展开体)
+                // 展开体是 header 的兄弟节点，不在 24px 行内
+                let header = div()
                     .id(("think-row", (ei * 1000 + bi) as u64))
                     .relative()
                     .overflow_hidden()
@@ -1685,8 +1687,12 @@ impl AppView {
                             .text_color(theme::t().text_3)
                             .child(first_line(text)),
                     );
+                if let Some(ms) = sweep_ms {
+                    let _ = ms;
+                }
+                let mut wrapper = div().w_full().v_flex().child(header);
                 if open {
-                    row = row.child(
+                    wrapper = wrapper.child(
                         div()
                             .pt_1()
                             .pb_1()
@@ -1705,10 +1711,7 @@ impl AppView {
                             ),
                     );
                 }
-                if let Some(ms) = sweep_ms {
-                    row = row.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
-                }
-                div().w_full().child(row).into_any_element()
+                wrapper.into_any_element()
             }
 
             MsgBlock::Tool(tool) => {
@@ -1721,7 +1724,7 @@ impl AppView {
                 } else {
                     None
                 };
-                let mut row = div()
+                let header = div()
                     .id(("tool-row", (ei * 1000 + bi) as u64))
                     .relative()
                     .overflow_hidden()
@@ -1782,18 +1785,17 @@ impl AppView {
                             .text_color(if tool.error { theme::t().error } else { theme::t().text_3 })
                             .child(first_line(&tool.arguments)),
                     );
+                let _ = sweep_ms;
+                let mut wrapper = div().w_full().v_flex().child(header);
                 if open {
-                    row = row.child(io_card(
+                    wrapper = wrapper.child(io_card(
                         (ei * 1000 + bi) as u64,
                         &tool.arguments,
                         tool.result.as_deref(),
                         tool.error,
                     ));
                 }
-                if let Some(ms) = sweep_ms {
-                    row = row.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
-                }
-                div().w_full().child(row).into_any_element()
+                wrapper.into_any_element()
             }
         }
     }

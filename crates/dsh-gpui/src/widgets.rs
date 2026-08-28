@@ -364,9 +364,458 @@ pub(crate) fn row_sweep(elapsed_ms: u64, width: f32) -> Div {
                 )),
         )
 }
-/// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
-pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {
+/// 展开体行数上限（web CHAT_READ/DIFF_MAX_LINES = 8：头 4 + 尾 4，
+/// 中段以「… 其余 N 行」折叠钮开合）。
+const CARD_MAX_LINES: usize = 8;
+
+/// 折叠行（web FoldToggle + .expand：左对齐、tertiary、hover secondary）。
+/// 点击回调由持有状态的渲染站点注入。
+pub(crate) fn fold_toggle(
+    uid: u64,
+    hidden: usize,
+    expanded: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let label = if expanded {
+        "收起".to_string()
+    } else {
+        format!("… 其余 {hidden} 行")
+    };
+    div()
+        .id(("tool-fold", uid))
+        .w_full()
+        .cursor_pointer()
+        .text_color(theme::t().text_3)
+        .hover(|s| s.text_color(theme::t().text_2))
+        .on_click(on_toggle)
+        .child(label)
+}
+
+/// 终端卡（web TerminalBlock .block/.header/.output，行内绑定：
+/// mono 12/18、banner 上限 150 内滚动、输出上限 224 内滚动、gutter 30px
+/// 状态点列）。running 只画 banner；settled 有 l2 分隔线 + 输出（空输出
+/// 画「无输出」占位）。dsh-shell 无退出码元数据，状态只由点色承载：
+/// 运行 accent、成功 green、失败 error。
+pub(crate) fn terminal_card(
+    uid: u64,
+    command: &str,
+    cwd: &str,
+    output: Option<&str>,
+    running: bool,
+    error: bool,
+) -> Div {
+    let dot_color = if running {
+        theme::t().accent
+    } else if error {
+        theme::t().error
+    } else {
+        theme::t().green
+    };
+    let cwd_label = prompt_label(cwd);
+    let body = command.strip_suffix('\n').unwrap_or(command);
+    let command_lines: Vec<&str> = if body.is_empty() { vec![""] } else { body.split('\n').collect() };
+    // prompt 行（cwd 标注整次调用，只在首行出现；后续行裸 `$` 对齐）
+    let mut prompt = div().v_flex().min_w_0().flex_1();
+    for (i, line) in command_lines.iter().enumerate() {
+        prompt = prompt.child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .min_w_0()
+                .line_height(px(18.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(theme_mono())
+                        .text_size(px(12.0))
+                        .text_color(theme::t().text_3)
+                        .child(if i == 0 { cwd_label.clone() } else { "$".to_string() }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .font_family(theme_mono())
+                        .text_size(px(12.0))
+                        .text_color(theme::t().text)
+                        .child(line.to_string()),
+                ),
+        );
+    }
+    // banner：settled 且有非空输出时附「复制」（复制原始输出）
+    let mut banner = div()
+        .id(("term-banner", uid))
+        .relative()
+        .flex()
+        .items_start()
+        .gap_3()
+        .pt(px(9.0))
+        .pr(px(14.0))
+        .pb(px(9.0))
+        .pl(px(30.0))
+        .max_h(px(150.0))
+        .overflow_y_scroll()
+        .child(prompt);
+    if !running
+        && let Some(text) = output
+        && !text.trim().is_empty()
+    {
+        let raw = text.to_string();
+        banner = banner.child(
+            div()
+                .id(("term-copy", uid))
+                .flex_none()
+                .cursor_pointer()
+                .font_family(theme_mono())
+                .text_size(px(13.0))
+                .line_height(px(18.0))
+                .text_color(theme::t().text_2)
+                .hover(|s| s.text_color(theme::t().text))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(raw.clone()));
+                })
+                .child("复制"),
+        );
+    }
     let mut card = div()
+        .relative()
+        .ml_1()
+        .mt_1()
+        .mb_1()
+        .overflow_hidden()
+        .rounded(px(12.0))
+        .bg(theme::t().code_bg)
+        .child(banner);
+    // 状态点：卡片自己的 gutter 列（左 8px），对首行行盒垂直居中
+    card = card.child(
+        div()
+            .absolute()
+            .left(px(8.0))
+            .top(px(14.0))
+            .child(state_dot(dot_color)),
+    );
+    if !running {
+        card = card.child(div().h(px(1.0)).w_full().bg(theme::t().border_l2));
+        let empty = output.map(|o| o.trim().is_empty()).unwrap_or(true);
+        if empty {
+            card = card.child(
+                div()
+                    .pt(px(12.0))
+                    .pr(px(14.0))
+                    .pb(px(12.0))
+                    .pl(px(30.0))
+                    .font_family(theme_mono())
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .text_color(theme::t().text_3)
+                    .child("无输出"),
+            );
+        } else {
+            let text = output.unwrap_or_default();
+            let mut out = div()
+                .id(("term-out", uid))
+                .pt(px(12.0))
+                .pr(px(14.0))
+                .pb(px(12.0))
+                .pl(px(30.0))
+                .max_h(px(224.0))
+                .overflow_y_scroll()
+                .overflow_x_scroll()
+                .font_family(theme_mono())
+                .text_size(px(12.0))
+                .line_height(px(18.0))
+                .text_color(theme::t().text);
+            // 尾部换行是终结符，不是额外空行（web parse 后按渲染行裁剪）
+            let trimmed = text.strip_suffix('\n').unwrap_or(text);
+            for line in trimmed.split('\n') {
+                out = out.child(div().min_h(px(18.0)).whitespace_nowrap().child(line.to_string()));
+            }
+            card = card.child(out);
+        }
+    }
+    card
+}
+
+/// 终端 prompt 的 cwd 标签（web promptLabel：home 折叠 ~，否则末段）。
+fn prompt_label(cwd: &str) -> String {
+    let trimmed = cwd.trim_end_matches(['/', '\\']);
+    if let Ok(home) = std::env::var("HOME")
+        && trimmed == home.trim_end_matches(['/', '\\'])
+    {
+        return "~".into();
+    }
+    match trimmed.rsplit(['/', '\\']).next() {
+        Some(seg) if !seg.is_empty() => seg.to_string(),
+        _ => cwd.to_string(),
+    }
+}
+
+/// 读取卡（web ReadBlock：banner（banner 底、路径 mono 标签 + 语言 + 复制）
+/// + 48px 行号 gutter 正文，mono 13/22，8 行上限折叠）。
+pub(crate) fn read_card(
+    uid: u64,
+    label: &str,
+    lang: &str,
+    text: &str,
+    expanded: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + Clone,
+) -> Div {
+    let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();
+    let total = lines.len();
+    let hidden = total.saturating_sub(CARD_MAX_LINES);
+    let capped = hidden > 0 && !expanded;
+    let (head, tail) = if capped {
+        (CARD_MAX_LINES - CARD_MAX_LINES / 2, CARD_MAX_LINES / 2)
+    } else {
+        (total, 0)
+    };
+    let mut body = div()
+        .id(("read-body", uid))
+        .py(px(12.0))
+        .overflow_x_scroll()
+        .font_family(theme_mono())
+        .text_size(px(13.0))
+        .line_height(px(22.0));
+    let row = |num: usize, text: &str| -> Div {
+        div()
+            .flex()
+            .min_h(px(22.0))
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(48.0))
+                    .pr(px(14.0))
+                    .text_right()
+                    .text_color(theme::t().text_3)
+                    .child(num.to_string()),
+            )
+            .child(div().text_color(theme::t().text).child(text.to_string()))
+    };
+    for (i, line) in lines[..head].iter().enumerate() {
+        body = body.child(row(i + 1, line));
+    }
+    if hidden > 0 {
+        body = body.child(
+            fold_toggle(uid, hidden, expanded, on_toggle.clone()).pl(px(48.0)),
+        );
+    }
+    if tail > 0 {
+        for (i, line) in lines[total - tail..].iter().enumerate() {
+            body = body.child(row(total - tail + i + 1, line));
+        }
+    }
+    let mut banner = div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .px(px(14.0))
+        .py(px(9.0))
+        .bg(theme::t().code_banner)
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .font_family(theme_mono())
+                .text_size(px(12.0))
+                .line_height(px(18.0))
+                .text_color(theme::t().text)
+                .child(label.to_string()),
+        );
+    let mut action = div().flex_none().flex().items_center().gap_3();
+    if !lang.is_empty() {
+        action = action.child(
+            div()
+                .font_family(theme_mono())
+                .text_size(px(12.0))
+                .line_height(px(18.0))
+                .text_color(theme::t().text_3)
+                .child(lang.to_string()),
+        );
+    }
+    let raw = text.to_string();
+    action = action.child(
+        div()
+            .id(("read-copy", uid))
+            .cursor_pointer()
+            .text_size(px(13.0))
+            .line_height(px(18.0))
+            .text_color(theme::t().text_2)
+            .hover(|s| s.text_color(theme::t().text))
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(raw.clone()));
+            })
+            .child("复制"),
+    );
+    banner = banner.child(action);
+    div()
+        .ml_1()
+        .mt_1()
+        .mb_1()
+        .overflow_hidden()
+        .rounded(px(12.0))
+        .bg(theme::t().code_bg)
+        .child(banner)
+        .child(body)
+}
+
+/// 差异卡（web DiffBlock，fs write 单 hunk：oldText = null → 全 + 行，
+/// 路径头 600 weight，复制钮悬浮右上，footer `└ +A -R · N 个文件`，
+/// mono 13/22，8 行上限折叠）。
+pub(crate) fn diff_card(
+    uid: u64,
+    path: &str,
+    new_text: &str,
+    expanded: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + Clone,
+) -> Div {
+    let lines: Vec<&str> = new_text.strip_suffix('\n').unwrap_or(new_text).split('\n').collect();
+    let added = lines.len();
+    let total = added + 1; // + 路径头
+    let hidden = total.saturating_sub(CARD_MAX_LINES);
+    let capped = hidden > 0 && !expanded;
+    let (head, tail) = if capped {
+        (CARD_MAX_LINES - CARD_MAX_LINES / 2, CARD_MAX_LINES / 2)
+    } else {
+        (total, 0)
+    };
+    let copy_rows = {
+        let mut s = String::new();
+        s.push_str(path);
+        s.push('\n');
+        for l in &lines {
+            s.push_str("+ ");
+            s.push_str(l);
+            s.push('\n');
+        }
+        s
+    };
+    let mut body = div()
+        .id(("diff-body", uid))
+        .p(px(12.0))
+        .overflow_x_scroll()
+        .font_family(theme_mono())
+        .text_size(px(13.0))
+        .line_height(px(22.0));
+    let path_row = || {
+        div()
+            .min_h(px(22.0))
+            .whitespace_nowrap()
+            .pr(px(56.0))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::t().text)
+            .child(path.to_string())
+    };
+    let add_row = |text: &str| {
+        div()
+            .min_h(px(22.0))
+            .whitespace_nowrap()
+            .text_color(theme::t().green)
+            .child(format!("+ {text}"))
+    };
+    // 行序列 = [路径头, +行…]；8 行上限切头尾（行按索引惰性构建，Div 不可克隆）
+    let row_for = |i: usize| -> Div {
+        if i == 0 {
+            path_row()
+        } else {
+            add_row(lines[i - 1])
+        }
+    };
+    for i in 0..head {
+        body = body.child(row_for(i));
+    }
+    if hidden > 0 {
+        body = body.child(fold_toggle(uid, hidden, expanded, on_toggle.clone()));
+    }
+    if tail > 0 {
+        for i in (total - tail)..total {
+            body = body.child(row_for(i));
+        }
+    }
+    let mut card = div()
+        .relative()
+        .ml_1()
+        .mt_1()
+        .mb_1()
+        .rounded(px(12.0))
+        .bg(theme::t().code_bg)
+        .child(body)
+        .child(
+            div()
+                .px(px(14.0))
+                .pb(px(12.0))
+                .font_family(theme_mono())
+                .text_size(px(13.0))
+                .line_height(px(22.0))
+                .text_color(theme::t().text_3)
+                .child(format!("└ +{added} -0 · 1 个文件")),
+        );
+    card = card.child(
+        div()
+            .id(("diff-copy", uid))
+            .absolute()
+            .top(px(8.0))
+            .right(px(12.0))
+            .cursor_pointer()
+            .text_size(px(13.0))
+            .line_height(px(18.0))
+            .text_color(theme::t().text_2)
+            .hover(|s| s.text_color(theme::t().text))
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_rows.clone()));
+            })
+            .child("复制"),
+    );
+    card
+}
+
+/// 网页获取卡（web WebFetchBlock：URL 链接（business 蓝、mono 13/19、
+/// break-all）+ 状态行；dsh-web 无 HTTP 状态码元数据，只画截断注记）。
+pub(crate) fn web_fetch_card(uid: u64, url: &str, truncated: bool) -> Div {
+    let open_url = url.to_string();
+    div()
+        .ml_1()
+        .mt_1()
+        .mb_1()
+        .p(px(12.0))
+        .rounded(px(12.0))
+        .bg(theme::t().code_bg)
+        .v_flex()
+        .gap(px(6.0))
+        .child(
+            div()
+                .id(("web-url", uid))
+                .cursor_pointer()
+                .font_family(theme_mono())
+                .text_size(px(13.0))
+                .line_height(px(19.0))
+                .text_color(theme::t().accent)
+                .hover(|s| s.underline())
+                .on_click(move |_, _, cx| {
+                    cx.open_url(&open_url);
+                })
+                .child(url.to_string()),
+        )
+        .when(truncated, |card| {
+            card.child(
+                div()
+                    .text_size(px(13.0))
+                    .line_height(px(18.0))
+                    .text_color(theme::t().text_3)
+                    .child("内容已截断"),
+            )
+        })
+}
+
+/// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
+pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {    let mut card = div()
         .ml_1()
         .mt_1()
         .mb_1()

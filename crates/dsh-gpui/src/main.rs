@@ -53,6 +53,8 @@ struct ToolBlock {
     result: Option<String>,
     error: bool,
     open: bool,
+    /// 读取/差异卡的 8 行折叠展开态（web 每实例 useState 的对应物）
+    expanded: bool,
 }
 
 #[derive(Clone)]
@@ -1154,6 +1156,7 @@ impl AppView {
                                     result: None,
                                     error: false,
                                     open: false,
+                                    expanded: false,
                                 }))
                             }
                             _ => {}
@@ -1334,6 +1337,7 @@ impl AppView {
                     result: None,
                     error: false,
                     open: false,
+                    expanded: false,
                 }));
             }
             AgentEvent::ToolResult { tool_call_id, is_error } => {
@@ -1848,12 +1852,105 @@ impl AppView {
                 let group: SharedString = format!("tool-blk-{ei}-{bi}").into();
                 let mut wrapper = div().w_full().v_flex().group(group.clone()).child(header);
                 if open {
-                    wrapper = wrapper.child(io_card(
-                        (ei * 1000 + bi) as u64,
-                        &tool.arguments,
-                        tool.result.as_deref(),
-                        tool.error,
-                    ));
+                    // web ToolRow 卡片分派：terminal/read/diff/web 各走专属
+                    // 原语；错误行与未匹配工具回退通用 IO 卡（web 卡模型
+                    // 在错误/缺元数据时为 null 的同一回退语义）
+                    let args_json: serde_json::Value =
+                        serde_json::from_str(&tool.arguments).unwrap_or(serde_json::Value::Null);
+                    let arg_str = |key: &str| -> String {
+                        args_json
+                            .get(key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    let uid = (ei * 1000 + bi) as u64;
+                    let element = match tool.name.as_str() {
+                        "shell" => widgets::terminal_card(
+                            uid,
+                            &arg_str("command"),
+                            &self.current_cwd,
+                            tool.result.as_deref(),
+                            running,
+                            tool.error,
+                        )
+                        .into_any_element(),
+                        "fs" if !tool.error && tool.result.is_some() => {
+                            let path = arg_str("path");
+                            let shown = widgets::display_path(&path, &self.current_cwd);
+                            let result = tool.result.clone().unwrap_or_default();
+                            match arg_str("op").as_str() {
+                                "read" => {
+                                    let lang = std::path::Path::new(&path)
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("")
+                                        .to_lowercase();
+                                    let t_fold = this.clone();
+                                    widgets::read_card(
+                                        uid,
+                                        &shown,
+                                        &lang,
+                                        &result,
+                                        tool.expanded,
+                                        move |_, _, cx| {
+                                            t_fold.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    tool.expanded = !tool.expanded;
+                                                }
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .into_any_element()
+                                }
+                                "write" => {
+                                    let content = arg_str("content");
+                                    let t_fold = this.clone();
+                                    widgets::diff_card(
+                                        uid,
+                                        &shown,
+                                        &content,
+                                        tool.expanded,
+                                        move |_, _, cx| {
+                                            t_fold.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    tool.expanded = !tool.expanded;
+                                                }
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                    .into_any_element()
+                                }
+                                _ => widgets::io_card(
+                                    uid,
+                                    &tool.arguments,
+                                    tool.result.as_deref(),
+                                    tool.error,
+                                )
+                                .into_any_element(),
+                            }
+                        }
+                        "web_fetch" if !tool.error && tool.result.is_some() => widgets::web_fetch_card(
+                            uid,
+                            &arg_str("url"),
+                            tool.result.as_deref().is_some_and(|r| r.chars().count() >= 8000),
+                        )
+                        .into_any_element(),
+                        _ => widgets::io_card(
+                            uid,
+                            &tool.arguments,
+                            tool.result.as_deref(),
+                            tool.error,
+                        )
+                        .into_any_element(),
+                    };
+                    wrapper = wrapper.child(element);
                     // web inspectButton：展开体下方左对齐小 pill，
                     // hover 整个工具块时显现，点击跳轨迹视图对应行
                     let t_insp = this.clone();

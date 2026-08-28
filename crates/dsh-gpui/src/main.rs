@@ -2607,7 +2607,7 @@ fn main() {
                 let _h = llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter))
                     .expect("register deepseek from credentials");
                 let model = std::env::var("DSH_MODEL")
-                    .unwrap_or_else(|_| user_settings.model.clone());
+                    .unwrap_or_else(|_| "deepseek-chat".to_string());
                 ("deepseek".to_string(), model)
             } else {
                 let _h = llm.register_adapter(&["mock".to_string()], Arc::new(MockAdapter)).expect("register mock");
@@ -2701,14 +2701,27 @@ fn main() {
         startup_desired.clone()
     };
     // 初始路由：环境变量 key > 自定义提供方 > mock
-    // agent 初始路由：环境 key/凭据 key 的 deepseek 优先；否则按 agent-default-model；
-    // 无任何配置时 mock。
-    let effective_startup = if provider == "deepseek" || !stored_deepseek_key.is_empty() {
+    // agent 初始路由优先级：
+    //   1. 环境变量 DEEPSEEK_KEY（显式意图，最优先）
+    //   2. settings.yaml 的 agent-default-model 所指 provider（web 里选定的当前模型）
+    //   3. .credentials.yaml 有 DEEPSEEK key
+    //   4. 声明的第一个 provider / 5. mock
+    let effective_startup = if provider == "deepseek" {
+        "deepseek".to_string()
+    } else if initial_route != "deepseek"
+        && user_settings.providers.iter().any(|p| p.id == initial_route)
+    {
+        initial_route.clone()
+    } else if !stored_deepseek_key.is_empty() {
         "deepseek".to_string()
     } else if user_settings.providers.is_empty() {
         "mock".to_string()
     } else {
-        initial_route.clone()
+        user_settings
+            .providers
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_default()
     };
     if effective_startup != "mock"
         && let Some(p) = user_settings.providers.iter().find(|p| p.id == effective_startup)

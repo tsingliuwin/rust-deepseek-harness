@@ -65,12 +65,23 @@ pub(crate) fn drag_handle(side: DragSide) -> Stateful<Div> {
             DragSide::Sidebar => "drag-sidebar",
             DragSide::Details => "drag-details",
         }))
-        .w(px(8.0))
+        .w(px(16.0)) // 16px 命中带骑缝（±8px），起拖容错与 web 一致
         .h_full()
         .flex_none()
-        .mx(px(-4.0))
+        .mx(px(-8.0))
         .cursor_col_resize()
-        .hover(|s| s.bg(theme::t().border_l2))
+        .hover(|s| s.bg(theme::t().hover))
+        .relative()
+        .child(
+            // 视觉中线 2px（hover 时淡化，拖拽光标由 gpui drag 全程锁定 col-resize）
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(px(2.0))
+                .mx_auto()
+                .bg(theme::t().border_l2),
+        )
         .on_drag(
             ColumnDrag { side },
             |_drag, _offset, _window, cx| cx.new(|_| gpui::Empty),

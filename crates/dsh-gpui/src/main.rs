@@ -1195,6 +1195,8 @@ impl AppView {
         self.stats_turns = 0;
         self.stats_tools = 0;
         self.tab = CenterTab::Conversation;
+        // 虚拟列表长度同步（切换后条目数变了；不 reset 则仍按旧长度渲染）
+        self.sync_chat_list(true);
         cx.notify();
     }
 

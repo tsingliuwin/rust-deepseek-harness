@@ -886,6 +886,8 @@ struct AppView {
     // 中栏 tab + 详情选中
     tab: CenterTab,
     selected_tool: Option<ToolDetail>,
+    /// 轨迹 tab 滚动句柄（Inspect pill 跳转 scroll_to_item）
+    traj_scroll: ScrollHandle,
 }
 
 impl AppView {
@@ -1000,6 +1002,7 @@ impl AppView {
             stats_tools: 0,
             tab: CenterTab::Conversation,
             selected_tool: None,
+            traj_scroll: ScrollHandle::new(),
         };
         view.rebuild_from_session();
         // 虚拟列表长度同步（构造时 rebuild 填充了 entries，列表需知道条数）
@@ -1641,7 +1644,7 @@ impl AppView {
                 };
                 // web 结构：root(v_flex) > row(24px header) + thinkBody(展开体)
                 // 展开体是 header 的兄弟节点，不在 24px 行内
-                let header = div()
+                let mut header = div()
                     .id(("think-row", (ei * 1000 + bi) as u64))
                     .relative()
                     .overflow_hidden()
@@ -1688,7 +1691,8 @@ impl AppView {
                             .child(first_line(text)),
                     );
                 if let Some(ms) = sweep_ms {
-                    let _ = ms;
+                    // web .row::after 运行扫光（行容器 relative + overflow_hidden）
+                    header = header.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
                 }
                 let mut wrapper = div().w_full().v_flex().child(header);
                 if open {
@@ -1716,7 +1720,20 @@ impl AppView {
 
             MsgBlock::Tool(tool) => {
                 let open = tool.open;
-                let (label, icon) = tool_display(&tool.name);
+                let (_, icon) = tool_display(&tool.name);
+                let (title, summary, file_path) = widgets::tool_row_texts(&tool.name, &tool.arguments);
+                // web ToolRow：失败行折叠摘要 = 输出首行（failureLine 替换语义）
+                let failure = if tool.error && tool.result.is_some() {
+                    Some(widgets::first_line(tool.result.as_deref().unwrap_or("")))
+                } else {
+                    None
+                };
+                let summary_text = failure.clone().unwrap_or_else(|| {
+                    file_path
+                        .as_deref()
+                        .map(|p| widgets::display_path(p, &self.current_cwd))
+                        .unwrap_or(summary)
+                });
                 let t = this.clone();
                 let running = tool.result.is_none();
                 let sweep_ms = if running {
@@ -1724,7 +1741,19 @@ impl AppView {
                 } else {
                     None
                 };
-                let header = div()
+                // Inspect 跳转目标：该调用在轨迹列表中的行号（之前的工具块计数）
+                let mut traj_ix = 0usize;
+                'traj_count: for (i, e) in self.entries.iter().enumerate() {
+                    for (j, b) in e.blocks.iter().enumerate() {
+                        if matches!(b, MsgBlock::Tool(_)) {
+                            if i == ei && j == bi {
+                                break 'traj_count;
+                            }
+                            traj_ix += 1;
+                        }
+                    }
+                }
+                let mut header = div()
                     .id(("tool-row", (ei * 1000 + bi) as u64))
                     .relative()
                     .overflow_hidden()
@@ -1770,10 +1799,35 @@ impl AppView {
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
                             .text_color(theme::t().text)
-                            .child(label),
+                            .child(title),
                     )
-                    .child(dot_sep())
-                    .child(
+                    .child(dot_sep());
+                // web fileLink：文件工具的 path 摘要渲染为下划线链接，
+                // 点击用宿主默认应用打开（阻断行点击的展开切换）
+                if file_path.is_some() && failure.is_none() {
+                    let open_path = file_path.clone().unwrap_or_default();
+                    header = header.child(
+                        div()
+                            .id(("tool-file", (ei * 1000 + bi) as u64))
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(theme::FONT_ROW))
+                            .line_height(px(theme::FONT_ROW_LEADING))
+                            .text_color(theme::t().text_2)
+                            .underline()
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme::t().text))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                widgets::open_with_host_app(&open_path);
+                            })
+                            .child(summary_text.clone()),
+                    );
+                } else {
+                    header = header.child(
                         div()
                             .flex_1()
                             .min_w_0()
@@ -1782,11 +1836,17 @@ impl AppView {
                             .text_ellipsis()
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(if tool.error { theme::t().error } else { theme::t().text_3 })
-                            .child(first_line(&tool.arguments)),
+                            .text_color(if failure.is_some() { theme::t().error } else { theme::t().text_3 })
+                            .child(summary_text.clone()),
                     );
-                let _ = sweep_ms;
-                let mut wrapper = div().w_full().v_flex().child(header);
+                }
+                if let Some(ms) = sweep_ms {
+                    // web .row::after 运行扫光（行容器 relative + overflow_hidden）
+                    header = header.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
+                }
+                // hover 显现 Inspect pill 的悬停域：标题行 + 展开体整体
+                let group: SharedString = format!("tool-blk-{ei}-{bi}").into();
+                let mut wrapper = div().w_full().v_flex().group(group.clone()).child(header);
                 if open {
                     wrapper = wrapper.child(io_card(
                         (ei * 1000 + bi) as u64,
@@ -1794,6 +1854,44 @@ impl AppView {
                         tool.result.as_deref(),
                         tool.error,
                     ));
+                    // web inspectButton：展开体下方左对齐小 pill，
+                    // hover 整个工具块时显现，点击跳轨迹视图对应行
+                    let t_insp = this.clone();
+                    // gpui 无 align-self：外层全宽 flex 使 pill 靠左
+                    wrapper = wrapper.child(
+                        div().w_full().flex().child(
+                            div()
+                                .id(("tool-inspect", (ei * 1000 + bi) as u64))
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .mt(px(4.0))
+                                .mb(px(2.0))
+                                .ml(px(4.0))
+                                .px(px(8.0))
+                                .py(px(2.0))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(theme::t().border_l2)
+                                .bg(theme::t().bg_base)
+                                .text_color(theme::t().text_2)
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .cursor_pointer()
+                                .opacity(0.0)
+                                .group_hover(group.clone(), |s| s.opacity(1.0))
+                                .hover(|s| s.bg(theme::t().elevated).text_color(theme::t().text))
+                                .on_click(move |_, _, cx| {
+                                    t_insp.update(cx, |v, cx| {
+                                        v.tab = CenterTab::Trajectory;
+                                        v.traj_scroll.scroll_to_item(traj_ix);
+                                        cx.notify();
+                                    });
+                                })
+                                .child(Icon::new(IconName::Inspector).size(px(12.0)))
+                                .child("查看"),
+                        ),
+                    );
                 }
                 wrapper.into_any_element()
             }
@@ -1941,8 +2039,9 @@ impl AppView {
         )
     }
 
-    /// 轨迹 tab：全量工具调用台账。
-    fn render_trajectory(&self, this: &Entity<AppView>) -> Div {
+    /// 轨迹 tab：全量工具调用台账。滚动容器在本方法内（track_scroll 接
+    /// Inspect pill 的 scroll_to_item；行必须是其直接子节点才能按行号跳转）。
+    fn render_trajectory(&self, this: &Entity<AppView>) -> Stateful<Div> {
         let mut rows: Vec<AnyElement> = Vec::new();
         for (ei, entry) in self.entries.iter().enumerate() {
             for (bi, block) in entry.blocks.iter().enumerate() {
@@ -2008,7 +2107,16 @@ impl AppView {
                 }
             }
         }
-        let mut col = div().w_full().max_w(px(CHAT_CONTENT_WIDTH)).mx_auto().v_flex().py_4();
+        let mut col = div()
+            .id("traj-scroll")
+            .h_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.traj_scroll)
+            .w_full()
+            .max_w(px(CHAT_CONTENT_WIDTH))
+            .mx_auto()
+            .v_flex()
+            .py_4();
         if rows.is_empty() {
             col = col.child(
                 div()
@@ -2794,11 +2902,11 @@ impl AppView {
 
         // 主体：hero（空会话）/ 对话 / 轨迹
         if self.is_empty_session() && !self.running {
-            center = center.child(self.render_hero(this, has_text));
+            center = center.child(self.render_hero(this, has_text, width));
         } else {
             let body = match self.tab {
-                CenterTab::Conversation => self.render_chat(&this),
-                CenterTab::Trajectory => self.render_trajectory(&this),
+                CenterTab::Conversation => self.render_chat(&this).into_any_element(),
+                CenterTab::Trajectory => self.render_trajectory(&this).into_any_element(),
             };
             let show_jump = !self.chat_near_bottom();
             let t_jump = this.clone();
@@ -2864,12 +2972,7 @@ impl AppView {
                                     .child(chat_list_el)
                                     .into_any_element()
                             } else {
-                                div()
-                                    .id("traj-scroll")
-                                    .h_full()
-                                    .overflow_y_scroll()
-                                    .child(body)
-                                    .into_any_element()
+                                body.into_any_element()
                             },
                         )
                         .when(show_jump, |d| {
@@ -3043,7 +3146,12 @@ impl AppView {
     }
 
     /// 空会话 hero：标题 + 工作区行 + 居中输入卡（HeroShell）。
-    fn render_hero(&self, this: Entity<AppView>, has_text: bool) -> Div {
+    fn render_hero(&self, this: Entity<AppView>, has_text: bool, center_w: f32) -> Div {
+        // web ConversationRoot .heroGlow：资产 1051×468 对设计卡 776，宽随卡缩放，
+        // 中心锚在卡面（底边上方 92px），translate(-50%, 50%) 使椭圆中心落在锚上。
+        let stack_w = (center_w - 48.0).min(COMPOSER_CARD_WIDTH);
+        let glow_w = stack_w * (1051.0 / 776.0);
+        let glow_h = glow_w * (468.0 / 1051.0);
         div()
             .flex_1()
             .min_h_0()
@@ -3051,13 +3159,24 @@ impl AppView {
             .items_center()
             .justify_center()
             .px_6()
+            // web .viewArea 滚动容器裁剪两轴：光晕（宽于卡）不出中栏
+            .overflow_hidden()
             .child(
                 div()
+                    .relative()
                     .w_full()
                     .max_w(px(COMPOSER_CARD_WIDTH))
                     .v_flex()
                     .gap_3()
                     .pb(px(32.0))
+                    .child(
+                        img("brands/hero-glow.png")
+                            .absolute()
+                            .left(px((stack_w - glow_w) / 2.0))
+                            .bottom(px(92.0 - glow_h / 2.0))
+                            .w(px(glow_w))
+                            .h(px(glow_h)),
+                    )
                     .child(
                         // 标题行：fish + 探索未至之境 + 预览版 badge
                         div().flex().items_center().justify_center().gap_2p5().child(

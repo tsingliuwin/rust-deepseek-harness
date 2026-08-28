@@ -320,7 +320,6 @@ pub(crate) fn state_dot(color: gpui::Rgba) -> Div {
 /// 运行中的行扫光（web .row::after：300px 带自左滑向右，2.6s ease-out +
 /// 10% 尾停后循环；左端渐变 = bg_base 60% 透明）。行容器需
 /// relative + overflow_hidden，扫光为其最后 child。
-#[allow(dead_code)]
 pub(crate) fn row_sweep(elapsed_ms: u64, width: f32) -> Div {
     const PERIOD_MS: u64 = 2600;
     const BAND: f32 = 300.0;
@@ -450,6 +449,85 @@ pub(crate) fn tool_display(name: &str) -> (String, IconName) {
         "web_fetch" => ("Web".into(), IconName::Globe),
         other => (other.to_string(), IconName::Bot),
     }
+}
+
+/// 工具行折叠行模型（web toolRowModel 语义）：
+/// 标题按工具/op 定名（tool.title.*），摘要取 args 的人类字段
+/// （SUMMARY_KEYS：command / path / url），fs read|write 的 path 作为
+/// 可打开文件链接返回（deriveFilePath）。
+pub(crate) fn tool_row_texts(name: &str, args: &str) -> (String, String, Option<String>) {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(args).ok();
+    let pick = |keys: &[&str]| -> Option<String> {
+        let v = parsed.as_ref()?;
+        keys.iter()
+            .find_map(|k| v.get(k).and_then(|x| x.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(|s| s.lines().next().unwrap_or("").to_string())
+    };
+    match name {
+        "shell" => (
+            "Bash".into(),
+            pick(&["command"]).unwrap_or_else(|| first_line(args)),
+            None,
+        ),
+        "web_fetch" => (
+            "网页获取".into(),
+            pick(&["url"]).unwrap_or_else(|| first_line(args)),
+            None,
+        ),
+        "fs" => {
+            let op = parsed
+                .as_ref()
+                .and_then(|v| v.get("op"))
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            let path = pick(&["path"]);
+            let title = if op == "write" { "写入" } else { "读取" };
+            let summary = path.clone().unwrap_or_else(|| first_line(args));
+            let link = match op {
+                "read" | "write" => path,
+                _ => None,
+            };
+            (title.into(), summary, link)
+        }
+        other => (
+            "工具调用".into(),
+            format!("{other} · {}", first_line(args)),
+            None,
+        ),
+    }
+}
+
+/// 摘要路径显示（web relativizeToCwd + abbreviateHomePath）：
+/// 先剥工作区根，剩余主目录绝对路径缩写为 ~。
+pub(crate) fn display_path(text: &str, cwd: &str) -> String {
+    let root = cwd.trim_end_matches(['/', '\\']);
+    let text = if !root.is_empty()
+        && (text.starts_with(&format!("{root}/")) || text.starts_with(&format!("{root}\\")))
+    {
+        text[root.len() + 1..].to_string()
+    } else {
+        text.to_string()
+    };
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() && text.starts_with(&format!("{home}/")) {
+            return format!("~{}", &text[home.len()..]);
+        }
+    }
+    text
+}
+
+/// 用宿主默认应用打开文件（web onOpenFile 语义）。
+pub(crate) fn open_with_host_app(path: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", path])
+        .spawn();
 }
 
 /// 多行文本取首行（截断 120 字符）。

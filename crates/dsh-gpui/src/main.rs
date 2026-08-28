@@ -1465,6 +1465,9 @@ impl AppView {
                                 .children(session_rows),
                         )
                         .child(
+                            // 底部渐隐（web .fade）：起点必须是与 sidebar_bg 同
+                            // 色但 alpha=0 的颜色——若用 transparent_black，浅色
+                            // 侧栏上插值的中间像素会变灰，呈现一条黑带。
                             div()
                                 .absolute()
                                 .bottom_0()
@@ -1473,7 +1476,13 @@ impl AppView {
                                 .h(px(24.0))
                                 .bg(linear_gradient(
                                     180.0,
-                                    linear_color_stop(gpui::transparent_black(), 0.0),
+                                    linear_color_stop(
+                                        {
+                                            let sb = theme::t().sidebar_bg;
+                                            gpui::Rgba { r: sb.r, g: sb.g, b: sb.b, a: 0.0 }
+                                        },
+                                        0.0,
+                                    ),
                                     linear_color_stop(theme::t().sidebar_bg, 1.0),
                                 )),
                         ),

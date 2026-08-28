@@ -1252,6 +1252,11 @@ pub(crate) fn tool_row_texts(name: &str, args: &str) -> (String, String, Option<
             pick(&["pattern"]).unwrap_or_else(|| first_line(args)),
             None,
         ),
+        "subagent" => (
+            "子任务".into(),
+            pick(&["description"]).unwrap_or_else(|| first_line(args)),
+            None,
+        ),
         "fs" => {
             let op = parsed
                 .as_ref()

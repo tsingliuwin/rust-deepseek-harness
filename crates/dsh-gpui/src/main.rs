@@ -807,6 +807,8 @@ struct AppView {
     agent: Arc<ReactLoopAgent>,
     recorder: Arc<SessionRecorder>,
     llm: Arc<LlmRuntime>,
+    /// 子 agent 工具句柄（路由切换时同步）
+    subagent: Arc<dsh_subagent::SubagentTool>,
     sessions: Vec<SessionMeta>,
     /// 工作区列表（与 web 共享 storages/workspace.json）
     workspaces: Vec<WorkspaceInfo>,
@@ -900,6 +902,7 @@ impl AppView {
     fn new(
         agent: Arc<ReactLoopAgent>,
         deps: AppDeps,
+        subagent: Arc<dsh_subagent::SubagentTool>,
         sessions: Vec<SessionMeta>,
         input: Entity<InputState>,
         #[allow(dead_code)] // 被 DeepSeek 卡引用
@@ -947,6 +950,7 @@ impl AppView {
             agent,
             recorder: deps.recorder,
             llm: deps.llm,
+            subagent,
             sessions,
             entries: Vec::new(),
             input,
@@ -1471,7 +1475,7 @@ impl AppView {
         }
         let adapter = DeepSeekAdapter::new(key.clone());
         let _ = self.llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter));
-        self.agent.set_provider_and_model("deepseek", self.desired_model.clone());
+        self.set_route("deepseek", &self.desired_model.clone());
         self.llm_configured = true;
         self.deepseek_key = key;
         self.settings.model = self.desired_model.clone();
@@ -1603,12 +1607,12 @@ impl AppView {
     #[allow(dead_code)]
     fn activate_provider(&mut self, id: &str) {
         if id == "deepseek" {
-            self.agent.set_provider_and_model("deepseek", self.desired_model.clone());
+            self.set_route("deepseek", &self.desired_model.clone());
             self.active_provider = "deepseek".into();
             self.llm_configured = true;
         } else if let Some(p) = self.settings.providers.iter().find(|p| p.id == id).cloned() {
             let model = p.models.first().map(|m| m.id.clone()).unwrap_or_default();
-            self.agent.set_provider_and_model(p.id.clone(), model.clone());
+            self.set_route(&p.id, &model);
             self.active_provider = p.id;
             self.desired_model = model;
             self.llm_configured = true;
@@ -1616,12 +1620,18 @@ impl AppView {
         self.persist_settings();
     }
 
+    /// 宿主路由切换：主 agent 与子 agent 工具同步。
+    fn set_route(&mut self, provider: &str, model: &str) {
+        self.agent.set_provider_and_model(provider, model);
+        self.subagent.set_route(provider, model);
+    }
+
     /// 删除自定义提供方（若激活中则回退 deepseek）。
     fn remove_provider(&mut self, id: &str) {
         self.settings.providers.retain(|p| p.id != id);
         if self.active_provider == id {
             self.active_provider = "deepseek".into();
-            self.agent.set_provider_and_model("deepseek", self.desired_model.clone());
+            self.set_route("deepseek", &self.desired_model.clone());
         }
         self.persist_settings();
     }
@@ -3987,6 +3997,16 @@ fn main() {
     let _grep = tools.register(Arc::new(dsh_search::GrepTool)).unwrap();
     let _glob = tools.register(Arc::new(dsh_search::GlobTool)).unwrap();
     let prompt = Arc::new(SystemPrompt::new());
+    // 子 agent 工具（进程内 fork；路由经 set_route 跟随宿主切换）
+    let subagent_tool = dsh_subagent::SubagentTool::new(
+        llm.clone(),
+        tools.clone(),
+        prompt.clone(),
+        provider.clone(),
+        model.clone(),
+    )
+    .with_system_prompt(Some("You are a focused subagent. Complete the delegated task and report the result concisely.".into()));
+    let _subagent = tools.register(subagent_tool.clone()).unwrap();
     // web tool:grep section：引导模型用 grep 工具而非 shell grep
     let _grep_section = prompt.add_section(dsh_system_prompt::PromptSection {
         name: "tool:grep".into(),
@@ -4151,7 +4171,8 @@ fn main() {
         && let Some(p) = user_settings.providers.iter().find(|p| p.id == effective_startup)
     {
         let model = p.models.first().map(|m| m.id.clone()).unwrap_or(initial_model.clone());
-        agent.set_provider_and_model(p.id.clone(), model);
+        agent.set_provider_and_model(p.id.clone(), model.clone());
+        subagent_tool.set_route(&p.id, &model);
     }
     let _ = initial_model;
 
@@ -4217,6 +4238,7 @@ fn main() {
                     AppView::new(
                         Arc::clone(&agent),
                         deps,
+                        subagent_tool.clone(),
                         sessions_meta.clone(),
                         input.clone(),
                         api_input,

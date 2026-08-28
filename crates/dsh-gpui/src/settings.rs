@@ -978,6 +978,8 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
                 .top(px(72.0))
                 .left(px(16.0))
                 .w(px(240.0))
+                .max_h(px(320.0))
+                .overflow_y_scroll()
                 .v_flex()
                 .p(px(4.0))
                 .rounded(px(8.0))

@@ -59,11 +59,50 @@ pub struct SessionEntry {
 
 pub struct SessionRecorder {
     root: PathBuf,
+    /// 会话 id → 已解析的会话文件（规范桶锚定；避免 cwd 口径漂移时
+    /// 在错误桶里重建/写入副本）。
+    resolved: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
 }
 
 impl SessionRecorder {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self { root, resolved: std::sync::Mutex::new(Default::default()) }
+    }
+
+    /// 规范桶解析：hint 命中优先，其次全桶扫描取最近修改。
+    /// 未找到返回 None（调用方决定是否在 hint 桶新建）。
+    fn resolve_file(&self, id: &SessionId, hint: Option<&str>) -> Option<PathBuf> {
+        let cache = self.resolved.lock().unwrap();
+        if let Some(path) = cache.get(id.as_str()) {
+            if path.exists() {
+                return Some(path.clone());
+            }
+        }
+        drop(cache);
+        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+        let mut hint_hit: Option<PathBuf> = None;
+        if let Ok(projs) = fs::read_dir(&self.root) {
+            for proj in projs.flatten() {
+                let file = proj.path().join(id.as_str()).join("session.jsonl.zstd");
+                if !file.exists() {
+                    continue;
+                }
+                if let Some(h) = hint
+                    && proj.file_name().to_string_lossy() == project_key(h)
+                {
+                    hint_hit = Some(file.clone());
+                }
+                let modified = fs::metadata(&file).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+                    best = Some((modified, file));
+                }
+            }
+        }
+        let found = hint_hit.or(best.map(|(_, f)| f));
+        if let Some(f) = &found {
+            self.resolved.lock().unwrap().insert(id.as_str().to_string(), f.clone());
+        }
+        found
     }
 
     fn project_dir(&self, cwd: &str) -> PathBuf {
@@ -81,6 +120,11 @@ impl SessionRecorder {
     /// 新建会话：建目录并写 header（web 读取的最小要求）。
     pub fn create(&self, id: &SessionId, cwd: &str, agent_preset: &str) -> io::Result<()> {
         let file = self.session_file(id, cwd);
+        // 已存在的日志绝不允许被新 header 覆盖（fail-closed：数据 > 自愈）
+        if file.exists() {
+            self.resolved.lock().unwrap().insert(id.as_str().to_string(), file.clone());
+            return Ok(());
+        }
         fs::create_dir_all(file.parent().unwrap())?;
         let header = serde_json::json!({
             "type": "session",
@@ -152,10 +196,25 @@ impl SessionRecorder {
 
     /// 追加一个事件（web 信封行；读-改-写整文件压缩）。
     pub fn append(&self, id: &SessionId, cwd: &str, event: &SessionEvent) -> io::Result<()> {
-        let file = self.session_file(id, cwd);
+        // 规范桶锚定：写入永远落在会话自身的日志上（hint 只在 id 尚无
+        // 任何文件时作为新建位置），杜绝 cwd 口径漂移产生跨桶副本
+        let file = match self.resolve_file(id, Some(cwd)) {
+            Some(f) => f,
+            None => {
+                self.create(id, cwd, "standard")?;
+                self.session_file(id, cwd)
+            }
+        };
         let (mut lines, last_seq) = self.read_lines(&file);
+        if lines.is_empty() && file.exists() && fs::metadata(&file).map(|m| m.len() > 0).unwrap_or(false) {
+            // 文件存在却解不出内容：拒绝覆盖（可能是不认识的编码/半写状态）
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("session log unreadable, refusing to overwrite: {}", file.display()),
+            ));
+        }
         if lines.is_empty() {
-            // 目录被外部清掉时自愈：重建 header
+            // 空文件（仅 header 或零字节）：补 header
             self.create(id, cwd, "standard")?;
             lines = self.read_lines(&file).0;
         }
@@ -179,7 +238,7 @@ impl SessionRecorder {
 
     /// 会话标题（`session/title` 事件的最新值）。
     pub fn title_of(&self, id: &SessionId, cwd: &str) -> Option<String> {
-        let file = self.session_file(id, cwd);
+        let file = self.resolve_file(id, Some(cwd)).unwrap_or_else(|| self.session_file(id, cwd));
         let (lines, _) = self.read_lines(&file);
         lines
             .iter()
@@ -200,7 +259,12 @@ impl SessionRecorder {
                 return Ok((Session::from_events(id.clone(), events), Some(cwd.to_string())));
             }
         }
-        // 2) 扫描所有 project 目录找该 id
+        // 2) 扫描所有 project 目录找该 id（多桶副本取最近修改）
+        if let Some(file) = self.resolve_file(id, None) {
+            let events = self.read_events(&file);
+            let cwd = read_header_cwd(&file);
+            return Ok((Session::from_events(id.clone(), events), cwd));
+        }
         if self.root.exists() {
             for proj in fs::read_dir(&self.root)? {
                 let proj = proj?;
@@ -287,6 +351,9 @@ impl SessionRecorder {
             }
         }
         out.sort_by(|a, b| b.modified.cmp(&a.modified));
+        // 同 id 多桶副本（历史缺陷可能遗留）：只保留最近修改的一条
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|e| seen.insert(e.id.as_str().to_string()));
         Ok(out)
     }
 
@@ -728,6 +795,56 @@ mod tests {
             _ => None,
         });
         assert_eq!(reloaded, Some(m.source.clone()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_with_drifted_cwd_stays_in_canonical_bucket() {
+        // 缺陷复现防护：会话建在桶 A，之后以桶 B 的 cwd 口径追加——
+        // 必须落在桶 A 的原日志上，绝不产生桶 B 副本
+        let dir = std::env::temp_dir().join(format!("dsh-persist-canonical-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = SessionRecorder::new(dir.join("sessions"));
+        let id = SessionId::new("session-drift");
+        rec.create(&id, "/tmp/ws-a", "standard").unwrap();
+        rec.append(&id, "/tmp/ws-a", &SessionEvent::UserMessage(Message::user_text("real"))).unwrap();
+
+        // cwd 口径漂移（应用侧把当前会话误标为另一个工作区）
+        rec.append(&id, "/tmp/ws-b", &SessionEvent::SessionTitle { title: "t".into() }).unwrap();
+        rec.append(&id, "/tmp/ws-b", &SessionEvent::UserMessage(Message::user_text("second"))).unwrap();
+
+        let a_file = dir.join("sessions").join(project_key("/tmp/ws-a")).join(id.as_str()).join("session.jsonl.zstd");
+        let b_file = dir.join("sessions").join(project_key("/tmp/ws-b")).join(id.as_str()).join("session.jsonl.zstd");
+        assert!(a_file.exists());
+        assert!(!b_file.exists(), "cross-bucket copy created");
+        let (session, _) = rec.load(&id, None).unwrap();
+        let users: Vec<_> = session
+            .entries()
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::UserMessage(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users.len(), 2, "both appends landed on the canonical log");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_never_overwrites_existing_log() {
+        let dir = std::env::temp_dir().join(format!("dsh-persist-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = SessionRecorder::new(dir.join("sessions"));
+        let id = SessionId::new("session-guard");
+        rec.create(&id, "/tmp/ws", "standard").unwrap();
+        rec.append(&id, "/tmp/ws", &SessionEvent::UserMessage(Message::user_text("keep me"))).unwrap();
+        // 重复 create（如自愈路径误入）不得清掉已有日志
+        rec.create(&id, "/tmp/ws", "standard").unwrap();
+        let (session, _) = rec.load(&id, Some("/tmp/ws")).unwrap();
+        assert!(session.entries().iter().any(|e| matches!(
+            &e.event,
+            SessionEvent::UserMessage(m) if m.content.iter().any(|b| matches!(b, dsh_llm::ContentBlock::Text { text } if text == "keep me"))
+        )));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -14,6 +14,121 @@ use gpui_component::{
 
 use crate::theme;
 
+/// markdown 拆分：文本段 + 围栏代码段。
+enum MdSegment {
+    Text(String),
+    Code { lang: String, code: String },
+}
+
+/// 按 ``` 围栏拆分（粗粒度但稳定；未闭合围栏回退为文本）。
+fn split_markdown(md: &str) -> Vec<MdSegment> {
+    let newline = "
+";
+    let mut segments = Vec::new();
+    let mut text_buf = String::new();
+    let mut lines = md.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            if !text_buf.trim().is_empty() {
+                segments.push(MdSegment::Text(text_buf.clone()));
+                text_buf.clear();
+            }
+            let lang = trimmed.trim_start_matches("```").trim().to_string();
+            let mut code = String::new();
+            let mut closed = false;
+            for inner in lines.by_ref() {
+                if inner.trim_start().starts_with("```") {
+                    closed = true;
+                    break;
+                }
+                code.push_str(inner);
+                code.push_str(newline);
+            }
+            if !closed {
+                text_buf.push_str(line);
+                text_buf.push_str(newline);
+                text_buf.push_str(&code);
+                continue;
+            }
+            segments.push(MdSegment::Code {
+                lang: if lang.is_empty() { "text".into() } else { lang },
+                code: code.trim_end_matches(newline).to_string(),
+            });
+        } else {
+            text_buf.push_str(line);
+            text_buf.push_str(newline);
+        }
+    }
+    if !text_buf.trim().is_empty() {
+        segments.push(MdSegment::Text(text_buf));
+    }
+    segments
+}
+
+/// 代码块完整卡片（web CodeBlock .block/.banner/.pre 对齐）：
+/// banner = 语言 mono 标签 + 复制按钮，content = 代码本体。
+fn code_block_card(uid: usize, lang: &str, code: &str) -> Div {
+    let text = code.to_string();
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&text, &mut hasher);
+    let copy_id: SharedString =
+        format!("code-copy-{uid}-{:x}", std::hash::Hasher::finish(&hasher)).into();
+    let lang_display = if lang.is_empty() { "text".to_string() } else { lang.to_string() };
+    div()
+        .v_flex()
+        .rounded(px(12.0))
+        .overflow_hidden()
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px(px(14.0))
+                .py(px(9.0))
+                .bg(theme::t().code_banner)
+                .child(
+                    div()
+                        .font_family(theme_mono())
+                        .text_size(px(12.0))
+                        .line_height(px(18.0))
+                        .text_color(theme::t().text_3)
+                        .child(lang_display),
+                )
+                .child(
+                    div()
+                        .id(copy_id)
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_color(theme::t().text_3)
+                        .hover(|s| s.text_color(theme::t().text).bg(theme::t().hover))
+                        .tooltip(tip("复制代码"))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
+                        })
+                        .child(Icon::new(IconName::Copy).size(px(12.0)))
+                        .child(div().text_size(px(11.0)).line_height(px(14.0)).child("复制")),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .p_4()
+                .bg(theme::t().code_bg)
+                .font_family(theme_mono())
+                .text_size(px(13.0))
+                .line_height(px(22.0))
+                .text_color(theme::t().text)
+                .child(code.to_string()),
+        )
+}
+
 /// 用 `TextView::markdown` 渲染一段 markdown，样式对齐 web 版
 /// MarkdownText.module.css + 字号标尺。
 #[derive(IntoElement)]
@@ -33,51 +148,27 @@ impl RenderOnce for MarkdownBlock {
             4 => px(16.0),
             _ => base,
         }));
-        style.code_block = StyleRefinement::default()
-            .bg(theme::t().code_bg)
-            .rounded(px(12.0))
-            .p(px(16.0));
         style.is_dark = true;
-        TextView::markdown(self.id, self.text, window, cx)
-            .style(style)
-            .code_block_actions(|code, _window, _cx| {
-                // 语言 + 复制 浮标（web CodeBlock .banner 的浮层形态）
-                let lang = code.lang().unwrap_or_else(|| "text".into());
-                let text = code.code();
-                let mut hasher = std::hash::DefaultHasher::new();
-                std::hash::Hash::hash(&text, &mut hasher);
-                let copy_id: SharedString = format!("md-copy-{:x}", std::hash::Hasher::finish(&hasher)).into();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .font_family(theme_mono())
-                            .text_color(theme::t().caption)
-                            .child(lang),
-                    )
-                    .child(
-                        div()
-                            .id(copy_id)
-                            .size(px(20.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_color(theme::t().text_3)
-                            .hover(|s| s.text_color(theme::t().text).bg(theme::t().hover))
-                            .tooltip(tip("复制代码"))
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
-                            })
-                            .child(Icon::new(IconName::Copy).size(px(12.0))),
-                    )
-                    .into_any_element()
-            })
+
+        let segments = split_markdown(&self.text);
+        let mut col = div().v_flex().gap(px(12.0));
+        for (i, seg) in segments.into_iter().enumerate() {
+            match seg {
+                MdSegment::Text(text) => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    col = col.child(
+                        TextView::markdown(self.id * 1000 + i * 2, text, window, cx)
+                            .style(style.clone()),
+                    );
+                }
+                MdSegment::Code { lang, code } => {
+                    col = col.child(code_block_card(self.id * 1000 + i * 2 + 1, &lang, &code));
+                }
+            }
+        }
+        col
     }
 }
 /// hover 提示（gpui-component Tooltip）。
@@ -229,6 +320,7 @@ pub(crate) fn state_dot(color: gpui::Rgba) -> Div {
 /// 运行中的行扫光（web .row::after：300px 带自左滑向右，2.6s ease-out +
 /// 10% 尾停后循环；左端渐变 = bg_base 60% 透明）。行容器需
 /// relative + overflow_hidden，扫光为其最后 child。
+#[allow(dead_code)]
 pub(crate) fn row_sweep(elapsed_ms: u64, width: f32) -> Div {
     const PERIOD_MS: u64 = 2600;
     const BAND: f32 = 300.0;

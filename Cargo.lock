@@ -1545,6 +1545,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui-component",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",

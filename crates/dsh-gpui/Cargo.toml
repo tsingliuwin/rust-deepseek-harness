@@ -23,4 +23,5 @@ futures.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 uuid.workspace = true
+serde.workspace = true
 serde_json.workspace = true

@@ -34,7 +34,7 @@ impl RenderOnce for MarkdownBlock {
             _ => base,
         }));
         style.code_block = StyleRefinement::default()
-            .bg(theme::CODE_BG)
+            .bg(theme::t().code_bg)
             .rounded(px(12.0))
             .p(px(16.0));
         style.is_dark = true;
@@ -56,7 +56,7 @@ impl RenderOnce for MarkdownBlock {
                             .text_size(px(11.0))
                             .line_height(px(14.0))
                             .font_family(theme_mono())
-                            .text_color(theme::CAPTION)
+                            .text_color(theme::t().caption)
                             .child(lang),
                     )
                     .child(
@@ -68,8 +68,8 @@ impl RenderOnce for MarkdownBlock {
                             .justify_center()
                             .rounded(px(4.0))
                             .cursor_pointer()
-                            .text_color(theme::TEXT_3)
-                            .hover(|s| s.text_color(theme::TEXT).bg(theme::HOVER))
+                            .text_color(theme::t().text_3)
+                            .hover(|s| s.text_color(theme::t().text).bg(theme::t().hover))
                             .tooltip(tip("复制代码"))
                             .on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
@@ -103,7 +103,7 @@ pub(crate) fn icon_btn(
         .rounded_full()
         .text_color(color)
         .cursor_pointer()
-        .hover(|s| s.bg(theme::HOVER))
+        .hover(|s| s.bg(theme::t().hover))
         .tooltip(tip(tooltip))
         .on_click(on_click)
         .child(Icon::new(icon).size(px(16.0)))
@@ -123,9 +123,9 @@ pub(crate) fn rail_icon(
         .items_center()
         .justify_center()
         .rounded(px(10.0))
-        .text_color(theme::TEXT)
+        .text_color(theme::t().text)
         .cursor_pointer()
-        .hover(|s| s.bg(theme::HOVER))
+        .hover(|s| s.bg(theme::t().hover))
         .tooltip(tip(tooltip))
         .on_click(on_click)
         .child(Icon::new(icon).size(px(18.0)))
@@ -154,8 +154,8 @@ pub(crate) fn session_row(
         .gap_1()
         .rounded(px(8.0))
         .cursor_pointer()
-        .map(|d| if active { d.bg(theme::HOVER) } else { d })
-        .hover(|s| s.bg(theme::HOVER))
+        .map(|d| if active { d.bg(theme::t().hover) } else { d })
+        .hover(|s| s.bg(theme::t().hover))
         .on_click(on_click)
         .child(
             div()
@@ -166,7 +166,7 @@ pub(crate) fn session_row(
                 .text_ellipsis()
                 .text_size(px(theme::FONT_ROW))
                 .line_height(px(20.0))
-                .text_color(theme::TEXT)
+                .text_color(theme::t().text)
                 .child(title),
         )
         .when(!time_label.is_empty(), |d| {
@@ -175,7 +175,7 @@ pub(crate) fn session_row(
                     .id(SharedString::from(format!("session-time-{index}")))
                     .text_size(px(12.0))
                     .line_height(px(20.0))
-                    .text_color(theme::TEXT_3)
+                    .text_color(theme::t().text_3)
                     .group_hover(group_time, |s| s.opacity(0.0))
                     .child(time_label),
             )
@@ -190,12 +190,12 @@ pub(crate) fn session_row(
                 .justify_center()
                 .opacity(0.0)
                 .group_hover(group_more, |s| s.opacity(1.0))
-                .child(Icon::new(IconName::Ellipsis).size(px(14.0)).text_color(theme::TEXT_3)),
+                .child(Icon::new(IconName::Ellipsis).size(px(14.0)).text_color(theme::t().text_3)),
         )
 }
 /// 行内 2×2 分隔点（web .sep）。
 pub(crate) fn dot_sep() -> Div {
-    div().size(px(2.0)).rounded(px(1.0)).bg(theme::CAPTION).mx_2()
+    div().size(px(2.0)).rounded(px(1.0)).bg(theme::t().caption).mx_2()
 }
 /// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
 pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {
@@ -206,11 +206,11 @@ pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) 
         .v_flex()
         .rounded(px(12.0))
         .border_1()
-        .border_color(theme::BORDER_L1)
-        .bg(theme::CODE_BG);
+        .border_color(theme::t().border_l1)
+        .bg(theme::t().code_bg);
     card = card.child(io_section(uid * 2, "输入", input, false));
     if let Some(out) = output {
-        card = card.child(div().h(px(1.0)).w_full().bg(theme::BORDER_L2));
+        card = card.child(div().h(px(1.0)).w_full().bg(theme::t().border_l2));
         card = card.child(io_section(uid * 2 + 1, "输出", out, error));
     }
     card
@@ -227,7 +227,7 @@ pub(crate) fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div 
             div()
                 .text_size(px(theme::FONT_CAPTION))
                 .line_height(px(theme::FONT_CAPTION_LEADING))
-                .text_color(theme::CAPTION)
+                .text_color(theme::t().caption)
                 .font_family(theme_mono())
                 .child(label.to_string()),
         )
@@ -241,7 +241,7 @@ pub(crate) fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div 
                 .font_family(theme_mono())
                 .text_size(px(12.0))
                 .line_height(px(18.0))
-                .text_color(if error { theme::ERROR } else { theme::TEXT_2 })
+                .text_color(if error { theme::t().error } else { theme::t().text_2 })
                 .child(text.to_string()),
         )
 }
@@ -255,7 +255,7 @@ pub(crate) fn detail_section(label: &str, content: Div) -> Div {
                 .text_size(px(theme::FONT_CAPTION))
                 .line_height(px(theme::FONT_CAPTION_LEADING))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::TEXT_2)
+                .text_color(theme::t().text_2)
                 .child(label.to_string()),
         )
         .child(content)
@@ -265,11 +265,11 @@ pub(crate) fn code_card(text: &str, error: bool) -> Div {
     div()
         .p_4()
         .rounded(px(12.0))
-        .bg(theme::CODE_BG)
+        .bg(theme::t().code_bg)
         .font_family(theme_mono())
         .text_size(px(13.0))
         .line_height(px(22.0))
-        .text_color(if error { theme::ERROR } else { theme::TEXT })
+        .text_color(if error { theme::t().error } else { theme::t().text })
         
         
         .child(text.to_string())

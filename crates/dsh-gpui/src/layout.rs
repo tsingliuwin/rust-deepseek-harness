@@ -70,7 +70,7 @@ pub(crate) fn drag_handle(side: DragSide) -> Stateful<Div> {
         .flex_none()
         .mx(px(-4.0))
         .cursor_col_resize()
-        .hover(|s| s.bg(theme::BORDER_L2))
+        .hover(|s| s.bg(theme::t().border_l2))
         .on_drag(
             ColumnDrag { side },
             |_drag, _offset, _window, cx| cx.new(|_| gpui::Empty),

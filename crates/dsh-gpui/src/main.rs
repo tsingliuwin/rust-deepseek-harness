@@ -8,6 +8,7 @@
 
 mod assets;
 pub(crate) mod layout;
+mod settings;
 mod theme;
 pub(crate) mod widgets;
 
@@ -101,6 +102,69 @@ enum CenterTab {
 
 // --- 根视图 ------------------------------------------------------------------
 
+/// 设置页签。
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum SettingsTab {
+    General,
+    Models,
+    Plugins,
+    Presets,
+}
+
+/// 外观模式（通用设置 → 外观分段）。
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum AppearanceMode {
+    Light,
+    Dark,
+    #[serde(rename = "system")]
+    System,
+}
+
+/// 智能体运行中按 Enter 的行为（通用设置）。
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum EnterBehavior {
+    /// 排队（投递到 inbox，当前轮结束后处理）。
+    #[serde(rename = "queue")]
+    Queue,
+    /// 打断（cancel 当前轮后立即处理）。
+    #[serde(rename = "interrupt")]
+    Interrupt,
+}
+
+/// 持久化到 settings.json 的用户设置。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AppSettings {
+    pub(crate) appearance: AppearanceMode,
+    pub(crate) enter: EnterBehavior,
+    pub(crate) model: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            appearance: AppearanceMode::System,
+            enter: EnterBehavior::Queue,
+            model: "deepseek-chat".into(),
+        }
+    }
+}
+
+/// 配置目录（settings.json / 会话 JSONL 所在）。
+pub(crate) fn config_dir() -> std::path::PathBuf {
+    std::env::var("DSH_SESSIONS_DIR")
+        .map(std::path::PathBuf::from)
+        .map(|p| p.parent().map(|d| d.to_path_buf()).unwrap_or(p))
+        .unwrap_or_else(|_| {
+            std::env::var("LOCALAPPDATA")
+                .map(|p| std::path::PathBuf::from(p).join("dsh-rust"))
+                .unwrap_or_else(|_| "dsh-rust".into())
+        })
+}
+
+fn settings_path() -> std::path::PathBuf {
+    config_dir().join("settings.json")
+}
+
 /// AppView 的运行期依赖（打包传入以控制构造参数个数）。
 struct AppDeps {
     recorder: Arc<SessionRecorder>,
@@ -117,6 +181,9 @@ struct AppView {
     api_input: Entity<InputState>,
     desired_model: String,
     settings_open: bool,
+    settings_tab: SettingsTab,
+    settings: AppSettings,
+    llm_configured: bool,
     pending_clear: bool,
     _input_subscription: Subscription,
     chat_scroll: ScrollHandle,
@@ -144,6 +211,8 @@ impl AppView {
         input: Entity<InputState>,
         api_input: Entity<InputState>,
         desired_model: String,
+        settings: AppSettings,
+        llm_configured: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let subscription = cx.subscribe(&input, |chat, input, event, cx| {
@@ -168,6 +237,9 @@ impl AppView {
             api_input,
             desired_model,
             settings_open: false,
+            settings_tab: SettingsTab::General,
+            settings,
+            llm_configured,
             pending_clear: false,
             _input_subscription: subscription,
             chat_scroll: ScrollHandle::new(),
@@ -434,13 +506,78 @@ impl AppView {
     fn send_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text: String =
             self.input.read_with(cx, |s, _| s.value().to_string()).trim().to_string();
-        if text.is_empty() || self.running {
+        if text.is_empty() {
             return;
+        }
+        if self.running {
+            // 通用设置「繁忙时 Enter 行为」：排队投递，或打断当前轮
+            match self.settings.enter {
+                EnterBehavior::Queue => {}
+                EnterBehavior::Interrupt => self.agent.cancel(),
+            }
         }
         self.push_user(text.clone());
         self.agent.followup(text);
         self.input.update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
+    }
+
+    // --- 设置 ----------------------------------------------------------------
+
+    /// 解析 System 外观为实际亮/暗（跟随系统时每帧按窗口外观校正）。
+    fn effective_appearance(&self, window: &Window) -> gpui_component::ThemeMode {
+        match self.settings.appearance {
+            AppearanceMode::Light => gpui_component::ThemeMode::Light,
+            AppearanceMode::Dark => gpui_component::ThemeMode::Dark,
+            AppearanceMode::System => match window.appearance() {
+                gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark => {
+                    gpui_component::ThemeMode::Dark
+                }
+                _ => gpui_component::ThemeMode::Light,
+            },
+        }
+    }
+
+    fn set_appearance(&mut self, mode: AppearanceMode, cx: &mut Context<Self>) {
+        self.settings.appearance = mode;
+        self.persist_settings();
+        // 非跟随系统：立即应用；System 由 render 每帧按窗口外观校正
+        match mode {
+            AppearanceMode::Light => theme::apply(gpui_component::ThemeMode::Light, cx),
+            AppearanceMode::Dark => theme::apply(gpui_component::ThemeMode::Dark, cx),
+            AppearanceMode::System => {}
+        }
+        cx.notify();
+    }
+
+    fn set_enter_behavior(&mut self, behavior: EnterBehavior, cx: &mut Context<Self>) {
+        self.settings.enter = behavior;
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// 模型页「保存并启用」：注册 DeepSeek adapter 并切换路由。
+    fn apply_api_key(&mut self, cx: &App) {
+        let key: String = self.api_input.read_with(cx, |s, _| s.value().to_string());
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            return;
+        }
+        let adapter = DeepSeekAdapter::new(key);
+        let _ = self.llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter));
+        self.agent.set_provider_and_model("deepseek", self.desired_model.clone());
+        self.llm_configured = true;
+        self.settings.model = self.desired_model.clone();
+        self.persist_settings();
+    }
+
+    /// 写盘 settings.json（失败静默——设置是尽力持久化）。
+    fn persist_settings(&self) {
+        let path = settings_path();
+        let _ = std::fs::create_dir_all(config_dir());
+        if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
+            let _ = std::fs::write(path, json);
+        }
     }
 
     // --- 渲染 ---------------------------------------------------------------
@@ -449,7 +586,7 @@ impl AppView {
         match block {
             MsgBlock::Text(t) => div()
                 .w_full()
-                .text_color(theme::TEXT)
+                .text_color(theme::t().text)
                 .child(MarkdownBlock { text: t.clone(), id: 1_000_000 + ei * 1000 + bi })
                 .into_any_element(),
 
@@ -464,7 +601,7 @@ impl AppView {
                     .gap_1p5()
                     .cursor_pointer()
                     .rounded(px(6.0))
-                    .hover(|s| s.bg(theme::HOVER))
+                    .hover(|s| s.bg(theme::t().hover))
                     .on_click(move |_, _, cx| {
                         t.update(cx, |v, cx| {
                             if let Some(MsgBlock::Reasoning { open: o, .. }) =
@@ -478,13 +615,13 @@ impl AppView {
                     .child(
                         Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
                             .size(px(12.0))
-                            .text_color(theme::TEXT_2),
+                            .text_color(theme::t().text_2),
                     )
                     .child(
                         div()
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::TEXT)
+                            .text_color(theme::t().text)
                             .child("Think"),
                     )
                     .child(dot_sep())
@@ -497,7 +634,7 @@ impl AppView {
                             .text_ellipsis()
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::TEXT_3)
+                            .text_color(theme::t().text_3)
                             .child(first_line(text)),
                     );
                 if open {
@@ -508,7 +645,7 @@ impl AppView {
                             .pl(px(22.0))
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::TEXT_3)
+                            .text_color(theme::t().text_3)
                             
                             .child(text.clone()),
                     );
@@ -528,7 +665,7 @@ impl AppView {
                     .gap_1p5()
                     .cursor_pointer()
                     .rounded(px(6.0))
-                    .hover(|s| s.bg(theme::HOVER))
+                    .hover(|s| s.bg(theme::t().hover))
                     .on_click(move |_, _, cx| {
                         t.update(cx, |v, cx| {
                             if let Some(MsgBlock::Tool(tool)) =
@@ -549,14 +686,14 @@ impl AppView {
                     .child(
                         Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
                             .size(px(12.0))
-                            .text_color(theme::TEXT_2),
+                            .text_color(theme::t().text_2),
                     )
-                    .child(Icon::new(icon).size(px(14.0)).text_color(theme::TEXT_2))
+                    .child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
                     .child(
                         div()
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::TEXT)
+                            .text_color(theme::t().text)
                             .child(label),
                     )
                     .child(dot_sep())
@@ -569,7 +706,7 @@ impl AppView {
                             .text_ellipsis()
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(if tool.error { theme::ERROR } else { theme::TEXT_3 })
+                            .text_color(if tool.error { theme::t().error } else { theme::t().text_3 })
                             .child(first_line(&tool.arguments)),
                     );
                 if open {
@@ -611,12 +748,12 @@ impl AppView {
                         div()
                             .max_w(px(USER_BUBBLE_MAX))
                             .rounded(px(22.0))
-                            .bg(theme::SURFACE)
+                            .bg(theme::t().surface)
                             .px_4()
                             .py(px(10.0))
                             .text_size(px(theme::FONT_BUBBLE))
                             .line_height(px(theme::FONT_BUBBLE_LEADING))
-                            .text_color(theme::TEXT)
+                            .text_color(theme::t().text)
                             
                             .child(bubble_text),
                     )
@@ -630,10 +767,10 @@ impl AppView {
                             .justify_center()
                             .rounded(px(4.0))
                             .cursor_pointer()
-                            .text_color(theme::CAPTION)
+                            .text_color(theme::t().caption)
                             .opacity(0.0)
                             .group_hover(group_copy, |s| s.opacity(1.0))
-                            .hover(|s| s.text_color(theme::TEXT_2).bg(theme::HOVER))
+                            .hover(|s| s.text_color(theme::t().text_2).bg(theme::t().hover))
                             .tooltip(tip("复制"))
                             .on_click(move |_, _, cx| {
                                 let text = text.clone();
@@ -682,18 +819,18 @@ impl AppView {
                                 .size(px(8.0))
                                 .rounded_full()
                                 .flex_none()
-                                .bg(theme::ERROR),
+                                .bg(theme::t().error),
                         )
                         .child(
                             div().child(
                                 div()
-                                    .text_color(theme::ERROR)
+                                    .text_color(theme::t().error)
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("出错了"),
                             ),
                         )
                         .child(
-                            div().flex_1().min_w_0().text_color(theme::TEXT_2).child(text),
+                            div().flex_1().min_w_0().text_color(theme::t().text_2).child(text),
                         ),
                 )
             }
@@ -712,7 +849,7 @@ impl AppView {
                         .text_size(px(theme::FONT_ROW))
                         .line_height(px(22.0))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::ACCENT)
+                        .text_color(theme::t().accent)
                         .child("Deep diving…"),
                 )
                 .children(self.turn_started_at.map(|t| {
@@ -720,7 +857,7 @@ impl AppView {
                         .ml_2()
                         .text_size(px(theme::FONT_CAPTION))
                         .line_height(px(theme::FONT_CAPTION_LEADING))
-                        .text_color(theme::CAPTION)
+                        .text_color(theme::t().caption)
                         .child(format!("{}秒", t.elapsed().as_secs()))
                 })),
         )
@@ -748,7 +885,7 @@ impl AppView {
                             .gap_1p5()
                             .rounded(px(8.0))
                             .cursor_pointer()
-                            .hover(|s| s.bg(theme::HOVER))
+                            .hover(|s| s.bg(theme::t().hover))
                             .on_click(move |_, _, cx| {
                                 t.update(cx, |v, cx| {
                                     v.selected_tool = Some(ToolDetail {
@@ -761,12 +898,12 @@ impl AppView {
                                     cx.notify();
                                 });
                             })
-                            .child(Icon::new(icon).size(px(14.0)).text_color(theme::TEXT_2))
+                            .child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
                             .child(
                                 div()
                                     .text_size(px(theme::FONT_ROW))
                                     .line_height(px(theme::FONT_ROW_LEADING))
-                                    .text_color(theme::TEXT)
+                                    .text_color(theme::t().text)
                                     .child(label),
                             )
                             .child(dot_sep())
@@ -779,7 +916,7 @@ impl AppView {
                                     .text_ellipsis()
                                     .text_size(px(theme::FONT_ROW))
                                     .line_height(px(theme::FONT_ROW_LEADING))
-                                    .text_color(theme::TEXT_3)
+                                    .text_color(theme::t().text_3)
                                     .child(first_line(&tool.arguments)),
                             )
                             .into_any_element(),
@@ -794,7 +931,7 @@ impl AppView {
                     .py_4()
                     .text_size(px(13.0))
                     .line_height(px(20.0))
-                    .text_color(theme::TEXT_3)
+                    .text_color(theme::t().text_3)
                     .child("本轮还没有工具调用记录"),
             );
         } else {
@@ -813,6 +950,15 @@ impl Render for AppView {
             self.input.update(cx, |state, cx| state.set_value("", window, cx));
         }
 
+        // 跟随系统：按窗口外观校正主题（与当前生效主题不同才重应用）
+        if self.settings.appearance == AppearanceMode::System {
+            let want = self.effective_appearance(window);
+            if want.is_dark() != theme::is_dark() {
+                theme::apply(want, cx);
+                cx.notify();
+            }
+        }
+
         let vw: f32 = window.viewport_size().width.into();
         self.viewport = vw;
         let narrow = vw < SIDEBAR_AUTO_COLLAPSE;
@@ -829,8 +975,8 @@ impl Render for AppView {
             .size_full()
             .h_flex()
             .relative()
-            .bg(theme::BG_BASE)
-            .text_color(theme::TEXT)
+            .bg(theme::t().bg_base)
+            .text_color(theme::t().text)
             // Zed redistributable_columns 模式：拖拽期间 move 事件全窗捕获，
             // 指针越过 8px 把手也照常跟手（捕获阶段，一处分发）。
             .on_drag_move::<ColumnDrag>(move |ev, window, cx| {
@@ -864,120 +1010,22 @@ impl Render for AppView {
             root = root.child(self.render_details(dw, this.clone()));
         }
         if self.settings_open {
-            root = root.child(self.render_settings_overlay(this));
+            root = root.child(settings::render_settings(self, this, window, cx));
         }
         root
     }
 }
 
 impl AppView {
-    /// 设置面板：全屏覆盖层（对齐参考 `shell.overlay` 槽位）。
-    fn render_settings_overlay(&self, this: Entity<AppView>) -> Div {
-        let t_close = this.clone();
-        let t_save = this.clone();
-        div()
-            .absolute()
-            .size_full()
-            .top_0()
-            .left_0()
-            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                div()
-                    .w(px(480.0))
-                    .v_flex()
-                    .gap_3()
-                    .p_4()
-                    .rounded(px(16.0))
-                    .bg(theme::SURFACE)
-                    .border_1()
-                    .border_color(theme::BORDER_L2)
-                    .child(
-                        div().h_flex().items_center().justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .line_height(px(20.0))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::TEXT)
-                                    .child("设置 · 模型"),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-close")
-                                    .size(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .cursor_pointer()
-                                    .text_color(theme::TEXT_2)
-                                    .hover(|s| s.bg(theme::HOVER))
-                                    .on_click(move |_, _, cx| {
-                                        t_close.update(cx, |v, cx| { v.settings_open = false; cx.notify(); });
-                                    })
-                                    .child(Icon::new(IconName::Close).size(px(16.0))),
-                            ),
-                    )
-                    .child(
-                        div().v_flex().gap_1()
-                            .child(div().text_size(px(12.0)).line_height(px(18.0)).text_color(theme::TEXT_3).child("DeepSeek API Key"))
-                            .child(Input::new(&self.api_input).appearance(false).w_full())
-                            .child(div().text_size(px(12.0)).line_height(px(18.0)).text_color(theme::CAPTION).child(
-                                "保存后即刻启用 DeepSeek；留空则继续使用当前模型。",
-                            )),
-                    )
-                    .child(
-                        div().text_size(px(12.0)).line_height(px(18.0)).text_color(theme::CAPTION)
-                            .child(format!("当前路由：{} / {}", "deepseek", self.desired_model)),
-                    )
-                    .child(
-                        div().flex().justify_end().gap_2().child(
-                            div()
-                                .id("settings-save")
-                                .h(px(32.0))
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(theme::ACCENT)
-                                .text_color(gpui::white())
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme::ACCENT_HOVER))
-                                .on_click(move |_, _, cx| {
-                                    t_save.update(cx, |v, cx| {
-                                        let key: String = v.api_input.read_with(cx, |s, _| s.value().to_string());
-                                        let key = key.trim().to_string();
-                                        if !key.is_empty() {
-                                            let adapter = DeepSeekAdapter::new(key);
-                                            let _ = v.llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter));
-                                            let model = std::env::var("DSH_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
-                                            v.desired_model = model.clone();
-                                            v.agent.set_provider_and_model("deepseek", model);
-                                        }
-                                        v.settings_open = false;
-                                        cx.notify();
-                                    });
-                                })
-                                .child("保存并启用"),
-                        ),
-                    ),
-            )
-    }
 
     fn render_sidebar(&self, collapsed: bool, width: f32, this: Entity<AppView>) -> Div {
         let mut col = div()
             .h_full()
             .w(px(width))
             .flex_none()
-            .bg(theme::SIDEBAR_BG)
+            .bg(theme::t().sidebar_bg)
             .border_r_1()
-            .border_color(theme::BORDER_L1);
+            .border_color(theme::t().border_l1);
         if collapsed {
             let t_expand = this.clone();
             let t_new = this.clone();
@@ -1052,8 +1100,8 @@ impl AppView {
                                         .px_1()
                                         .rounded(px(3.0))
                                         .border_1()
-                                        .border_color(theme::BORDER_L2)
-                                        .text_color(theme::TEXT_2)
+                                        .border_color(theme::t().border_l2)
+                                        .text_color(theme::t().text_2)
                                         .font_family(theme_mono())
                                         .text_size(px(9.0))
                                         .line_height(px(14.0))
@@ -1061,7 +1109,7 @@ impl AppView {
                                 ),
                         )
                         .child(
-                            icon_btn("sb-collapse", IconName::PanelLeftClose, theme::TEXT_2, "收起侧边栏", move |_, _, cx| {
+                            icon_btn("sb-collapse", IconName::PanelLeftClose, theme::t().text_2, "收起侧边栏", move |_, _, cx| {
                                 t_collapse.update(cx, |v, cx| { v.sidebar_collapsed = true; cx.notify(); });
                             }),
                         ),
@@ -1080,14 +1128,14 @@ impl AppView {
                         .mb_2()
                         .rounded(px(12.0))
                         .border_1()
-                        .border_color(theme::BORDER_L2)
-                        .bg(theme::SURFACE)
+                        .border_color(theme::t().border_l2)
+                        .bg(theme::t().surface)
                         .text_size(px(theme::FONT_ROW))
                         .line_height(px(22.0))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::TEXT)
+                        .text_color(theme::t().text)
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme::SURFACE_2))
+                        .hover(|s| s.bg(theme::t().surface_2))
                         .on_click(move |_, _, cx| {
                             t_new.update(cx, |v, cx| { v.new_session(cx); });
                         })
@@ -1109,12 +1157,12 @@ impl AppView {
                                 .min_w_0()
                                 .text_size(px(theme::FONT_ROW))
                                 .line_height(px(20.0))
-                                .text_color(theme::TEXT_3)
+                                .text_color(theme::t().text_3)
                                 .child("会话"),
                         )
-                        .child(icon_btn("sb-search", IconName::Search, theme::TEXT_2, "搜索会话", |_, _, _| {}))
-                        .child(icon_btn("sb-view", IconName::Ellipsis, theme::TEXT_2, "视图选项", |_, _, _| {}))
-                        .child(icon_btn("sb-add-workspace", IconName::Plus, theme::TEXT_2, "添加工作区", |_, _, _| {})),
+                        .child(icon_btn("sb-search", IconName::Search, theme::t().text_2, "搜索会话", |_, _, _| {}))
+                        .child(icon_btn("sb-view", IconName::Ellipsis, theme::t().text_2, "视图选项", |_, _, _| {}))
+                        .child(icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", |_, _, _| {})),
                 )
                 .child(
                     // 工作区行（folder + 名称 + 展开指示）
@@ -1129,7 +1177,7 @@ impl AppView {
                         .child(
                             Icon::new(IconName::Folder)
                                 .size(px(16.0))
-                                .text_color(theme::ACCENT),
+                                .text_color(theme::t().accent),
                         )
                         .child(
                             div()
@@ -1137,10 +1185,10 @@ impl AppView {
                                 .min_w_0()
                                 .text_size(px(theme::FONT_ROW))
                                 .line_height(px(20.0))
-                                .text_color(theme::TEXT)
+                                .text_color(theme::t().text)
                                 .child("DSH"),
                         )
-                        .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::CAPTION)),
+                        .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption)),
                 )
                 .child(
                     // 会话列表 + 底部渐隐（web .fade）
@@ -1167,7 +1215,7 @@ impl AppView {
                                 .bg(linear_gradient(
                                     180.0,
                                     linear_color_stop(gpui::transparent_black(), 0.0),
-                                    linear_color_stop(theme::SIDEBAR_BG, 1.0),
+                                    linear_color_stop(theme::t().sidebar_bg, 1.0),
                                 )),
                         ),
                 )
@@ -1183,16 +1231,16 @@ impl AppView {
                         .px_2()
                         .rounded(px(8.0))
                         .cursor_pointer()
-                        .hover(|s| s.bg(theme::HOVER))
+                        .hover(|s| s.bg(theme::t().hover))
                         .on_click(move |_, _, cx| {
                             t_settings.update(cx, |v, cx| { v.settings_open = true; cx.notify(); });
                         })
-                        .child(Icon::new(IconName::Settings).size(px(16.0)).text_color(theme::TEXT_3))
+                        .child(Icon::new(IconName::Settings).size(px(16.0)).text_color(theme::t().text_3))
                         .child(
                             div()
                                 .text_size(px(theme::FONT_ROW))
                                 .line_height(px(20.0))
-                                .text_color(theme::TEXT_2)
+                                .text_color(theme::t().text_2)
                                 .child("设置"),
                         ),
                 );
@@ -1208,7 +1256,7 @@ impl AppView {
             .min_w_0()
             .flex_none()
             .v_flex()
-            .bg(theme::BG_BASE);
+            .bg(theme::t().bg_base);
 
         let show_header = !self.is_empty_session() || self.running;
         if show_header {
@@ -1255,12 +1303,12 @@ impl AppView {
                                     .justify_center()
                                     .rounded_full()
                                     .border_1()
-                                    .border_color(theme::BORDER_L2)
-                                    .bg(theme::SURFACE)
-                                    .text_color(theme::TEXT_2)
+                                    .border_color(theme::t().border_l2)
+                                    .bg(theme::t().surface)
+                                    .text_color(theme::t().text_2)
                                     .cursor_pointer()
                                     .shadow_md()
-                                    .hover(|s| s.bg(theme::SURFACE_2).text_color(theme::TEXT))
+                                    .hover(|s| s.bg(theme::t().surface_2).text_color(theme::t().text))
                                     .tooltip(tip("回到底部"))
                                     .on_click(move |_, _, cx| {
                                         t_jump.update(cx, |v, _cx| {
@@ -1291,7 +1339,7 @@ impl AppView {
             .pl(px(20.0))
             .pr(px(28.0))
             .border_b_1()
-            .border_color(theme::BORDER_L2)
+            .border_color(theme::t().border_l2)
             .child(
                 div()
                     .min_h(px(32.0))
@@ -1307,24 +1355,24 @@ impl AppView {
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(20.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::TEXT)
+                            .text_color(theme::t().text)
                             .child(title),
                     )
                     .child(
                         div().flex().items_center().gap_1().px_2().h(px(24.0)).rounded(px(12.0))
-                            .hover(|s| s.bg(theme::HOVER))
-                            .child(Icon::new(IconName::Bot).size(px(12.0)).text_color(theme::TEXT_2))
+                            .hover(|s| s.bg(theme::t().hover))
+                            .child(Icon::new(IconName::Bot).size(px(12.0)).text_color(theme::t().text_2))
                             .child(
                                 div()
                                     .text_size(px(theme::FONT_TAB))
                                     .line_height(px(theme::FONT_ROW_LEADING))
-                                    .text_color(theme::TEXT_2)
+                                    .text_color(theme::t().text_2)
                                     .child("标准模式"),
                             ),
                     )
                     .child(div().flex_1())
                     .child(
-                        icon_btn("details-toggle", IconName::PanelRight, theme::TEXT_2, "详情", move |_, _, cx| {
+                        icon_btn("details-toggle", IconName::PanelRight, theme::t().text_2, "详情", move |_, _, cx| {
                             t_details.update(cx, |v, cx| { v.details_open = !v.details_open; cx.notify(); });
                         }),
                     ),
@@ -1342,12 +1390,12 @@ impl AppView {
                 .cursor_pointer()
                 .pb(px(11.0))
                 .border_b_2()
-                .border_color(if active { theme::ACCENT.into() } else { gpui::transparent_black() })
+                .border_color(if active { theme::t().accent.into() } else { gpui::transparent_black() })
                 .text_size(px(theme::FONT_TAB))
                 .line_height(px(16.0))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(if active { theme::ACCENT } else { theme::TEXT_3 })
-                .hover(|s| s.text_color(theme::TEXT_2))
+                .text_color(if active { theme::t().accent } else { theme::t().text_3 })
+                .hover(|s| s.text_color(theme::t().text_2))
                 .on_click(move |_, _, cx| {
                     t.update(cx, |v, cx| {
                         v.tab = if label == "轨迹" { CenterTab::Trajectory } else { CenterTab::Conversation };
@@ -1388,7 +1436,7 @@ impl AppView {
                     .text_center()
                     .text_size(px(theme::FONT_CAPTION))
                     .line_height(px(20.0))
-                    .text_color(theme::TEXT_3)
+                    .text_color(theme::t().text_3)
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
@@ -1406,7 +1454,7 @@ impl AppView {
         div()
             .flex_none()
             .v_flex()
-            .bg(theme::BG_BASE)
+            .bg(theme::t().bg_base)
             .pb_2()
             .child(self.composer_card(this, has_text))
     }
@@ -1437,7 +1485,7 @@ impl AppView {
                                 .text_size(px(theme::FONT_HERO))
                                 .line_height(px(theme::FONT_HERO_LEADING))
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::TEXT)
+                                .text_color(theme::t().text)
                                 .child("🐟 探索未至之境")
                                 .child(
                                     div()
@@ -1445,9 +1493,9 @@ impl AppView {
                                         .px_1p5()
                                         .rounded_full()
                                         .border_1()
-                                        .border_color(theme::HOVER)
+                                        .border_color(theme::t().hover)
                                         .bg(gpui::rgb(0x283142))
-                                        .text_color(theme::TEXT)
+                                        .text_color(theme::t().text)
                                         .font_family(theme_mono())
                                         .text_size(px(theme::FONT_CAPTION))
                                         .line_height(px(theme::FONT_CAPTION_LEADING))
@@ -1463,16 +1511,16 @@ impl AppView {
                             .items_center()
                             .pl(px(20.0))
                             .gap_1()
-                            .child(Icon::new(IconName::FolderClosed).size(px(14.0)).text_color(theme::TEXT))
+                            .child(Icon::new(IconName::FolderClosed).size(px(14.0)).text_color(theme::t().text))
                             .child(
                                 div()
                                     .text_size(px(theme::FONT_TAB))
                                     .line_height(px(theme::FONT_ROW_LEADING))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::TEXT)
+                                    .text_color(theme::t().text)
                                     .child(workspace_name()),
                             )
-                            .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::CAPTION))
+                            .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption))
                             .child(
                                 div()
                                     .id("hero-mode")
@@ -1484,13 +1532,13 @@ impl AppView {
                                     .h(px(24.0))
                                     .rounded(px(12.0))
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(theme::HOVER))
-                                    .child(Icon::new(IconName::Bot).size(px(12.0)).text_color(theme::TEXT_2))
+                                    .hover(|s| s.bg(theme::t().hover))
+                                    .child(Icon::new(IconName::Bot).size(px(12.0)).text_color(theme::t().text_2))
                                     .child(
                                         div()
                                             .text_size(px(theme::FONT_TAB))
                                             .line_height(px(theme::FONT_ROW_LEADING))
-                                            .text_color(theme::TEXT_2)
+                                            .text_color(theme::t().text_2)
                                             .child("标准模式"),
                                     ),
                             ),
@@ -1508,7 +1556,7 @@ impl AppView {
             .flex()
             .items_center()
             .gap_4()
-            .child(icon_btn("composer-add", IconName::Plus, theme::TEXT, "添加附件", |_, _, _| {}))
+            .child(icon_btn("composer-add", IconName::Plus, theme::t().text, "添加附件", |_, _, _| {}))
             .child(
                 div()
                     .id("composer-mode")
@@ -1518,16 +1566,16 @@ impl AppView {
                     .h(px(28.0))
                     .px_2()
                     .rounded(px(8.0))
-                    .child(Icon::new(IconName::Eye).size(px(14.0)).text_color(theme::TEXT_2))
+                    .child(Icon::new(IconName::Eye).size(px(14.0)).text_color(theme::t().text_2))
                     .child(
                         div()
                             .text_size(px(theme::FONT_TAB))
                             .line_height(px(20.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::TEXT_2)
+                            .text_color(theme::t().text_2)
                             .child("Workspace Write"),
                     )
-                    .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::CAPTION)),
+                    .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption)),
             );
 
         let mut right = div()
@@ -1548,10 +1596,10 @@ impl AppView {
                             .text_size(px(theme::FONT_TAB))
                             .line_height(px(20.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::TEXT_2)
+                            .text_color(theme::t().text_2)
                             .child(self.desired_model.clone()),
                     )
-                    .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::CAPTION)),
+                    .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption)),
             );
 
         let trailing: AnyElement = if running {
@@ -1561,12 +1609,12 @@ impl AppView {
                 .id("composer-stop")
                 .size(px(34.0))
                 .rounded_full()
-                .bg(theme::ACCENT)
+                .bg(theme::t().accent)
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.bg(theme::ACCENT_HOVER))
+                .hover(|s| s.bg(theme::t().accent_hover))
                 .tooltip(tip("停止生成"))
                 .on_click(move |_, _, cx| {
                     t_stop.update(cx, |v, _cx| {
@@ -1581,13 +1629,13 @@ impl AppView {
                 .id("composer-send")
                 .size(px(34.0))
                 .rounded_full()
-                .bg(theme::ACCENT)
+                .bg(theme::t().accent)
                 .flex()
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
                 .when(!has_text, |d| d.opacity(0.4))
-                .when(has_text, |d| d.hover(|s| s.bg(theme::ACCENT_HOVER)))
+                .when(has_text, |d| d.hover(|s| s.bg(theme::t().accent_hover)))
                 .tooltip(tip("发送 (Enter)"))
                 .on_click(move |_, window, cx| {
                     t_send.update(cx, |v, cx| v.send_from_composer(window, cx));
@@ -1607,8 +1655,8 @@ impl AppView {
             .pt_2p5()
             .rounded(px(22.0))
             .border_1()
-            .border_color(theme::BORDER_L1)
-            .bg(theme::SURFACE)
+            .border_color(theme::t().border_l1)
+            .bg(theme::t().surface)
             .child(div().pl_4().pr_3().pt_1().child(Input::new(&self.input).appearance(false).w_full()))
             .child(
                 div()
@@ -1636,13 +1684,13 @@ impl AppView {
                         .py_2()
                         .text_size(px(13.0))
                         .line_height(px(20.0))
-                        .text_color(theme::TEXT_3)
+                        .text_color(theme::t().text_3)
                         .child("点击消息流中的工具行查看详情"),
                 );
             }
             Some(tool) => {
                 body = body
-                    .child(detail_section("工具", div().text_color(theme::TEXT).child(tool.name.clone())))
+                    .child(detail_section("工具", div().text_color(theme::t().text).child(tool.name.clone())))
                     .child(detail_section(
                         "输入",
                         code_card(&first_line(&tool.arguments), false),
@@ -1654,7 +1702,7 @@ impl AppView {
                             None => div()
                                 .text_size(px(13.0))
                                 .line_height(px(20.0))
-                                .text_color(theme::CAPTION)
+                                .text_color(theme::t().caption)
                                 .child("（运行中…）"),
                         },
                     ));
@@ -1665,9 +1713,9 @@ impl AppView {
             .w(px(width))
             .flex_none()
             .v_flex()
-            .bg(theme::BG_BASE)
+            .bg(theme::t().bg_base)
             .border_l_1()
-            .border_color(theme::BORDER_L2)
+            .border_color(theme::t().border_l2)
             .child(
                 div()
                     .flex_none()
@@ -1679,17 +1727,17 @@ impl AppView {
                     .px_3()
                     .pb_3()
                     .border_b_1()
-                    .border_color(theme::BORDER_L2)
+                    .border_color(theme::t().border_l2)
                     .child(
                         div()
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(20.0))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::TEXT)
+                            .text_color(theme::t().text)
                             .child("详情"),
                     )
                     .child(
-                        icon_btn("details-close", IconName::Close, theme::TEXT_2, "关闭详情", move |_, _, cx| {
+                        icon_btn("details-close", IconName::Close, theme::t().text_2, "关闭详情", move |_, _, cx| {
                             t.update(cx, |v, cx| { v.details_open = false; cx.notify(); });
                         }),
                     ),
@@ -1731,10 +1779,10 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
                 .justify_center()
                 .rounded(px(4.0))
                 .cursor_pointer()
-                .text_color(theme::CAPTION)
+                .text_color(theme::t().caption)
                 .opacity(0.0)
                 .group_hover(group_copy, |s| s.opacity(1.0))
-                .hover(|s| s.text_color(theme::TEXT_2).bg(theme::HOVER))
+                .hover(|s| s.text_color(theme::t().text_2).bg(theme::t().hover))
                 .tooltip(tip("复制"))
                 .on_click(move |_, _, cx| {
                     t.update(cx, |v, cx| {
@@ -1756,7 +1804,7 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
             div()
                 .text_size(px(theme::FONT_CAPTION))
                 .line_height(px(theme::FONT_CAPTION_LEADING))
-                .text_color(theme::CAPTION)
+                .text_color(theme::t().caption)
                 .child(text),
         )
 }
@@ -1863,11 +1911,22 @@ fn main() {
     let event_rx = agent.subscribe();
     agent.spawn();
 
+    // 用户设置：settings.json（尽力加载，失败用默认）
+    let user_settings: AppSettings = std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let startup_theme = match user_settings.appearance {
+        AppearanceMode::Light => gpui_component::ThemeMode::Light,
+        AppearanceMode::Dark => gpui_component::ThemeMode::Dark,
+        AppearanceMode::System => gpui_component::ThemeMode::Dark, // 实际值由首帧 render 按窗口外观校正
+    };
+
     Application::new()
         .with_assets(assets::AppAssets)
         .run(move |cx| {
         gpui_component::init(cx);
-        theme::init(cx);
+        theme::apply(startup_theme, cx);
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), &*cx);
         cx.open_window(
             WindowOptions {
@@ -1885,7 +1944,8 @@ fn main() {
                 let api_input = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).placeholder("sk-… (DeepSeek API Key)")
                 });
-                let desired_model = std::env::var("DSH_MODEL").unwrap_or_else(|_| "deepseek-chat".into());
+                let desired_model = std::env::var("DSH_MODEL")
+                    .unwrap_or_else(|_| user_settings.model.clone());
                 let app = cx.new(|cx| {
                     let deps = AppDeps { recorder: Arc::clone(&recorder), llm: Arc::clone(&llm) };
                     AppView::new(
@@ -1895,6 +1955,8 @@ fn main() {
                         input.clone(),
                         api_input,
                         desired_model,
+                        user_settings.clone(),
+                        provider == "deepseek",
                         cx,
                     )
                 });

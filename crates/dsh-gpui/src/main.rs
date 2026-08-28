@@ -254,15 +254,15 @@ pub(crate) fn dsh_home() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".dsh")
 }
 
-/// settings.json —— 配置文档（不含密钥；扩展名决定格式，dsh 约定）。
+/// settings.yaml —— 与 web 版 dsh 共享同一份配置文档（YAML）。
+/// 只读写我们拥有的段，其余段原样保留。
 fn settings_path() -> std::path::PathBuf {
-    dsh_home().join("settings.json")
+    dsh_home().join("settings.yaml")
 }
 
-/// credentials.json —— 密钥独立文档（对齐 dsh credentials-local 的
-/// `.credentials.yaml` 职责：settings 只存声明，密钥另管）。
+/// .credentials.yaml —— 与 web 共享的密钥文档：{version: 1, refs: {REF: key}}。
 fn credentials_path() -> std::path::PathBuf {
-    dsh_home().join("credentials.json")
+    dsh_home().join(".credentials.yaml")
 }
 
 /// 会话目录（默认 `{home}/sessions`；DSH_SESSIONS_DIR 显式设置时覆盖）。
@@ -272,78 +272,391 @@ pub(crate) fn sessions_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| dsh_home().join("sessions"))
 }
 
-/// 读凭证文档：provider id -> api key。
+/// 读 settings.yaml 为 YAML Value（不存在则空 map）。
+fn load_settings_doc() -> serde_yaml::Value {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|s| serde_yaml::from_str(&s).ok())
+        .unwrap_or(serde_yaml::Value::Mapping(Default::default()))
+}
+
+fn save_settings_doc(doc: &serde_yaml::Value) {
+    let _ = std::fs::create_dir_all(dsh_home());
+    if let Ok(text) = serde_yaml::to_string(doc) {
+        let _ = std::fs::write(settings_path(), text);
+    }
+}
+
+/// 读 .credentials.yaml 的 refs：REF 名 -> 密钥。
 fn load_credentials() -> std::collections::HashMap<String, String> {
     std::fs::read_to_string(credentials_path())
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.as_object().cloned())
-        .map(|o| {
-            o.into_iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
-                .collect()
+        .and_then(|s| serde_yaml::from_str::<serde_yaml::Value>(&s).ok())
+        .and_then(|d| d.get("refs").cloned())
+        .and_then(|r| {
+            r.as_mapping().map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| {
+                        Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                    })
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
 
-/// 写凭证文档（幂等合并：只改提供的 key，其余保留）。
+/// 写 .credentials.yaml（幂等合并 refs，保留既有条目与 version）。
 fn save_credentials(patch: &[(String, String)]) {
-    let mut doc = load_credentials();
-    for (k, v) in patch {
-        doc.insert(k.clone(), v.clone());
+    let mut doc = std::fs::read_to_string(credentials_path())
+        .ok()
+        .and_then(|s| serde_yaml::from_str::<serde_yaml::Value>(&s).ok())
+        .unwrap_or_else(|| serde_yaml::Value::Mapping(Default::default()));
+    if doc.get("version").is_none() {
+        if let serde_yaml::Value::Mapping(m) = &mut doc {
+            m.insert("version".into(), serde_yaml::Value::Number(1.into()));
+        }
+    }
+    if let serde_yaml::Value::Mapping(m) = &mut doc {
+        let entry = m
+            .entry("refs".into())
+            .or_insert(serde_yaml::Value::Mapping(Default::default()));
+        if let serde_yaml::Value::Mapping(refs) = entry {
+            for (k, v) in patch {
+                refs.insert(k.clone().into(), serde_yaml::Value::String(v.clone()));
+            }
+        }
     }
     let _ = std::fs::create_dir_all(dsh_home());
-    if let Ok(json) = serde_json::to_string_pretty(&doc) {
-        let _ = std::fs::write(credentials_path(), json);
+    if let Ok(text) = serde_yaml::to_string(&doc) {
+        let _ = std::fs::write(credentials_path(), text);
     }
 }
 
-/// 旧版 {LOCALAPPDATA}/dsh-rust 一次性迁移到 {home}（有数据才动）。
-fn migrate_legacy() {
-    let home = dsh_home();
-    if home.join("settings.json").exists() {
-        return; // 新布局已在用
+/// web deriveKeyRef：大写 route、非字母数字转 `_`、后缀 _API_KEY。
+fn derive_key_ref(route: &str) -> String {
+    let mut out = String::new();
+    for c in route.chars() {
+        if c.is_ascii_alphanumeric() && !c.is_ascii_digit() {
+            out.push(c.to_ascii_uppercase());
+        } else if c.is_ascii_digit() {
+            out.push(c);
+        } else {
+            if !out.ends_with('_') {
+                out.push('_');
+            }
+        }
     }
-    let Ok(local) = std::env::var("LOCALAPPDATA") else { return };
-    let legacy = std::path::PathBuf::from(local).join("dsh-rust");
-    if !legacy.exists() || !legacy.join("settings.json").exists() {
+    format!("{}_API_KEY", out.trim_end_matches('_'))
+}
+
+/// 从 settings.yaml 构建内存态用户设置（只读我们拥有的段）。
+fn load_user_config() -> (AppSettings, String, String, bool, String) {
+    let doc = load_settings_doc();
+    let get = |path: &[&str]| -> Option<serde_yaml::Value> {
+        let mut cur = &doc;
+        for key in path {
+            cur = cur.get(*key)?;
+        }
+        Some(cur.clone())
+    };
+    let mut settings = AppSettings::default();
+
+    // 外观：ui-theme.preference
+    if let Some(v) = get(&["ui-theme", "preference"]).and_then(|v| v.as_str().map(|s| s.to_string())) {
+        settings.appearance = match v.as_str() {
+            "light" => AppearanceMode::Light,
+            "dark" => AppearanceMode::Dark,
+            _ => AppearanceMode::System,
+        };
+    }
+    // Enter：ui-conversation.busyEnter
+    if let Some(v) = get(&["ui-conversation", "busyEnter"]).and_then(|v| v.as_str().map(|s| s.to_string())) {
+        settings.enter = if v == "steer" { EnterBehavior::Interrupt } else { EnterBehavior::Queue };
+    }
+    // providers：llm-pi-ai.providers.<route>
+    let credentials = load_credentials();
+    if let Some(provs) = get(&["llm-pi-ai", "providers"]).and_then(|v| v.as_mapping().cloned()) {
+        for (route, def) in provs {
+            let route = route.as_str().unwrap_or_default().to_string();
+            if route.is_empty() {
+                continue;
+            }
+            let str_at = |k: &str| def.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+            let key_env = str_at("apiKeyEnv").unwrap_or_default();
+            let api_key = credentials.get(&key_env).cloned().unwrap_or_default();
+            let models = def
+                .get("models")
+                .and_then(|v| v.as_sequence())
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|m| {
+                            Some(CustomModel {
+                                id: m.get("id")?.as_str()?.to_string(),
+                                display_name: m.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+                                context_window: m.get("contextWindow").and_then(|n| n.as_u64()).map(|n| n.to_string()).unwrap_or_default(),
+                                max_tokens: m.get("maxTokens").and_then(|n| n.as_u64()).map(|n| n.to_string()).unwrap_or_default(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            settings.providers.push(CustomProvider {
+                id: route.clone(),
+                name: str_at("displayName").unwrap_or_else(|| route.clone()),
+                base_url: str_at("baseURL").unwrap_or_default(),
+                api_key,
+                protocol: str_at("api").unwrap_or_else(|| "openai-completions".into()),
+                models,
+            });
+        }
+    }
+    // 当前模型：agent-default-model
+    let mut active = "deepseek".to_string();
+    let mut desired = settings.model.clone();
+    if let Some(p) = get(&["agent-default-model", "provider"]).and_then(|v| v.as_str().map(|s| s.to_string())) {
+        if p == "deepseek-official" {
+            active = "deepseek".into();
+        } else if settings.providers.iter().any(|x| x.id == p) {
+            active = p.clone();
+            desired = settings
+                .providers
+                .iter()
+                .find(|x| x.id == p)
+                .and_then(|x| x.models.first())
+                .map(|m| m.id.clone())
+                .unwrap_or_default();
+        }
+    }
+    if let Some(m) = get(&["agent-default-model", "model"]).and_then(|v| v.as_str().map(|s| s.to_string())) {
+        desired = m;
+    }
+    settings.model = desired.clone();
+
+    let stored_deepseek_key = credentials.get("DEEPSEEK_API_KEY").cloned().unwrap_or_default();
+    let deepseek_env_locked = DeepSeekAdapter::from_env().is_some();
+    (settings, active, desired, deepseek_env_locked, stored_deepseek_key)
+}
+
+/// 持久化：patch settings.yaml 与 .credentials.yaml（其余段原样）。
+fn persist_user_config(
+    settings: &AppSettings,
+    active_provider: &str,
+    desired_model: &str,
+    deepseek_key: &str,
+    env_key_locked: bool,
+) {
+    let doc = load_settings_doc();
+    // 以现有文档的 mapping 为基底（保留 ui-onboarding/locale 等其它段）
+    let mapping = doc.as_mapping().cloned().unwrap_or_default();
+
+    // providers：全量替换 llm-pi-ai.providers
+    let mut providers = serde_yaml::Mapping::new();
+    for p in &settings.providers {
+        let mut def = serde_yaml::Mapping::new();
+        if !p.api_key.is_empty() {
+            def.insert("apiKeyEnv".into(), derive_key_ref(&p.id).into());
+        }
+        if !p.name.is_empty() && p.name != p.id {
+            def.insert("displayName".into(), p.name.clone().into());
+        }
+        if !p.base_url.is_empty() {
+            def.insert("baseURL".into(), p.base_url.clone().into());
+        }
+        def.insert("api".into(), "openai-completions".into());
+        let models: Vec<serde_yaml::Value> = p
+            .models
+            .iter()
+            .map(|m| {
+                let mut row = serde_yaml::Mapping::new();
+                row.insert("id".into(), m.id.clone().into());
+                if !m.display_name.is_empty() {
+                    row.insert("name".into(), m.display_name.clone().into());
+                } else {
+                    row.insert("name".into(), m.id.clone().into());
+                }
+                if !m.context_window.is_empty() {
+                    if let Ok(n) = m.context_window.parse::<u64>() {
+                        row.insert("contextWindow".into(), n.into());
+                    }
+                }
+                if !m.max_tokens.is_empty() {
+                    if let Ok(n) = m.max_tokens.parse::<u64>() {
+                        row.insert("maxTokens".into(), n.into());
+                    }
+                }
+                serde_yaml::Value::Mapping(row)
+            })
+            .collect();
+        def.insert("models".into(), serde_yaml::Value::Sequence(models));
+        providers.insert(serde_yaml::Value::String(p.id.clone()), serde_yaml::Value::Mapping(def));
+    }
+    let pi_block = {
+        let mut pi = serde_yaml::Mapping::new();
+        pi.insert("providers".into(), serde_yaml::Value::Mapping(providers));
+        serde_yaml::Value::Mapping(pi)
+    };
+
+    let mut mapping = mapping;
+    mapping.insert("llm-pi-ai".into(), pi_block);
+    // agent-default-model：内部 "deepseek" -> web route "deepseek-official"
+    let route = if active_provider == "deepseek" { "deepseek-official" } else { active_provider };
+    let mut adm = serde_yaml::Mapping::new();
+    adm.insert("provider".into(), route.into());
+    adm.insert("model".into(), desired_model.to_string().into());
+    mapping.insert("agent-default-model".into(), serde_yaml::Value::Mapping(adm));
+    // Enter 行为：ui-conversation.busyEnter
+    let mut conv = serde_yaml::Mapping::new();
+    conv.insert(
+        "busyEnter".into(),
+        match settings.enter {
+            EnterBehavior::Interrupt => "steer",
+            EnterBehavior::Queue => "queue",
+        }
+        .into(),
+    );
+    mapping.insert("ui-conversation".into(), serde_yaml::Value::Mapping(conv));
+    // 外观：ui-theme.preference
+    let mut theme = serde_yaml::Mapping::new();
+    theme.insert(
+        "preference".into(),
+        match settings.appearance {
+            AppearanceMode::Light => "light",
+            AppearanceMode::Dark => "dark",
+            AppearanceMode::System => "system",
+        }
+        .into(),
+    );
+    mapping.insert("ui-theme".into(), serde_yaml::Value::Mapping(theme));
+
+    save_settings_doc(&serde_yaml::Value::Mapping(mapping));
+
+    // 密钥：.credentials.yaml refs
+    let mut creds: Vec<(String, String)> = Vec::new();
+    if !deepseek_key.is_empty() && !env_key_locked {
+        creds.push(("DEEPSEEK_API_KEY".into(), deepseek_key.to_string()));
+    }
+    for p in &settings.providers {
+        if !p.api_key.is_empty() {
+            creds.push((derive_key_ref(&p.id), p.api_key.clone()));
+        }
+    }
+    if !creds.is_empty() {
+        save_credentials(&creds);
+    }
+}
+
+/// 旧版 settings.json / credentials.json 一次性并入 YAML 后删除。
+fn migrate_legacy() {
+    // settings.yaml 已经存在（web 版或本版此前写过）→ 视为已同步，跳过迁移。
+    if settings_path().exists() {
         return;
     }
-    let _ = std::fs::create_dir_all(&home);
-    if let Ok(raw) = std::fs::read_to_string(legacy.join("settings.json")) {
-        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let mut keys: Vec<(String, String)> = Vec::new();
-            if let Some(provs) = v.get_mut("providers").and_then(|p| p.as_array_mut()) {
-                for p in provs.iter_mut() {
-                    let id = p.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                    if let Some(key) = p.get_mut("api_key").and_then(|k| k.as_str()) {
-                        if !id.is_empty() {
-                            keys.push((id, key.to_string()));
+    let legacy_settings = dsh_home().join("settings.json");
+    let legacy_creds = dsh_home().join("credentials.json");
+    let old_local = std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|p| std::path::PathBuf::from(p).join("dsh-rust"));
+    let mut fj = legacy_settings.clone();
+    if !fj.exists()
+        && let Some(l) = &old_local
+    {
+        fj = l.join("settings.json");
+    }
+    if !fj.exists() {
+        return;
+    }
+    // 解析旧 json 设置
+    let Ok(raw) = std::fs::read_to_string(&fj) else { return };
+    let Ok(raw_j) = serde_json::from_str(&raw) else { return };
+    let mut old: serde_json::Value = raw_j;
+    let mut settings = AppSettings::default();
+    if let Some(a) = old.get("appearance").and_then(|v| v.as_str()) {
+        settings.appearance = match a {
+            "Light" | "light" => AppearanceMode::Light,
+            "Dark" | "dark" => AppearanceMode::Dark,
+            _ => AppearanceMode::System,
+        };
+    }
+    if let Some(e) = old.get("enter").and_then(|v| v.as_str()) {
+        settings.enter = if e == "interrupt" || e == "steer" { EnterBehavior::Interrupt } else { EnterBehavior::Queue };
+    }
+    if let Some(m) = old.get("model").and_then(|v| v.as_str()) {
+        settings.model = m.to_string();
+    }
+    let mut old_keys: std::collections::HashMap<String, String> = Default::default();
+    if let Some(provs) = old.get_mut("providers").and_then(|p| p.as_array_mut()) {
+        for p in provs.iter_mut() {
+            let id = p.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let key = p.get("api_key").and_then(|k| k.as_str()).unwrap_or_default().to_string();
+            if !key.is_empty() {
+                old_keys.insert(id.clone(), key.clone());
+            }
+            settings.providers.push(CustomProvider {
+                id: id.clone(),
+                name: p.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+                base_url: p.get("base_url").and_then(|b| b.as_str()).unwrap_or_default().to_string(),
+                api_key: key,
+                protocol: p.get("protocol").and_then(|x| x.as_str()).unwrap_or("openai-completions").to_string(),
+                models: p
+                    .get("models")
+                    .and_then(|v| v.as_array())
+                    .map(|seq| {
+                        seq.iter()
+                            .filter_map(|m| {
+                                Some(CustomModel {
+                                    id: m.get("id")?.as_str()?.to_string(),
+                                    display_name: m.get("display_name").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+                                    context_window: m.get("context_window").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+                                    max_tokens: m.get("max_tokens").and_then(|n| n.as_str()).unwrap_or_default().to_string(),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    // 旧 credentials.json 的 key 合并
+    let mut creds_files = vec![legacy_creds.clone()];
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let lc = std::path::PathBuf::from(local).join("dsh-rust").join("credentials.json");
+        if lc.exists() {
+            creds_files.push(lc);
+        }
+    }
+    for cf in creds_files {
+        if let Ok(rawc) = std::fs::read_to_string(cf) {
+            if let Ok(_doc) = serde_json::from_str::<serde_json::Value>(&rawc) {
+                if let Some(o) = _doc.as_object() {
+                    for (k, v) in o {
+                        if let Some(sv) = v.as_str() {
+                            old_keys.insert(k.clone(), sv.to_string());
                         }
                     }
-                    if let Some(o) = p.as_object_mut() {
-                        o.remove("api_key");
-                    }
-                }
-            }
-            if let Ok(json) = serde_json::to_string_pretty(&v) {
-                let _ = std::fs::write(home.join("settings.json"), json);
-                if !keys.is_empty() {
-                    save_credentials(&keys);
                 }
             }
         }
     }
-    let old_s = legacy.join("sessions");
-    if old_s.exists() {
-        let new_s_dir = home.join("sessions");
-        let _ = std::fs::create_dir_all(&new_s_dir);
-        if let Ok(entries) = std::fs::read_dir(&old_s) {
-            for e in entries.flatten() {
-                let _ = std::fs::copy(e.path(), new_s_dir.join(e.file_name()));
+    if false {
+    if let Ok(rawc) = std::fs::read_to_string(legacy_creds.clone()) {
+        if let Ok(_doc) = serde_json::from_str::<serde_json::Value>(&rawc) {
             }
         }
     }
+    // deepseek key
+    let deepseek_key = old_keys.remove("deepseek").unwrap_or_default();
+    for (id, key) in &old_keys {
+        if let Some(p) = settings.providers.iter_mut().find(|p| &p.id == id) {
+            p.api_key = key.clone();
+        }
+    }
+    // 写 yaml（providers 的 keys 会经 derive_key_ref 进 credentials）
+    persist_user_config(&settings, "deepseek", &settings.model, &deepseek_key, false);
+    let _ = std::fs::remove_file(&legacy_settings);
+    let _ = std::fs::remove_file(&legacy_creds);
 }
 
 /// AppView 的运行期依赖（打包传入以控制构造参数个数）。
@@ -965,28 +1278,15 @@ impl AppView {
     }
 
 
-    /// 写盘：settings.json（剥离密钥）+ credentials.json（密钥分流）。
+    /// 写盘：settings.yaml + .credentials.yaml（与 web 共享同一份文档）。
     fn persist_settings(&self) {
-        let _ = std::fs::create_dir_all(dsh_home());
-        let mut creds: Vec<(String, String)> = Vec::new();
-        if !self.deepseek_key.is_empty() && !self.env_key_locked {
-            creds.push(("deepseek".into(), self.deepseek_key.clone()));
-        }
-        for p in &self.settings.providers {
-            if !p.api_key.is_empty() {
-                creds.push((p.id.clone(), p.api_key.clone()));
-            }
-        }
-        if !creds.is_empty() {
-            save_credentials(&creds);
-        }
-        let mut clean = self.settings.clone();
-        for p in clean.providers.iter_mut() {
-            p.api_key = String::new();
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&clean) {
-            let _ = std::fs::write(settings_path(), json);
-        }
+        persist_user_config(
+            &self.settings,
+            &self.active_provider,
+            &self.desired_model,
+            &self.deepseek_key,
+            self.env_key_locked,
+        );
     }
 
     // --- 渲染 ---------------------------------------------------------------
@@ -2287,20 +2587,13 @@ fn main() {
     let _retry_disposer = dsh_agent_loop::retry::attach_retry(&events);
     let llm = Arc::new(LlmRuntime::with_events(events.clone()));
 
-    // 存储布局对齐 dsh：{DSH_HOME|~/.dsh}/settings.json + credentials.json + sessions/
+    // 存储与 web 版 dsh 共享：{DSH_HOME|~/.dsh}/settings.yaml + .credentials.yaml + sessions/
     migrate_legacy();
-    let mut user_settings: AppSettings = std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let credentials = load_credentials();
-    for p in user_settings.providers.iter_mut() {
-        if let Some(key) = credentials.get(&p.id) {
-            p.api_key = key.clone();
-        }
+    let (mut user_settings, startup_active, startup_desired, deepseek_env_locked, stored_deepseek_key) =
+        load_user_config();
+    if !startup_desired.is_empty() {
+        user_settings.model = startup_desired.clone();
     }
-    let stored_deepseek_key = credentials.get("deepseek").cloned().unwrap_or_default();
-    let deepseek_env_locked = DeepSeekAdapter::from_env().is_some();
 
     let (provider, model) = match DeepSeekAdapter::from_env() {
         Some(adapter) => {
@@ -2390,23 +2683,40 @@ fn main() {
 
     // 注册用户声明的自定义提供方（OpenAI 兼容，复用 DeepSeek adapter）
     for p in &user_settings.providers {
-        let adapter = DeepSeekAdapter::with_base_url(&p.api_key, &p.base_url);
-        let _ = llm.register_adapter(&[p.id.clone()], Arc::new(adapter));
-    }
-    // 初始路由：环境变量 key > 自定义提供方 > mock
-    let startup_active = if provider == "deepseek" {
-        "deepseek".to_string()
-    } else if let Some(p) = user_settings.providers.first() {
-        p.id.clone()
-    } else {
-        "mock".to_string()
-    };
-    if startup_active != "deepseek" && startup_active != "mock" {
-        if let Some(p) = user_settings.providers.iter().find(|p| p.id == startup_active) {
-            let model = p.models.first().map(|m| m.id.clone()).unwrap_or_default();
-            agent.set_provider_and_model(p.id.clone(), model);
+        if !p.base_url.is_empty() {
+            let adapter = DeepSeekAdapter::with_base_url(&p.api_key, &p.base_url);
+            let _ = llm.register_adapter(&[p.id.clone()], Arc::new(adapter));
         }
     }
+    let initial_route = if startup_active == "deepseek" {
+        "deepseek".to_string()
+    } else if user_settings.providers.iter().any(|p| p.id == startup_active) {
+        startup_active.clone()
+    } else {
+        "deepseek".to_string()
+    };
+    let initial_model = if startup_desired.is_empty() {
+        "deepseek-chat".to_string()
+    } else {
+        startup_desired.clone()
+    };
+    // 初始路由：环境变量 key > 自定义提供方 > mock
+    // agent 初始路由：环境 key/凭据 key 的 deepseek 优先；否则按 agent-default-model；
+    // 无任何配置时 mock。
+    let effective_startup = if provider == "deepseek" || !stored_deepseek_key.is_empty() {
+        "deepseek".to_string()
+    } else if user_settings.providers.is_empty() {
+        "mock".to_string()
+    } else {
+        initial_route.clone()
+    };
+    if effective_startup != "mock"
+        && let Some(p) = user_settings.providers.iter().find(|p| p.id == effective_startup)
+    {
+        let model = p.models.first().map(|m| m.id.clone()).unwrap_or(initial_model.clone());
+        agent.set_provider_and_model(p.id.clone(), model);
+    }
+    let _ = initial_model;
 
     Application::new()
         .with_assets(assets::AppAssets)
@@ -2468,9 +2778,9 @@ fn main() {
                         input.clone(),
                         api_input,
                         desired_model,
-                        startup_active.clone(),
+                        effective_startup.clone(),
                         user_settings.clone(),
-                        provider == "deepseek" || !user_settings.providers.is_empty(),
+                        provider == "deepseek" || !stored_deepseek_key.is_empty() || !user_settings.providers.is_empty(),
                         deepseek_env_locked,
                         stored_deepseek_key.clone(),
                         adopt_key.clone(),

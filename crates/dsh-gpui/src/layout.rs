@@ -60,19 +60,32 @@ pub(crate) struct ColumnDrag {
 /// 列宽把手：`on_drag` 起拖（借鉴 Zed render_column_resize_divider），
 /// 宽度由根容器上的 `on_drag_move::<ColumnDrag>` 按指针绝对位置跟手更新。
 pub(crate) fn drag_handle(side: DragSide) -> Stateful<Div> {
+    // 16px 命中带骑缝（±8px，起拖容错）；悬浮高亮画在中间的窄带
+    // 上，恢复早期 8px 细高亮的观感。
+    let group: SharedString = match side {
+        DragSide::Sidebar => "drag-sidebar".into(),
+        DragSide::Details => "drag-details".into(),
+    };
+    let group_h = group.clone();
     div()
-        .id(SharedString::from(match side {
-            DragSide::Sidebar => "drag-sidebar",
-            DragSide::Details => "drag-details",
-        }))
-        .w(px(16.0)) // 16px 命中带骑缝（±8px），起拖容错与 web 一致
+        .id(group.clone())
+        .w(px(16.0))
         .h_full()
         .flex_none()
         .mx(px(-8.0))
         .cursor_col_resize()
-        .hover(|s| s.bg(theme::t().hover))
-        // 分界视觉线由栏容器自身的 1px 边框提供（sidebar border_r /
-        // details border_l），把手只提供 16px 命中带与 hover 高亮。
+        .group(group_h)
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_1()
+                .right_1()
+                .opacity(0.0)
+                .group_hover(group.clone(), |s| s.opacity(1.0))
+                .bg(theme::t().border_l2),
+        )
         .on_drag(
             ColumnDrag { side },
             |_drag, _offset, _window, cx| cx.new(|_| gpui::Empty),

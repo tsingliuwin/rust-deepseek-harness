@@ -698,36 +698,93 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
     let pick = candidates.iter().position(|i| *i == app.adopt_pick).map(|p| candidates[p]).unwrap_or(0);
     let entry = &PROVIDER_CATALOG[pick];
 
-    let mut chooser = div().flex().flex_wrap().gap_2();
-    for (slot, ci) in candidates.iter().enumerate() {
-        let selected = *ci == pick;
-        let t = this.clone();
-        let idx = *ci;
-        let e = &PROVIDER_CATALOG[idx];
-        chooser = chooser.child(
+    // 提供方选择（web <select class="input selectInput">：240px、h32、r8、l2 描边、
+    // layer-1 底、14/22、右侧 12px chevron #81858C；点击就地展开选项列表）
+    let t_toggle = this.clone();
+    let entry_name = entry.name;
+    let dropdown_open = app.adopt_dropdown_open;
+    let mut chooser = div()
+        .relative()
+        .w(px(240.0))
+        .child(
             div()
-                .id(SharedString::from(format!("adopt-pick-{idx}")))
-                .h(px(32.0))
-                .px(px(10.0))
+                .id("adopt-select")
+                .w_full()
                 .flex()
                 .items_center()
+                .justify_between()
+                .pr(px(30.0))
+                .pl(px(10.0))
+                .h(px(32.0))
                 .rounded(px(8.0))
                 .border_1()
-                .border_color(if selected { tk.accent.into() } else { tk.border_l2 })
+                .border_color(tk.border_l2)
+                .bg(tk.layer1)
                 .text_size(px(theme::FONT_ROW))
                 .line_height(px(22.0))
-                .text_color(if selected { tk.accent } else { tk.text })
+                .text_color(tk.text)
                 .cursor_pointer()
-                .hover(|s| s.bg(tk.hover))
+                .hover(|s| s.border_color(tk.border_l3))
                 .on_click(move |_, _, cx| {
-                    t.update(cx, |v, cx| {
-                        v.adopt_pick = idx;
+                    t_toggle.update(cx, |v, cx| {
+                        v.adopt_dropdown_open = !v.adopt_dropdown_open;
                         cx.notify();
                     });
                 })
-                .child(e.name),
+                .child(entry_name)
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .absolute()
+                        .right(px(12.0))
+                        .size(px(12.0))
+                        .text_color(tk.caption),
+                ),
         );
-        let _ = slot;
+    if dropdown_open {
+        let mut menu = div()
+            .id("adopt-menu")
+            .absolute()
+            .top(px(36.0))
+            .left_0()
+            .w(px(240.0))
+            .v_flex()
+            .p(px(4.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(tk.border_l2)
+            .bg(tk.surface)
+            .shadow_lg();
+        for ci in candidates.iter() {
+            let t = this.clone();
+            let idx = *ci;
+            let e = &PROVIDER_CATALOG[idx];
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("adopt-pick-{idx}")))
+                    .w_full()
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .px(px(10.0))
+                    .rounded(px(6.0))
+                    .text_size(px(theme::FONT_ROW))
+                    .line_height(px(22.0))
+                    .text_color(tk.text)
+                    .map(|d| if idx == pick { d.bg(tk.hover) } else { d })
+                    .when(idx != pick, |d| d.hover(|s| s.bg(tk.hover)))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        let idx = idx;
+                        t.update(cx, |v, cx| {
+                            v.adopt_pick = idx;
+                            v.adopt_dropdown_open = false;
+                            cx.notify();
+                        });
+                    })
+                    .child(e.name),
+            );
+        }
+        chooser = chooser.child(menu);
     }
 
     div()

@@ -250,6 +250,7 @@ struct AppView {
     // 模型页添加/编辑卡状态（对齐 web ModelsSection 的 adding/declaring/editing）
     adding: AddingMode,
     adopt_pick: usize,
+    adopt_dropdown_open: bool,
     adopt_customized_open: bool,
     edit_customized_open: bool,
     editing_provider: Option<String>,
@@ -336,6 +337,7 @@ impl AppView {
             llm_configured,
             adding: AddingMode::None,
             adopt_pick: 0,
+            adopt_dropdown_open: false,
             adopt_customized_open: false,
             edit_customized_open: false,
             editing_provider: None,

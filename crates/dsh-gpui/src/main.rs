@@ -724,6 +724,7 @@ struct AppView {
     _input_subscription: Subscription,
     chat_scroll: ScrollHandle,
     // 布局状态
+    last_drag_tick: Instant,
     sidebar_collapsed: bool,
     sidebar_width: f32,
     details_open: bool,
@@ -813,6 +814,7 @@ impl AppView {
             pending_clear: false,
             _input_subscription: subscription,
             chat_scroll: ScrollHandle::new(),
+            last_drag_tick: Instant::now(),
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT,
             details_open: true,
@@ -1740,19 +1742,29 @@ impl Render for AppView {
                 let side = ev.drag(cx).side;
                 let x: f32 = ev.event.position.x.into();
                 let vw: f32 = window.viewport_size().width.into();
-                drag_target.update(cx, |v, cx| match side {
-                    DragSide::Sidebar => {
-                        let w = x.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-                        if (w - v.sidebar_width).abs() >= 1.0 {
-                            v.sidebar_width = w;
-                            cx.notify();
-                        }
+                drag_target.update(cx, |v, cx| {
+                    // 帧率级节流：GPUI 每事件全量 layout + 文本重组，
+                    // 1000Hz 鼠标事件直接喂给引擎是拖拽卡顿的根；
+                    // 12ms（≈83Hz）人眼视觉饱和，重排负担降一个数量级。
+                    let now = Instant::now();
+                    if (now - v.last_drag_tick).as_millis() < 12 {
+                        return;
                     }
-                    DragSide::Details => {
-                        let w = (vw - x).clamp(DETAILS_MIN, DETAILS_MAX);
-                        if (w - v.details_width).abs() >= 1.0 {
-                            v.details_width = w;
-                            cx.notify();
+                    v.last_drag_tick = now;
+                    match side {
+                        DragSide::Sidebar => {
+                            let w = x.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                            if (w - v.sidebar_width).abs() >= 1.0 {
+                                v.sidebar_width = w;
+                                cx.notify();
+                            }
+                        }
+                        DragSide::Details => {
+                            let w = (vw - x).clamp(DETAILS_MIN, DETAILS_MAX);
+                            if (w - v.details_width).abs() >= 1.0 {
+                                v.details_width = w;
+                                cx.notify();
+                            }
                         }
                     }
                 });

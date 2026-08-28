@@ -786,6 +786,13 @@ struct AppView {
     renaming_workspace: Option<String>,
     /// hero「选择工作区」菜单开合
     hero_ws_menu: bool,
+    /// 搜索会话：展开 + 词条
+    search_open: bool,
+    search_query: String,
+    search_input: Entity<InputState>,
+    /// 视图选项：单列表 / 按工作区；排序 手动 / 最近更新
+    group_flat: bool,
+    order_manual: bool,
     rename_input: Entity<InputState>,
     entries: Vec<ChatEntry>,
     input: Entity<InputState>,
@@ -827,6 +834,7 @@ struct AppView {
     edit_base: Entity<InputState>,
     pending_clear: bool,
     _input_subscription: Subscription,
+    _search_subscription: Subscription,
     /// 消息流虚拟列表（可变高、Bottom 对齐聊天模式）
     chat_list: ListState,
     /// 列表条目总数（消息 + 状态行 + 统计行）
@@ -866,6 +874,7 @@ impl AppView {
         deepseek_key: String,
         workspaces: Vec<WorkspaceInfo>,
         rename_input: Entity<InputState>,
+        search_input: Entity<InputState>,
         adopt_key: Entity<InputState>,
         adopt_base: Entity<InputState>,
         dc_route: Entity<InputState>,
@@ -877,6 +886,13 @@ impl AppView {
         edit_base: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let search_subscription = cx.subscribe(&search_input, |chat, st, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                let q = st.read_with(cx, |s, _| s.value().to_string());
+                chat.search_query = q.trim().to_string();
+                cx.notify();
+            }
+        });
         let subscription = cx.subscribe(&input, |chat, input, event, cx| {
             if matches!(event, InputEvent::PressEnter { secondary: false }) {
                 let text: String = input.read_with(cx, |s, _| s.value().to_string());
@@ -911,6 +927,11 @@ impl AppView {
             sidebar_menu: None,
             renaming_workspace: None,
             hero_ws_menu: false,
+            search_open: false,
+            search_query: String::new(),
+            search_input: search_input.clone(),
+            group_flat: false,
+            order_manual: false,
             rename_input,
             adding: AddingMode::None,
             adopt_pick: 0,
@@ -932,6 +953,7 @@ impl AppView {
             edit_base,
             pending_clear: false,
             _input_subscription: subscription,
+            _search_subscription: search_subscription,
             chat_list: ListState::new(0, ListAlignment::Bottom, px(100.0)),
             chat_items: 0,
             list_bottom: Rc::new(Cell::new(true)),
@@ -2126,7 +2148,40 @@ impl AppView {
             let t_pick = this.clone();
             let mut all_rows: Vec<AnyElement> = Vec::new();
             let mut row_index = 0usize;
+            let search_active = !self.search_query.is_empty();
+            if search_active {
+                // web searchTree：匹配会话平铺（工作区行常规渲染跳过）
+                let needle = self.search_query.to_lowercase();
+                for meta in &self.sessions {
+                    if !meta.title.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    let t_sw = this.clone();
+                    let id = meta.id.clone();
+                    let t_m = this.clone();
+                    let id_m = meta.id.as_str().to_string();
+                    let y_m = (row_index as f32) * 37.0 + 176.0;
+                    let active = meta.id == current_id;
+                    all_rows.push(
+                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                            let id = id.clone();
+                            t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
+                        }, move |_, _, cx| {
+                            let id = id_m.clone();
+                            t_m.update(cx, |v, cx| {
+                                v.sidebar_menu = Some(("session".into(), id, y_m));
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element(),
+                    );
+                    row_index += 1;
+                }
+            }
             for w in &self.workspaces {
+                if search_active && !self.group_flat {
+                    // 搜索命中：不发工作区行（会话已平铺）
+                }
                 let wid = w.id.clone();
                 let wtitle = w.title.clone();
                 let wid3 = wid.clone();
@@ -2234,19 +2289,39 @@ impl AppView {
                     row_index += 1;
                 }
                 // --- 该组会话行 ---
-                if !wcollapsed {
-                    for sid in &w.session_ids {
+                if !wcollapsed && !self.group_flat {
+                    let w_sids: Vec<String> = if self.order_manual {
+                        w.session_ids.clone()
+                    } else {
+                        self.sessions
+                            .iter()
+                            .filter(|m| w.session_ids.iter().any(|s| s == m.id.as_str()))
+                            .map(|m| m.id.as_str().to_string())
+                            .collect()
+                    };
+                    for sid in &w_sids {
                         if let Some(meta) = self.sessions.iter().find(|m| m.id.as_str() == sid) {
                             let t_sw = this.clone();
                             let id = meta.id.clone();
                             let active = meta.id == current_id;
-                            all_rows.push(
-                                session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
-                                    let id = id.clone();
-                                    t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                                })
-                                .into_any_element(),
-                            );
+                            {
+                                let t_m = this.clone();
+                                let id_m = meta.id.as_str().to_string();
+                                let y_m = (row_index as f32) * 37.0 + 130.0;
+                                all_rows.push(
+                                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                                        let id = id.clone();
+                                        t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
+                                    }, move |_, _, cx| {
+                                        let id = id_m.clone();
+                                        t_m.update(cx, |v, cx| {
+                                            v.sidebar_menu = Some(("session".into(), id, y_m));
+                                            cx.notify();
+                                        });
+                                    })
+                                    .into_any_element(),
+                                );
+                            }
                             row_index += 1;
                         }
                     }
@@ -2262,13 +2337,24 @@ impl AppView {
                 let t_sw = this.clone();
                 let id = meta.id.clone();
                 let active = meta.id == current_id;
-                all_rows.push(
-                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
-                        let id = id.clone();
-                        t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                    })
-                    .into_any_element(),
-                );
+                {
+                    let t_m = this.clone();
+                    let id_m = meta.id.as_str().to_string();
+                    let y_m = (row_index as f32) * 37.0 + 130.0;
+                    all_rows.push(
+                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                            let id = id.clone();
+                            t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
+                        }, move |_, _, cx| {
+                            let id = id_m.clone();
+                            t_m.update(cx, |v, cx| {
+                                v.sidebar_menu = Some(("session".into(), id, y_m));
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element(),
+                    );
+                }
                 row_index += 1;
             }
             let _ = t_pick.clone();
@@ -2357,17 +2443,57 @@ impl AppView {
                         .items_center()
                         .pl_1()
                         .mb_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(theme::FONT_ROW))
-                                .line_height(px(20.0))
-                                .text_color(theme::t().text_3)
-                                .child("会话"),
-                        )
-                        .child(icon_btn("sb-search", IconName::Search, theme::t().text_2, "搜索会话", |_, _, _| {}))
-                        .child(icon_btn("sb-view", IconName::Ellipsis, theme::t().text_2, "视图选项", |_, _, _| {}))
+                        .when(!self.search_open, |hdr| {
+                            hdr.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(theme::FONT_ROW))
+                                    .line_height(px(20.0))
+                                    .text_color(theme::t().text_3)
+                                    .child("会话"),
+                            )
+                            .child({
+                                let t = this.clone();
+                                icon_btn("sb-search", IconName::Search, theme::t().text_2, "搜索会话", move |_, _, cx| {
+                                    t.update(cx, |v, cx| {
+                                        v.search_open = true;
+                                        cx.notify();
+                                    });
+                                })
+                            })
+                        })
+                        .when(self.search_open, |hdr| {
+                            hdr.child(
+                                div()
+                                    .id("sb-search-input")
+                                    .flex_1()
+                                    .h(px(30.0))
+                                    .rounded(px(10.0))
+                                    .border_1()
+                                    .border_color(theme::t().border_l2)
+                                    .child(Input::new(&self.search_input).appearance(false).w_full()),
+                            )
+                            .child({
+                                let t = this.clone();
+                                icon_btn("sb-search-close", IconName::Close, theme::t().text_2, "关闭搜索", move |_, _, cx| {
+                                    t.update(cx, |v, cx| {
+                                        v.search_open = false;
+                                        v.search_query.clear();
+                                        cx.notify();
+                                    });
+                                })
+                            })
+                        })
+                        .child({
+                            let t = this.clone();
+                            icon_btn("sb-view", IconName::Ellipsis, theme::t().text_2, "视图选项", move |_, _, cx| {
+                                t.update(cx, |v, cx| {
+                                    v.sidebar_menu = Some(("view".into(), String::new(), 96.0));
+                                    cx.notify();
+                                });
+                            })
+                        })
                         .child({
                             let t_add_ws = this.clone();
                             icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, _, cx| {
@@ -2436,7 +2562,58 @@ impl AppView {
                             .border_color(theme::t().border_l2)
                             .bg(theme::t().surface)
                             .shadow_lg()
-                            .children(if kind == "ws" {
+                            .children(if kind == "view" {
+                                // 视图选项（web ViewOptionsMenu：分组 label + 单选 + 分隔 + 排序）
+                                let t1 = this.clone();
+                                let t2 = this.clone();
+                                let t3 = this.clone();
+                                let t4 = this.clone();
+                                vec![
+                                    sb_menu_label("分组方式").into_any_element(),
+                                    sb_menu_check_row(
+                                        "view-group-ws",
+                                        "按工作区",
+                                        !self.group_flat,
+                                        move |_, _, cx| t1.update(cx, |v, cx| {
+                                            v.group_flat = false;
+                                            v.sidebar_menu = None;
+                                            cx.notify();
+                                        }),
+                                    ).into_any_element(),
+                                    sb_menu_check_row(
+                                        "view-group-flat",
+                                        "单列表",
+                                        self.group_flat,
+                                        move |_, _, cx| t2.update(cx, |v, cx| {
+                                            v.group_flat = true;
+                                            v.sidebar_menu = None;
+                                            cx.notify();
+                                        }),
+                                    ).into_any_element(),
+                                    sb_menu_divider().into_any_element(),
+                                    sb_menu_label("排序方式").into_any_element(),
+                                    sb_menu_check_row(
+                                        "view-order-manual",
+                                        "手动排序",
+                                        self.order_manual,
+                                        move |_, _, cx| t3.update(cx, |v, cx| {
+                                            v.order_manual = true;
+                                            v.sidebar_menu = None;
+                                            cx.notify();
+                                        }),
+                                    ).into_any_element(),
+                                    sb_menu_check_row(
+                                        "view-order-updated",
+                                        "最近更新",
+                                        !self.order_manual,
+                                        move |_, _, cx| t4.update(cx, |v, cx| {
+                                            v.order_manual = false;
+                                            v.sidebar_menu = None;
+                                            cx.notify();
+                                        }),
+                                    ).into_any_element(),
+                                ]
+                            } else if kind == "ws" {
                                 let t1 = this.clone();
                                 let t2 = this.clone();
                                 let id1 = target.clone();
@@ -3220,6 +3397,48 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
 }
 
 
+/// 视图菜单分组 label（web Menu label：caption 色小字）。
+fn sb_menu_label(text: &'static str) -> Div {
+    div()
+        .px(px(10.0))
+        .pt_2()
+        .pb_1()
+        .text_size(px(11.0))
+        .line_height(px(14.0))
+        .text_color(theme::t().caption)
+        .child(text)
+}
+
+/// 视图菜单分隔线。
+fn sb_menu_divider() -> Div {
+    div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2)
+}
+
+/// 视图菜单可勾选行（web Menu selected：右侧勾、选中项 primary）。
+fn sb_menu_check_row(
+    id: &'static str,
+    label: &'static str,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(32.0))
+        .flex()
+        .items_center()
+        .px(px(10.0))
+        .rounded(px(6.0))
+        .text_size(px(theme::FONT_ROW))
+        .line_height(px(22.0))
+        .text_color(theme::t().text)
+        .map(|d| if selected { d.bg(theme::t().hover) } else { d })
+        .when(!selected, |d| d.hover(|s| s.bg(theme::t().hover)))
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(div().flex_1().child(label))
+        .when(selected, |d| d.child(Icon::new(IconName::Check).size(px(14.0)).text_color(theme::t().accent)))
+}
+
 /// 行菜单条目（web Menu entry：h32、hover 浅底、危险项红色）。
 /// 简易胶囊按钮（重命名对话框用）。
 fn action_btn_lite(
@@ -3469,6 +3688,9 @@ fn main() {
                 let rename_input = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).placeholder("工作区名称")
                 });
+                let search_input = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("搜索会话…")
+                });
                 let adopt_key = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).masked(true).placeholder("输入 API 密钥，或留空使用环境认证")
                 });
@@ -3514,6 +3736,7 @@ fn main() {
                         stored_deepseek_key.clone(),
                         startup_workspaces.clone(),
                         rename_input.clone(),
+                        search_input.clone(),
                         adopt_key.clone(),
                         adopt_base.clone(),
                         dc_route.clone(),

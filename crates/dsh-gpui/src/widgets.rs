@@ -138,6 +138,7 @@ pub(crate) fn session_row(
     time_label: String,
     active: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let id: SharedString = format!("session-{title}-{index}").into();
     let group: SharedString = format!("session-row-{index}").into();
@@ -181,15 +182,19 @@ pub(crate) fn session_row(
             )
         })
         .child(
-            // hover 显现的「…」（web 会话行 hover 切换）
+            // hover 显现的「…」（web 会话行 hover 切换：time 让位给菜单钮）
             div()
                 .id(SharedString::from(format!("session-more-{index}")))
                 .size(px(16.0))
                 .flex()
                 .items_center()
                 .justify_center()
+                .rounded(px(4.0))
                 .opacity(0.0)
                 .group_hover(group_more, |s| s.opacity(1.0))
+                .hover(|st| st.bg(theme::t().active))
+                .cursor_pointer()
+                .on_click(on_more)
                 .child(Icon::new(IconName::Ellipsis).size(px(14.0)).text_color(theme::t().text_3)),
         )
 }

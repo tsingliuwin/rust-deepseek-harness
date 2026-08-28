@@ -1,0 +1,17 @@
+[package]
+name = "dsh-llm-deepseek"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-llm = { path = "../dsh-llm" }
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+async-stream.workspace = true

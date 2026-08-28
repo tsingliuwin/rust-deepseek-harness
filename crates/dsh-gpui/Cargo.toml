@@ -1,0 +1,26 @@
+[package]
+name = "dsh-gpui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+dsh-cordis = { path = "../cordis" }
+dsh-llm = { path = "../dsh-llm" }
+dsh-tools = { path = "../dsh-tools" }
+dsh-system-prompt = { path = "../dsh-system-prompt" }
+dsh-agent-loop = { path = "../dsh-agent-loop" }
+dsh-llm-deepseek = { path = "../dsh-llm-deepseek" }
+dsh-fs = { path = "../dsh-fs" }
+dsh-shell = { path = "../dsh-shell" }
+dsh-web = { path = "../dsh-web" }
+dsh-persist = { path = "../dsh-persist" }
+dsh-session = { path = "../dsh-session" }
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+uuid.workspace = true
+serde_json.workspace = true

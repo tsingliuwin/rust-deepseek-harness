@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/cordis",
+  "crates/dsh-llm",
+  "crates/dsh-llm-deepseek",
+  "crates/dsh-session",
+  "crates/dsh-tools",
+  "crates/dsh-system-prompt",
+  "crates/dsh-agent",
+  "crates/dsh-agent-loop",
+  "crates/dsh-gpui",
+  "crates/dsh-fs",
+  "crates/dsh-shell",
+  "crates/dsh-web",
+  "crates/dsh-persist",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+bytes = "1"
+async-stream = "0.3"
+flume = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["default-tls", "stream", "json", "gzip", "brotli", "deflate"] }
+gpui = "0.2.2"
+gpui-component = "0.5.1"

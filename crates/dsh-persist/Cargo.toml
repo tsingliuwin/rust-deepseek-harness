@@ -1,0 +1,10 @@
+[package]
+name = "dsh-persist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-session = { path = "../dsh-session" }
+dsh-llm = { path = "../dsh-llm" }
+serde_json.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "dsh-agent-loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-cordis = { path = "../cordis" }
+dsh-llm = { path = "../dsh-llm" }
+dsh-session = { path = "../dsh-session" }
+dsh-tools = { path = "../dsh-tools" }
+dsh-system-prompt = { path = "../dsh-system-prompt" }
+dsh-agent = { path = "../dsh-agent" }
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+flume.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+dsh-fs = { path = "../dsh-fs" }
+dsh-shell = { path = "../dsh-shell" }
+dsh-web = { path = "../dsh-web" }

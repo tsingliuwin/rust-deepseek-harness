@@ -1,0 +1,11 @@
+[package]
+name = "dsh-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-tools = { path = "../dsh-tools" }
+serde_json.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true

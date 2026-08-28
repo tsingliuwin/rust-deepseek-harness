@@ -130,15 +130,22 @@ pub(crate) fn rail_icon(
         .on_click(on_click)
         .child(Icon::new(icon).size(px(18.0)))
 }
-/// 侧栏会话行（web .sessionRow：32px、r8、选中/hover 白 8%）。
+/// 侧栏会话行（web .sessionRow：32px、r8、选中/hover 白 8%，
+/// 右侧时间 hover 时切换为「…」操作钮）。
 pub(crate) fn session_row(
+    index: usize,
     title: String,
+    time_label: String,
     active: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
-    let id: SharedString = format!("session-{title}").into();
+    let id: SharedString = format!("session-{title}-{index}").into();
+    let group: SharedString = format!("session-row-{index}").into();
+    let group_time = group.clone();
+    let group_more = group.clone();
     div()
         .id(id)
+        .group(group)
         .h(px(32.0))
         .flex()
         .items_center()
@@ -161,6 +168,29 @@ pub(crate) fn session_row(
                 .line_height(px(20.0))
                 .text_color(theme::TEXT)
                 .child(title),
+        )
+        .when(!time_label.is_empty(), |d| {
+            d.child(
+                div()
+                    .id(SharedString::from(format!("session-time-{index}")))
+                    .text_size(px(12.0))
+                    .line_height(px(20.0))
+                    .text_color(theme::TEXT_3)
+                    .group_hover(group_time, |s| s.opacity(0.0))
+                    .child(time_label),
+            )
+        })
+        .child(
+            // hover 显现的「…」（web 会话行 hover 切换）
+            div()
+                .id(SharedString::from(format!("session-more-{index}")))
+                .size(px(16.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(0.0)
+                .group_hover(group_more, |s| s.opacity(1.0))
+                .child(Icon::new(IconName::Ellipsis).size(px(14.0)).text_color(theme::TEXT_3)),
         )
 }
 /// 行内 2×2 分隔点（web .sep）。
@@ -186,11 +216,13 @@ pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) 
     card
 }
 pub(crate) fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div {
+    // web ToolRow .ioSection：max-content 槽道标签 + 1fr 文本，gap 14，pad 12/16
     div()
-        .v_flex()
+        .flex()
+        .items_start()
+        .gap(px(14.0))
         .px_4()
         .py_3()
-        .gap_1()
         .child(
             div()
                 .text_size(px(theme::FONT_CAPTION))
@@ -202,6 +234,8 @@ pub(crate) fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div 
         .child(
             div()
                 .id(("io-scroll", uid))
+                .flex_1()
+                .min_w_0()
                 .max_h(px(150.0))
                 .overflow_y_scroll()
                 .font_family(theme_mono())

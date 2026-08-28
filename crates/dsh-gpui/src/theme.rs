@@ -149,6 +149,10 @@ pub fn init(cx: &mut gpui::App) {
     c.caret = ACCENT.into();
     c.ring = ACCENT.into();
     c.selection = hsla(0.61, 0.98, 0.7, 0.35);
+    // 滚动条（design-platform 暗色 l2 对：thumb neutral-600 / hover neutral-550）
+    c.scrollbar = gpui::transparent_black();
+    c.scrollbar_thumb = rgb_const(0x545557).into();
+    c.scrollbar_thumb_hover = rgb_const(0x65676b).into();
 
     c.title_bar = BG_BASE.into();
     c.title_bar_border = BORDER_L1;

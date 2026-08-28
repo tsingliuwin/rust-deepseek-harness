@@ -37,7 +37,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 // --- 参考 ui-layout/columns.ts 列宽契约 ---------------------------------------
 
@@ -79,6 +79,8 @@ struct ChatEntry {
 struct SessionMeta {
     id: SessionId,
     title: String,
+    /// 相对时间（「刚刚 / 6分钟 / 8天」，由 JSONL 的 mtime 计算）。
+    time_label: String,
 }
 
 /// 详情面板当前选中的工具调用。
@@ -287,11 +289,11 @@ impl AppView {
         self.stats_tools = 0;
         self.tab = CenterTab::Conversation;
         self.chat_scroll.scroll_to_bottom();
-        self.sessions.insert(0, SessionMeta { id, title: "新会话".into() });
+        self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into() });
         cx.notify();
     }
 
-    /// 消息流当前是否贴底（offset 向下滚动趋于 -max，阈值 40px）。
+/// 消息流当前是否贴底（offset 向下滚动趋于 -max，阈值 40px）。
     fn chat_near_bottom(&self) -> bool {
         self.chat_scroll.offset().y <= -self.chat_scroll.max_offset().height + px(40.0)
     }
@@ -596,12 +598,15 @@ impl AppView {
                     .unwrap_or_default();
                 let t = this.clone();
                 let bubble_text = text.clone();
+                let group: SharedString = format!("user-msg-{ei}").into();
+                let group_copy = group.clone();
                 div()
                     .w_full()
                     .flex()
                     .flex_col()
                     .items_end()
                     .gap(px(6.0))
+                    .group(group)
                     .child(
                         div()
                             .max_w(px(USER_BUBBLE_MAX))
@@ -616,7 +621,7 @@ impl AppView {
                             .child(bubble_text),
                     )
                     .child(
-                        // 气泡下方的复制按钮（web MessageIconActions）
+                        // 气泡下方的复制按钮（web MessageIconActions：悬停显现）
                         div()
                             .id(("copy-user", ei as u64))
                             .size(px(20.0))
@@ -626,6 +631,8 @@ impl AppView {
                             .rounded(px(4.0))
                             .cursor_pointer()
                             .text_color(theme::CAPTION)
+                            .opacity(0.0)
+                            .group_hover(group_copy, |s| s.opacity(1.0))
                             .hover(|s| s.text_color(theme::TEXT_2).bg(theme::HOVER))
                             .tooltip(tip("复制"))
                             .on_click(move |_, _, cx| {
@@ -638,11 +645,13 @@ impl AppView {
                     )
             }
             Role::Assistant => {
+                let group: SharedString = format!("assistant-msg-{ei}").into();
                 let mut col = div()
                     .w_full()
                     .flex()
                     .flex_col()
-                    .gap(px(16.0));
+                    .gap(px(16.0))
+                    .group(group);
                 for (bi, block) in entry.blocks.iter().enumerate() {
                     col = col.child(self.block_element(block, ei, bi, this));
                 }
@@ -1004,15 +1013,17 @@ impl AppView {
             let session_rows: Vec<Stateful<Div>> = self
                 .sessions
                 .iter()
-                .map(|s| {
+                .enumerate()
+                .map(|(i, s)| {
                     let t = this.clone();
                     let id = s.id.clone();
                     let active = s.id == current_id;
-                    session_row(s.title.clone(), active, move |_, _, cx| {
+                    session_row(i, s.title.clone(), s.time_label.clone(), active, move |_, _, cx| {
                         let id = id.clone();
                         t.update(cx, |v, cx| { v.switch_session(id, cx); });
                     })
-                })                .collect();
+                })
+                .collect();
             col = col
                 .v_flex()
                 .px_3()
@@ -1084,7 +1095,7 @@ impl AppView {
                         .child("新建会话"),
                 )
                 .child(
-                    // 区块头：工作区（36px）
+                    // 区块头：会话 + 搜索 / 视图 / 新建工作区（web .sectionHeader）
                     div()
                         .h(px(36.0))
                         .flex_none()
@@ -1094,14 +1105,19 @@ impl AppView {
                         .mb_1()
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .text_size(px(theme::FONT_ROW))
                                 .line_height(px(20.0))
                                 .text_color(theme::TEXT_3)
-                                .child("工作区"),
-                        ),
+                                .child("会话"),
+                        )
+                        .child(icon_btn("sb-search", IconName::Search, theme::TEXT_2, "搜索会话", |_, _, _| {}))
+                        .child(icon_btn("sb-view", IconName::Ellipsis, theme::TEXT_2, "视图选项", |_, _, _| {}))
+                        .child(icon_btn("sb-add-workspace", IconName::Plus, theme::TEXT_2, "添加工作区", |_, _, _| {})),
                 )
                 .child(
-                    // 工作区行（folder + 名称）
+                    // 工作区行（folder + 名称 + 展开指示）
                     div()
                         .h(px(34.0))
                         .flex_none()
@@ -1117,21 +1133,43 @@ impl AppView {
                         )
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
                                 .text_size(px(theme::FONT_ROW))
                                 .line_height(px(20.0))
                                 .text_color(theme::TEXT)
                                 .child("DSH"),
-                        ),
+                        )
+                        .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::CAPTION)),
                 )
                 .child(
+                    // 会话列表 + 底部渐隐（web .fade）
                     div()
-                        .id("sidebar-list")
+                        .relative()
                         .flex_grow()
                         .min_h_0()
-                        .overflow_y_scroll()
-                        .v_flex()
-                        .gap_0p5()
-                        .children(session_rows),
+                        .child(
+                            div()
+                                .id("sidebar-list")
+                                .h_full()
+                                .overflow_y_scroll()
+                                .v_flex()
+                                .gap_0p5()
+                                .children(session_rows),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(24.0))
+                                .bg(linear_gradient(
+                                    180.0,
+                                    linear_color_stop(gpui::transparent_black(), 0.0),
+                                    linear_color_stop(theme::SIDEBAR_BG, 1.0),
+                                )),
+                        ),
                 )
                 .child(
                     // 底部设置
@@ -1342,31 +1380,34 @@ impl AppView {
         if self.running {
             col = col.child(self.render_status_line());
         }
+        if self.stats_turns > 0 && !self.running {
+            // web StatsLine：流内居中，12/20 tertiary，nowrap ellipsis
+            col = col.child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .text_size(px(theme::FONT_CAPTION))
+                    .line_height(px(20.0))
+                    .text_color(theme::TEXT_3)
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(format!(
+                        "{} 轮 · {} 次工具调用",
+                        self.stats_turns, self.stats_tools
+                    )),
+            );
+        }
         div().w_full().child(col)
     }
 
-    /// 底部 composer 区：统计行 + 输入卡。
+    /// 底部 composer 区：输入卡（统计行已移入消息流 StatsLine 位）。
     fn render_composer_area(&self, this: Entity<AppView>, has_text: bool) -> Div {
         div()
             .flex_none()
             .v_flex()
             .bg(theme::BG_BASE)
             .pb_2()
-            .child(if self.stats_turns > 0 {
-                div()
-                    .mb(px(6.0))
-                    .text_center()
-                    .text_size(px(theme::FONT_CAPTION))
-                    .line_height(px(theme::FONT_CAPTION_LEADING))
-                    .text_color(theme::CAPTION)
-                    .child(format!(
-                        "{} 轮 · {} 次工具调用",
-                        self.stats_turns, self.stats_tools
-                    ))
-                    .into_any_element()
-            } else {
-                div().into_any_element()
-            })
             .child(self.composer_card(this, has_text))
     }
 
@@ -1416,7 +1457,7 @@ impl AppView {
                         ),
                     )
                     .child(
-                        // 工作区行：folder + 目录名 + chevron
+                        // 工作区行：folder + 目录名 + chevron + 标准模式 chip（web hero 同排）
                         div()
                             .flex()
                             .items_center()
@@ -1431,7 +1472,28 @@ impl AppView {
                                     .text_color(theme::TEXT)
                                     .child(workspace_name()),
                             )
-                            .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::CAPTION)),
+                            .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::CAPTION))
+                            .child(
+                                div()
+                                    .id("hero-mode")
+                                    .mx_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .h(px(24.0))
+                                    .rounded(px(12.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::HOVER))
+                                    .child(Icon::new(IconName::Bot).size(px(12.0)).text_color(theme::TEXT_2))
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_TAB))
+                                            .line_height(px(theme::FONT_ROW_LEADING))
+                                            .text_color(theme::TEXT_2)
+                                            .child("标准模式"),
+                                    ),
+                            ),
                     )
                     .child(self.composer_card(this, has_text)),
             )
@@ -1644,7 +1706,7 @@ impl AppView {
 
 
 
-/// 助手消息完成后的 footer：复制按钮 + 用时。
+/// 助手消息完成后的 footer：复制按钮（悬停显现）+ 用时。
 fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> Div {
     let t = this.clone();
     let secs = elapsed.as_secs();
@@ -1653,6 +1715,8 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
     } else {
         format!("用时 {}秒", secs)
     };
+    let group: SharedString = format!("assistant-msg-{ei}").into();
+    let group_copy = group.clone();
     div()
         .w_full()
         .flex()
@@ -1668,6 +1732,8 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
                 .rounded(px(4.0))
                 .cursor_pointer()
                 .text_color(theme::CAPTION)
+                .opacity(0.0)
+                .group_hover(group_copy, |s| s.opacity(1.0))
                 .hover(|s| s.text_color(theme::TEXT_2).bg(theme::HOVER))
                 .tooltip(tip("复制"))
                 .on_click(move |_, _, cx| {
@@ -1759,7 +1825,8 @@ fn main() {
                     .and_then(|s| s.first_user_text())
                     .map(|t| t.chars().take(30).collect())
                     .unwrap_or_else(|| "新会话".into());
-                SessionMeta { id: sid.clone(), title }
+                let time_label = session_time_label(&recorder, sid);
+                SessionMeta { id: sid.clone(), title, time_label }
             })
             .collect();
         let session = recorder.load(id).unwrap_or_else(|_| Session::new(id.clone()));
@@ -1767,7 +1834,7 @@ fn main() {
         (session, meta, is_fresh)
     } else {
         let id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        (Session::new(id.clone()), vec![SessionMeta { id, title: "新会话".into() }], true)
+        (Session::new(id.clone()), vec![SessionMeta { id, title: "新会话".into(), time_label: String::new() }], true)
     };
 
     let agent = ReactLoopAgent::new(
@@ -1808,9 +1875,10 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                window.set_window_title("DeepSeek Harness");
                 let input = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx)
-                        .placeholder("给智能体发消息 (Enter 发送 · Shift+Enter 换行)")
+                        .placeholder("给智能体发消息")
                         .multi_line(true)
                         .auto_grow(1, 14)
                 });
@@ -1873,6 +1941,31 @@ fn main() {
         )
         .expect("failed to open window");
     });
+}
+
+/// 会话 JSONL 的修改时间 → web 侧栏的相对时间文案。
+fn session_time_label(recorder: &SessionRecorder, id: &SessionId) -> String {
+    let path = recorder.path_for(id);
+    let Ok(md) = std::fs::metadata(&path) else {
+        return String::new();
+    };
+    let Ok(modified) = md.modified() else {
+        return String::new();
+    };
+    let Ok(d) = modified.duration_since(SystemTime::UNIX_EPOCH) else {
+        return String::new();
+    };
+    let Some(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok() else {
+        return String::new();
+    };
+    let secs = now.as_secs().saturating_sub(d.as_secs());
+    match secs {
+        s if s < 60 => "刚刚".into(),
+        s if s < 3600 => format!("{}分钟", s / 60),
+        s if s < 86400 => format!("{}小时", s / 3600),
+        s if s < 86400 * 30 => format!("{}天", s / 86400),
+        _ => format!("{}个月", secs / 86400 / 30),
+    }
 }
 
 fn message_text(m: &Message) -> String {

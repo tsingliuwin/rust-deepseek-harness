@@ -57,9 +57,10 @@ cargo run -p dsh-agent-loop --example tools_demo
 5. **退避重试** — `ResolvedRetryPolicy` 判定/指数退避、`LlmRuntime.provider_retry_policy`、`attach_retry`（attempt 计数 + turn 清理）；
 6. **fiber/inject 注入 + 可补丁 config** — `Scope`/`Fiber`/`Plugin`/`PluginManager`，`inject` 依赖排序挂载，`Patch` 按 id 替换/插入/删除，dispose 逆序回收；
 7. **fs/shell/web 工具包 + 会话持久化** — `dsh-fs`/`dsh-shell`/`dsh-web` 注册进 `ToolRegistry`；`dsh-persist` JSONL 落盘，启动恢复最近会话，会话列表可切换/新建。
-8. **ToolRow 收尾 + hero 光晕** — 工具行折叠模型对齐 web `toolRowModel`（标题按工具/op 定名、摘要取 command/path/url、失败行摘要替换为输出首行）；fs read|write 的 path 下划线链接（剥工作区根 + `~` 缩写，点击宿主应用打开）；Inspect pill（hover 显现，点击跳轨迹 tab 并 scroll_to_item 定位）；Think/工具行运行扫光恢复；hero 空态蓝色光晕（figma 313:14109 椭圆高斯模糊预渲染资产，宽随卡缩放、中心锚卡面）；代码块 banner、亮色主题（设置外观分段 + 跟随系统）此前已落地。
+8. **ToolRow 收尾 + hero 光晕** — 工具行折叠模型对齐 web `toolRowModel`（标题按工具/op 定名、摘要取 command/path/url、失败行摘要替换为输出首行）；fs read|write 的 path 下划线链接（剥工作区根 + `~` 缩写，点击宿主应用打开）；Inspect pill（hover 显现，点击跳轨迹 tab 并 scroll_to_item 定位）；Think/工具行运行扫光恢复；hero 空态蓝色光晕（figma 313:14109 椭圆高斯模糊预渲染资产，宽随卡缩放、中心锚卡面）；代码块 banner、亮色主题（设置外观分段 + 跟随系统）此前已落地；
+9. **工具专属展开卡** — shell → 终端卡（web TerminalBlock：cwd prompt banner + 30px gutter 状态点 + 输出 224px 内滚动，running 只画 banner）；fs read → 读取卡（web ReadBlock：banner 底 + 48px 行号 gutter）；fs write → 差异卡（web DiffBlock：全 + 行、footer `└ +N -0 · 1 个文件`）；web_fetch → 获取卡（URL 链接 open_url + 截断注记）；read/diff 8 行折叠（`… 其余 N 行`/收起）；错误行回退通用 IO 卡。
 
-**下一步**（其余能力）：compaction / subagent；fs 策略与沙箱 provider、web 搜索 provider、shell 超时与 PTY 等能力细化；工具专属展开卡（web TerminalBlock/DiffBlock/ReadBlock/SearchBlock/WebBlock 替代通用 IO 卡）。
+**下一步**（其余能力）：compaction / subagent；fs 策略与沙箱 provider、web 搜索 provider、shell 超时与 PTY 等能力细化；搜索卡（web SearchBlock，需 grep/glob 类工具）；通用卡片降级路径的 pretty args JSON（web deriveBody）。
 
 ## 备注
 

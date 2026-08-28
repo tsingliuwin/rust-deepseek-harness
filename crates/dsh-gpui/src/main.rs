@@ -809,6 +809,8 @@ struct AppView {
     llm: Arc<LlmRuntime>,
     /// 子 agent 工具句柄（路由切换时同步）
     subagent: Arc<dsh_subagent::SubagentTool>,
+    /// fs 沙箱句柄（工作区切换时同步写根）
+    fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
     sessions: Vec<SessionMeta>,
     /// 工作区列表（与 web 共享 storages/workspace.json）
     workspaces: Vec<WorkspaceInfo>,
@@ -903,6 +905,7 @@ impl AppView {
         agent: Arc<ReactLoopAgent>,
         deps: AppDeps,
         subagent: Arc<dsh_subagent::SubagentTool>,
+        fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
         sessions: Vec<SessionMeta>,
         input: Entity<InputState>,
         #[allow(dead_code)] // 被 DeepSeek 卡引用
@@ -951,6 +954,7 @@ impl AppView {
             recorder: deps.recorder,
             llm: deps.llm,
             subagent,
+            fs_sandbox,
             sessions,
             entries: Vec::new(),
             input,
@@ -1082,6 +1086,7 @@ impl AppView {
             session_ids: Vec::new(),
         });
         self.current_workspace = Some(id);
+        self.sync_fs_sandbox();
         save_workspaces(&self.workspaces);
         cx.notify();
     }
@@ -1100,6 +1105,7 @@ impl AppView {
         self.workspaces.retain(|w| w.id != id);
         if self.current_workspace.as_deref() == Some(id) {
             self.current_workspace = None;
+            self.sync_fs_sandbox();
         }
         save_workspaces(&self.workspaces);
     }
@@ -1618,6 +1624,18 @@ impl AppView {
             self.llm_configured = true;
         }
         self.persist_settings();
+    }
+
+    /// fs 沙箱根同步：写限定在当前工作区（无工作区时进程 cwd）。
+    fn sync_fs_sandbox(&self) {
+        let root = self
+            .current_workspace
+            .as_ref()
+            .and_then(|id| self.workspaces.iter().find(|w| &w.id == id))
+            .map(|w| w.path.clone())
+            .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        self.fs_sandbox.set_roots(vec![std::path::PathBuf::from(root)]);
     }
 
     /// 宿主路由切换：主 agent 与子 agent 工具同步。
@@ -2664,6 +2682,7 @@ impl AppView {
                                                 let id = w.clone();
                                                 t_plus.update(cx, |v, cx| {
                                                     v.current_workspace = Some(id.clone());
+                                                    v.sync_fs_sandbox();
                                                     if v.collapsed_workspaces.remove(&id) {}
                                                     v.new_session(cx);
                                                 });
@@ -3516,6 +3535,7 @@ impl AppView {
                                                 let id = id.clone();
                                                 t.update(cx, |v, cx| {
                                                     v.current_workspace = Some(id);
+                                                    v.sync_fs_sandbox();
                                                     v.hero_ws_menu = false;
                                                     cx.notify();
                                                 });
@@ -3991,7 +4011,9 @@ fn main() {
     };
 
     let tools = Arc::new(ToolRegistry::new());
-    let _fs = tools.register(Arc::new(FsTool)).unwrap();
+    // fs 沙箱：写限定在当前工作区根之下（随工作区切换经 AppView 同步）
+    let fs_sandbox = Arc::new(dsh_fs::WorkspaceContainment::new(Vec::new()));
+    let _fs = tools.register(Arc::new(FsTool::new(fs_sandbox.clone()))).unwrap();
     let _shell = tools.register(Arc::new(ShellTool)).unwrap();
     let _web = tools.register(Arc::new(WebTool::new())).unwrap();
     let _grep = tools.register(Arc::new(dsh_search::GrepTool)).unwrap();
@@ -4239,6 +4261,7 @@ fn main() {
                         Arc::clone(&agent),
                         deps,
                         subagent_tool.clone(),
+                        fs_sandbox.clone(),
                         sessions_meta.clone(),
                         input.clone(),
                         api_input,

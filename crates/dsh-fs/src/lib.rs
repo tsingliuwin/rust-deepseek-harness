@@ -1,15 +1,138 @@
 //! dsh-fs — a local-filesystem tool.
 //!
 //! One `fs` tool exposing `read` / `write` / `list` / `exists` operations over
-//! `std::fs`. This is the milestone shape of the reference's filesystem
-//! capability (its policy seam and sandbox provider arrive later).
+//! `std::fs`, behind an injected [`FsPolicy`]（web `fs-sandbox` containment +
+//! `fs-observation-policy` 的合并缝）：
+//!
+//! - [`AllowAllPolicy`]：直通（默认，无沙箱）。
+//! - [`WorkspaceContainment`]：写限定在给定工作区根之下（含 `~` 展开与
+//!   规范化——目标不存在时回退到最近存在祖先再判包含，web containment
+//!   的同一保守语义）；读/列/存在检查不受限。
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use dsh_tools::{Tool, ToolDefinition, ToolExecutionInput, ToolExecutionResult};
 use serde_json::json;
-use std::path::Path;
 
-pub struct FsTool;
+/// 文件系统策略 provider：读可见性 + 写包含。
+pub trait FsPolicy: Send + Sync {
+    /// `read` / `list` / `exists` 是否允许。
+    fn allow_read(&self, path: &Path) -> bool {
+        let _ = path;
+        true
+    }
+    /// `write` 是否允许。
+    fn allow_write(&self, path: &Path) -> bool {
+        let _ = path;
+        true
+    }
+    /// 拒绝时的错误前缀（策略语义说明）。
+    fn deny_reason(&self) -> &'static str {
+        "path denied by fs policy"
+    }
+}
+
+/// 直通策略（默认）：全部允许，无沙箱。
+pub struct AllowAllPolicy;
+
+impl FsPolicy for AllowAllPolicy {}
+
+/// 工作区包含策略：写限定在根集合之下。
+pub struct WorkspaceContainment {
+    roots: RwLock<Vec<PathBuf>>,
+}
+
+impl WorkspaceContainment {
+    pub fn new(roots: Vec<PathBuf>) -> Self {
+        Self { roots: RwLock::new(roots) }
+    }
+
+    /// 宿主切换工作区时更新根集合。
+    pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        *self.roots.write().unwrap() = roots;
+    }
+
+    /// 目标是否落在任一根之下（词法规范化；`~` 展开）。
+    fn under_any(&self, path: &Path) -> bool {
+        let roots = self.roots.read().unwrap();
+        if roots.is_empty() {
+            return false;
+        }
+        let expanded = expand_home(path);
+        let canonical = canonicalize_best_effort(&expanded);
+        roots.iter().any(|root| {
+            let root_expanded = expand_home(root);
+            let root_canonical = canonicalize_best_effort(&root_expanded);
+            canonical == root_canonical || canonical.starts_with(&root_canonical)
+        })
+    }
+}
+
+impl FsPolicy for WorkspaceContainment {
+    fn allow_write(&self, path: &Path) -> bool {
+        self.under_any(path)
+    }
+
+    fn deny_reason(&self) -> &'static str {
+        "write denied: path is outside the workspace sandbox"
+    }
+}
+
+/// 展开 `~` / `~/` 前缀。
+fn expand_home(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(format!("{home}/{rest}"));
+        }
+    } else if text == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// 尽力规范化：目标不存在（写新文件）时回退到最近存在的祖先，再接回
+/// 剩余段（web containment 的 ancestor-walk 保守等价）。
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    if let Ok(c) = path.canonicalize() {
+        return c;
+    }
+    let mut ancestor = path.to_path_buf();
+    let mut suffix: Vec<PathBuf> = Vec::new();
+    while let Some(parent) = ancestor.parent() {
+        suffix.push(ancestor.file_name().map(PathBuf::from).unwrap_or_default());
+        if let Ok(c) = parent.canonicalize() {
+            let mut out = c;
+            for seg in suffix.into_iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        ancestor = parent.to_path_buf();
+    }
+    path.to_path_buf()
+}
+
+/// `fs` 工具：所有操作经注入的策略检查后落到 `std::fs`。
+pub struct FsTool {
+    policy: Arc<dyn FsPolicy>,
+}
+
+impl FsTool {
+    pub fn new(policy: Arc<dyn FsPolicy>) -> Self {
+        Self { policy }
+    }
+}
+
+impl Default for FsTool {
+    fn default() -> Self {
+        Self::new(Arc::new(AllowAllPolicy))
+    }
+}
 
 #[async_trait]
 impl Tool for FsTool {
@@ -32,19 +155,36 @@ impl Tool for FsTool {
     async fn execute(&self, input: &ToolExecutionInput) -> ToolExecutionResult {
         let op = input.arguments.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let path = input.arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let path = Path::new(path);
+        if path.as_os_str().is_empty() {
+            return ToolExecutionResult::error("path must be a non-empty string");
+        }
         match op {
-            "read" => match std::fs::read_to_string(Path::new(path)) {
+            "read" | "list" | "exists" => {
+                if !self.policy.allow_read(path) {
+                    return ToolExecutionResult::error(self.policy.deny_reason());
+                }
+            }
+            "write" => {
+                if !self.policy.allow_write(path) {
+                    return ToolExecutionResult::error(self.policy.deny_reason());
+                }
+            }
+            _ => {}
+        }
+        match op {
+            "read" => match std::fs::read_to_string(path) {
                 Ok(text) => ToolExecutionResult::text(text),
                 Err(e) => ToolExecutionResult::error(format!("read failed: {e}")),
             },
             "write" => {
                 let content = input.arguments.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                match std::fs::write(Path::new(path), content) {
+                match std::fs::write(path, content) {
                     Ok(()) => ToolExecutionResult::text(format!("wrote {} bytes", content.len())),
                     Err(e) => ToolExecutionResult::error(format!("write failed: {e}")),
                 }
             }
-            "list" => match std::fs::read_dir(Path::new(path)) {
+            "list" => match std::fs::read_dir(path) {
                 Ok(entries) => {
                     let mut out = String::new();
                     for entry in entries.flatten() {
@@ -55,8 +195,44 @@ impl Tool for FsTool {
                 }
                 Err(e) => ToolExecutionResult::error(format!("list failed: {e}")),
             },
-            "exists" => ToolExecutionResult::text(format!("{}", Path::new(path).exists())),
+            "exists" => ToolExecutionResult::text(format!("{}", path.exists())),
             other => ToolExecutionResult::error(format!("unknown op \"{other}\"")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy_with_roots(roots: &[&str]) -> WorkspaceContainment {
+        WorkspaceContainment::new(roots.iter().map(PathBuf::from).collect())
+    }
+
+    #[test]
+    fn write_inside_root_allowed_outside_denied() {
+        let dir = std::env::temp_dir().join(format!("dsh-fs-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let policy = policy_with_roots(&[dir.to_str().unwrap()]);
+        assert!(policy.allow_write(&dir.join("sub/new.txt")));
+        assert!(!policy.allow_write(Path::new("/etc/hosts")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nonexistent_target_uses_ancestor_containment() {
+        let dir = std::env::temp_dir().join(format!("dsh-fs-test2-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        let policy = policy_with_roots(&[dir.join("a").to_str().unwrap()]);
+        // 目标 b/c/d.txt 尚不存在：回退到存在的祖先 b 判包含
+        assert!(policy.allow_write(&dir.join("a/b/c/d.txt")));
+        assert!(!policy.allow_write(&dir.join("outside/x.txt")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_roots_deny_all_writes() {
+        let policy = WorkspaceContainment::new(Vec::new());
+        assert!(!policy.allow_write(Path::new("/tmp/x")));
     }
 }

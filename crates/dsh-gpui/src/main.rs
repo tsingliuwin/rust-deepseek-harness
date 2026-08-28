@@ -35,7 +35,8 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{Icon, IconName, Root, StyledExt};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::scroll::ScrollableElement;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -44,6 +45,7 @@ use std::time::{Duration, Instant, SystemTime};
 // --- 消息块模型 ---------------------------------------------------------------
 
 /// 工具调用块（web 版 ToolRow）。
+#[derive(Clone)]
 struct ToolBlock {
     id: String,
     name: String,
@@ -53,6 +55,7 @@ struct ToolBlock {
     open: bool,
 }
 
+#[derive(Clone)]
 enum MsgBlock {
     Text(String),
     Reasoning { text: String, open: bool },
@@ -66,6 +69,7 @@ enum Role {
     Error,
 }
 
+#[derive(Clone)]
 struct ChatEntry {
     role: Role,
     blocks: Vec<MsgBlock>,
@@ -722,7 +726,12 @@ struct AppView {
     edit_base: Entity<InputState>,
     pending_clear: bool,
     _input_subscription: Subscription,
-    chat_scroll: ScrollHandle,
+    /// 消息流虚拟列表（可变高、Bottom 对齐聊天模式）
+    chat_list: ListState,
+    /// 列表条目总数（消息 + 状态行 + 统计行）
+    chat_items: usize,
+    /// 列表当前是否贴底（scroll handler 维护）
+    list_bottom: Rc<Cell<bool>>,
     // 布局状态
     last_drag_tick: Instant,
     sidebar_collapsed: bool,
@@ -813,7 +822,9 @@ impl AppView {
             edit_base,
             pending_clear: false,
             _input_subscription: subscription,
-            chat_scroll: ScrollHandle::new(),
+            chat_list: ListState::new(0, ListAlignment::Bottom, px(100.0)),
+            chat_items: 0,
+            list_bottom: Rc::new(Cell::new(true)),
             last_drag_tick: Instant::now(),
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT,
@@ -828,6 +839,20 @@ impl AppView {
             selected_tool: None,
         };
         view.rebuild_from_session();
+        // 贴底状态跟踪：滚动事件更新可见范围是否含末尾
+        {
+            let list = view.chat_list.clone();
+            let bottom = Rc::clone(&view.list_bottom);
+            let _ = &list;
+            list.set_scroll_handler(move |ev, _window, _cx| {
+                let _ = &bottom;
+                // visible_range.end 是后半开区间：末项可见 ⟺ end > last
+                // 这里只记录"是否滚到底部附近"，由 Viewer 用 chat_items 修正
+                let end = ev.visible_range.end;
+                let count = ev.count;
+                bottom.set(end >= count);
+            });
+        }
         view
     }
 
@@ -906,6 +931,7 @@ impl AppView {
                 _ => {}
             }
         }
+        self.sync_chat_list(true);
     }
 
     /// Switch the agent to a persisted session and rebuild the transcript.
@@ -916,7 +942,6 @@ impl AppView {
             self.stats_turns = 0;
             self.stats_tools = 0;
             self.tab = CenterTab::Conversation;
-            self.chat_scroll.scroll_to_bottom();
             cx.notify();
         }
     }
@@ -932,14 +957,29 @@ impl AppView {
         self.stats_turns = 0;
         self.stats_tools = 0;
         self.tab = CenterTab::Conversation;
-        self.chat_scroll.scroll_to_bottom();
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into() });
         cx.notify();
     }
+    /// 虚拟列表条目总数：消息 + 流式状态行 + 统计行。
+    fn chat_item_count(&self) -> usize {
+        self.entries.len()
+            + usize::from(self.running)
+            + usize::from(self.stats_turns > 0 && !self.running)
+    }
 
-/// 消息流当前是否贴底（offset 向下滚动趋于 -max，阈值 40px）。
+    /// 同步列表长度并按需滚底（流式期间沿用贴底语义）。
+    fn sync_chat_list(&mut self, force_bottom: bool) {
+        let n = self.chat_item_count();
+        self.chat_items = n;
+        self.chat_list.reset(n);
+        if n > 0 && (force_bottom || self.list_bottom.get()) {
+            self.chat_list.scroll_to_reveal_item(n - 1);
+        }
+    }
+
+    /// 消息流当前是否贴底（scroll handler 维护的可见范围判断）。
     fn chat_near_bottom(&self) -> bool {
-        self.chat_scroll.offset().y <= -self.chat_scroll.max_offset().height + px(40.0)
+        self.list_bottom.get()
     }
 
     fn current_session_id(&self) -> SessionId {
@@ -965,7 +1005,7 @@ impl AppView {
             done: true,
             elapsed: None,
         });
-        self.chat_scroll.scroll_to_bottom();
+        self.sync_chat_list(true);
     }
 
     fn last_assistant(&mut self) -> &mut ChatEntry {
@@ -1046,9 +1086,7 @@ impl AppView {
         }
         // 智能吸底：只有用户本来就贴在底部时才跟随滚动（web 同款行为）；
         // 用户上翻阅读时不再被流式输出拽走。
-        if self.chat_near_bottom() {
-            self.chat_scroll.scroll_to_bottom();
-        }
+        self.sync_chat_list(self.chat_near_bottom());
     }
 
     /// 从会话日志回读指定工具调用的最新结果文本。
@@ -2074,9 +2112,52 @@ impl AppView {
             };
             let show_jump = !self.chat_near_bottom();
             let t_jump = this.clone();
+            // 虚拟列表（gpui list，可变高）：内容在 ChatEntry 之外补两行
+            // （流式状态 / 统计），render_item 按序号派发。
+            let list_this = this.clone();
+            let chat_list_state = self.chat_list.clone();
+            let chat_list_el = gpui::list(chat_list_state, move |ix, _window, cx| {
+                let entry = list_this.read_with(cx, |v, _| v.entries.get(ix).cloned());
+                match entry {
+                    Some(e) => {
+                        let this = list_this.clone();
+                        list_this
+                            .read_with(cx, |v, _| v.render_entry(&e, ix, &this))
+                            .into_any_element()
+                    }
+                    None => {
+                        let ix = ix;
+                        list_this
+                            .read_with(cx, |v, _| {
+                                if ix == v.entries.len() && v.running {
+                                    v.render_status_line().into_any_element()
+                                } else {
+                                    // 统计行（web StatsLine）
+                                    div()
+                                        .w_full()
+                                        .text_center()
+                                        .text_size(px(theme::FONT_CAPTION))
+                                        .line_height(px(20.0))
+                                        .text_color(theme::t().text_3)
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(format!(
+                                            "{} 轮 · {} 次工具调用",
+                                            v.stats_turns, v.stats_tools
+                                        ))
+                                        .into_any_element()
+                                }
+                            })
+                            .into_any_element()
+                    }
+                }
+            })
+            .with_sizing_behavior(ListSizingBehavior::Auto);
+            let chat_list_el = chat_list_el;
             center = center
                 .child(
-                    // 相对定位包裹层承载「回到底部」浮钮（web ChatView .toBottom）
+                    // chat tab 用虚拟列表；轨迹保持普通流
                     div()
                         .flex_1()
                         .min_h_0()
@@ -2085,11 +2166,19 @@ impl AppView {
                             div()
                                 .id("chat-scroll")
                                 .h_full()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.chat_scroll)
                                 .px_8()
-                                .vertical_scrollbar(&self.chat_scroll)
-                                .child(body),
+                                .map(|d| {
+                                    if self.tab == CenterTab::Conversation {
+                                        d.child(chat_list_el)
+                                    } else {
+                                        let mut c = div()
+                                            .id("traj-scroll")
+                                            .h_full()
+                                            .overflow_y_scroll();
+                                        c = c.child(body);
+                                        c
+                                    }
+                                }),
                         )
                         .when(show_jump, |d| {
                             d.child(
@@ -2113,7 +2202,8 @@ impl AppView {
                                     .tooltip(tip("回到底部"))
                                     .on_click(move |_, _, cx| {
                                         t_jump.update(cx, |v, _cx| {
-                                            v.chat_scroll.scroll_to_bottom();
+                                            v.list_bottom.set(true);
+                                            v.sync_chat_list(true);
                                         });
                                     })
                                     .child(Icon::new(IconName::ChevronDown).size(px(16.0))),

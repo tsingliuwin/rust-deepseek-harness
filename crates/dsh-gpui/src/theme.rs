@@ -66,6 +66,7 @@ pub const GREEN: Rgba = rgb_const(0x22c55e);
 /// markdown 代码块底（`--dsw-alias-markdown-code-block` = bluish-900）。
 pub const CODE_BG: Rgba = rgb_const(0x1b1b1c);
 /// 代码块横幅底（`--dsw-alias-markdown-code-block-banner` = bluish-850）。
+#[allow(dead_code)] // 设计 token 预留，后续细节优化会用到
 pub const CODE_BANNER: Rgba = rgb_const(0x2c2c2e);
 
 // --- 边框 / 交互（暗色 = 白色低透明） -----------------------------------------
@@ -75,16 +76,20 @@ pub const BORDER_L1: Hsla = hsla_const(0.0, 0.0, 1.0, 0.06);
 /// `--dsw-alias-border-l2`：白 12%。
 pub const BORDER_L2: Hsla = hsla_const(0.0, 0.0, 1.0, 0.12);
 /// `--dsw-alias-border-l3`：白 16%。
+#[allow(dead_code)] // 设计 token 预留，后续细节优化会用到
 pub const BORDER_L3: Hsla = hsla_const(0.0, 0.0, 1.0, 0.16);
 /// `--dsw-alias-interactive-bg-hover`：白 8%（列表行 hover / 选中底）。
 pub const HOVER: Hsla = hsla_const(0.0, 0.0, 1.0, 0.08);
 /// `--dsw-alias-interactive-bg-active`：白 14%。
+#[allow(dead_code)] // 设计 token 预留，后续细节优化会用到
 pub const ACTIVE: Hsla = hsla_const(0.0, 0.0, 1.0, 0.14);
 
 // --- 字号标尺（`--dsw-font-*`） -----------------------------------------------
 // 仅列出本应用用到的；命名直接沿用 web 版。
 
+#[allow(dead_code)] // 设计 token 预留，后续细节优化会用到
 pub const FONT_MARKDOWN_BASE: f32 = 16.0; // 16/28 正文
+#[allow(dead_code)] // 设计 token 预留，后续细节优化会用到
 pub const FONT_MARKDOWN_BASE_LEADING: f32 = 28.0;
 /// 用户气泡 16/24。
 pub const FONT_BUBBLE: f32 = 16.0;

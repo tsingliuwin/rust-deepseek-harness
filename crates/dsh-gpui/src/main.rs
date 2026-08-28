@@ -7,7 +7,12 @@
 //! 消息流（用户气泡 / Think 折叠行 / 工具行 / markdown）+ 底部胶囊输入卡。
 
 mod assets;
+pub(crate) mod layout;
 mod theme;
+pub(crate) mod widgets;
+
+use crate::layout::*;
+use crate::widgets::*;
 
 use async_stream::stream;
 use async_trait::async_trait;
@@ -27,11 +32,7 @@ use dsh_tools::ToolRegistry;
 use dsh_web::WebTool;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::{
-    text::{TextView, TextViewStyle},
-    tooltip::Tooltip,
-    Icon, IconName, Root, StyledExt,
-};
+use gpui_component::{Icon, IconName, Root, StyledExt};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement;
 use std::path::PathBuf;
@@ -39,41 +40,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // --- 参考 ui-layout/columns.ts 列宽契约 ---------------------------------------
-
-const SIDEBAR_MIN: f32 = 264.0;
-const SIDEBAR_MAX: f32 = 420.0;
-const SIDEBAR_DEFAULT: f32 = 280.0;
-const SIDEBAR_COLLAPSED: f32 = 56.0;
-const SIDEBAR_AUTO_COLLAPSE: f32 = 1024.0;
-const CENTER_MIN: f32 = 640.0;
-const DETAILS_MIN: f32 = 300.0;
-const DETAILS_MAX: f32 = 520.0;
-const DETAILS_DEFAULT: f32 = 360.0;
-
-/// 会话内容列宽（ConversationRoot --dsh-chat-content-width）。
-const CHAT_CONTENT_WIDTH: f32 = 748.0;
-/// 输入卡上限 = 内容列 + 两侧 clearance 16px。
-const COMPOSER_CARD_WIDTH: f32 = CHAT_CONTENT_WIDTH + 32.0;
-/// 用户气泡宽度上限（MessageItem .userStack）。
-const USER_BUBBLE_MAX: f32 = 525.0;
-
-/// columns.ts 的「让步链」。
-fn compute_columns(viewport: f32, sidebar_pref: f32, details_pref: f32) -> (f32, f32, f32) {
-    let s = if sidebar_pref <= 0.0 {
-        SIDEBAR_COLLAPSED
-    } else {
-        sidebar_pref.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
-    };
-    let d0 = if details_pref <= 0.0 { 0.0 } else { details_pref.clamp(DETAILS_MIN, DETAILS_MAX) };
-    if s + d0 + CENTER_MIN <= viewport {
-        return (s, viewport - s - d0, d0);
-    }
-    let d1 = if d0 == 0.0 { 0.0 } else { (viewport - s - CENTER_MIN).max(DETAILS_MIN) };
-    if s + d1 + CENTER_MIN <= viewport {
-        return (s, CENTER_MIN, d1);
-    }
-    (s, (viewport - s).max(0.0), 0.0)
-}
 
 // --- 消息块模型 ---------------------------------------------------------------
 
@@ -129,85 +95,7 @@ enum CenterTab {
     Trajectory,
 }
 
-/// 用 `TextView::markdown` 渲染一段 markdown，样式对齐 web 版
-/// MarkdownText.module.css + 字号标尺。
-#[derive(IntoElement)]
-struct MarkdownBlock {
-    text: String,
-    id: usize,
-}
 
-impl RenderOnce for MarkdownBlock {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let mut style = TextViewStyle::default().paragraph_gap(rems(1.0));
-        style.heading_base_font_size = px(16.0);
-        style.heading_font_size = Some(Arc::new(|level, base| match level {
-            1 => px(24.0),
-            2 => px(22.0),
-            3 => px(20.0),
-            4 => px(16.0),
-            _ => base,
-        }));
-        style.code_block = StyleRefinement::default()
-            .bg(theme::CODE_BG)
-            .rounded(px(12.0))
-            .p(px(16.0));
-        style.is_dark = true;
-        TextView::markdown(self.id, self.text, window, cx)
-            .style(style)
-            .code_block_actions(|code, _window, _cx| {
-                // 语言 + 复制 浮标（web CodeBlock .banner 的浮层形态）
-                let lang = code.lang().unwrap_or_else(|| "text".into());
-                let text = code.code();
-                let mut hasher = std::hash::DefaultHasher::new();
-                std::hash::Hash::hash(&text, &mut hasher);
-                let copy_id: SharedString = format!("md-copy-{:x}", std::hash::Hasher::finish(&hasher)).into();
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(14.0))
-                            .font_family(theme_mono())
-                            .text_color(theme::CAPTION)
-                            .child(lang),
-                    )
-                    .child(
-                        div()
-                            .id(copy_id)
-                            .size(px(20.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_color(theme::TEXT_3)
-                            .hover(|s| s.text_color(theme::TEXT).bg(theme::HOVER))
-                            .tooltip(tip("复制代码"))
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
-                            })
-                            .child(Icon::new(IconName::Copy).size(px(12.0))),
-                    )
-                    .into_any_element()
-            })
-    }
-}
-
-#[derive(Clone, Copy)]
-enum DragSide {
-    Sidebar,
-    Details,
-}
-
-/// 列宽拖拽载荷（借鉴 Zed redistributable_columns 的 on_drag/on_drag_move
-/// 模式：拖起后由整窗 on_drag_move 跟手，指针越出把手也不丢事件）。
-#[derive(Clone, Copy)]
-struct ColumnDrag {
-    side: DragSide,
-}
 
 // --- 根视图 ------------------------------------------------------------------
 
@@ -236,8 +124,6 @@ struct AppView {
     details_open: bool,
     details_width: f32,
     viewport: f32,
-    // 消息流吸底（贴底才自动滚动，偏离则给「回到底部」）
-    chat_sticky: bool,
     // 会话运行态
     running: bool,
     turn_started_at: Option<Instant>,
@@ -288,7 +174,6 @@ impl AppView {
             details_open: true,
             details_width: DETAILS_DEFAULT,
             viewport: 1280.0,
-            chat_sticky: true,
             running: false,
             turn_started_at: None,
             stats_turns: 0,
@@ -541,12 +426,6 @@ impl AppView {
             }
         }
         (String::new(), false)
-    }
-
-    fn select_tool(&mut self, detail: ToolDetail, cx: &mut Context<Self>) {
-        self.selected_tool = Some(detail);
-        self.details_open = true;
-        cx.notify();
     }
 
     /// 发送按钮路径：读输入框 → 追加 → 清空（window 由 on_click 闭包提供）。
@@ -1757,194 +1636,13 @@ impl AppView {
     }
 }
 
-// --- 小组件 / 帮手 -----------------------------------------------------------
 
-/// 列宽把手：`on_drag` 起拖（借鉴 Zed render_column_resize_divider），
-/// 宽度由根容器上的 `on_drag_move::<ColumnDrag>` 按指针绝对位置跟手更新。
-fn drag_handle(side: DragSide) -> Stateful<Div> {
-    div()
-        .id(SharedString::from(match side {
-            DragSide::Sidebar => "drag-sidebar",
-            DragSide::Details => "drag-details",
-        }))
-        .w(px(8.0))
-        .h_full()
-        .flex_none()
-        .mx(px(-4.0))
-        .cursor_col_resize()
-        .hover(|s| s.bg(theme::BORDER_L2))
-        .on_drag(
-            ColumnDrag { side },
-            |_drag, _offset, _window, cx| cx.new(|_| gpui::Empty),
-        )
-}
 
-/// hover 提示（gpui-component Tooltip）。
-fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
-    move |_window, cx| cx.new(|_| Tooltip::new(text)).into()
-}
 
-/// 28px 圆形图标按钮（web .iconButton）。
-fn icon_btn(
-    id: &'static str,
-    icon: IconName,
-    color: impl Into<Hsla>,
-    tooltip: &'static str,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .size(px(28.0))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .text_color(color)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme::HOVER))
-        .tooltip(tip(tooltip))
-        .on_click(on_click)
-        .child(Icon::new(icon).size(px(16.0)))
-}
 
-/// 折叠栏 36×36 图标钮（web rail .iconButton）。
-fn rail_icon(
-    id: &'static str,
-    icon: IconName,
-    tooltip: &'static str,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    div()
-        .id(id)
-        .size(px(36.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(10.0))
-        .text_color(theme::TEXT)
-        .cursor_pointer()
-        .hover(|s| s.bg(theme::HOVER))
-        .tooltip(tip(tooltip))
-        .on_click(on_click)
-        .child(Icon::new(icon).size(px(18.0)))
-}
 
-/// 侧栏会话行（web .sessionRow：32px、r8、选中/hover 白 8%）。
-fn session_row(
-    title: String,
-    active: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> Stateful<Div> {
-    let id: SharedString = format!("session-{title}").into();
-    div()
-        .id(id)
-        .h(px(32.0))
-        .flex()
-        .items_center()
-        .pl(px(16.0))
-        .pr_2()
-        .gap_1()
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .map(|d| if active { d.bg(theme::HOVER) } else { d })
-        .hover(|s| s.bg(theme::HOVER))
-        .on_click(on_click)
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_ellipsis()
-                .text_size(px(theme::FONT_ROW))
-                .line_height(px(20.0))
-                .text_color(theme::TEXT)
-                .child(title),
-        )
-}
 
-/// 行内 2×2 分隔点（web .sep）。
-fn dot_sep() -> Div {
-    div().size(px(2.0)).rounded(px(1.0)).bg(theme::CAPTION).mx_2()
-}
 
-/// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
-fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {
-    let mut card = div()
-        .ml_1()
-        .mt_1()
-        .mb_1()
-        .v_flex()
-        .rounded(px(12.0))
-        .border_1()
-        .border_color(theme::BORDER_L1)
-        .bg(theme::CODE_BG);
-    card = card.child(io_section(uid * 2, "输入", input, false));
-    if let Some(out) = output {
-        card = card.child(div().h(px(1.0)).w_full().bg(theme::BORDER_L2));
-        card = card.child(io_section(uid * 2 + 1, "输出", out, error));
-    }
-    card
-}
-
-fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div {
-    div()
-        .v_flex()
-        .px_4()
-        .py_3()
-        .gap_1()
-        .child(
-            div()
-                .text_size(px(theme::FONT_CAPTION))
-                .line_height(px(theme::FONT_CAPTION_LEADING))
-                .text_color(theme::CAPTION)
-                .font_family(theme_mono())
-                .child(label.to_string()),
-        )
-        .child(
-            div()
-                .id(("io-scroll", uid))
-                .max_h(px(150.0))
-                .overflow_y_scroll()
-                .font_family(theme_mono())
-                .text_size(px(12.0))
-                .line_height(px(18.0))
-                .text_color(if error { theme::ERROR } else { theme::TEXT_2 })
-                .child(text.to_string()),
-        )
-}
-
-/// 详情面板的一个 section（label + 内容）。
-fn detail_section(label: &str, content: Div) -> Div {
-    div()
-        .mb_4()
-        .child(
-            div()
-                .mb_1p5()
-                .text_size(px(theme::FONT_CAPTION))
-                .line_height(px(theme::FONT_CAPTION_LEADING))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::TEXT_2)
-                .child(label.to_string()),
-        )
-        .child(content)
-}
-
-/// 详情面板代码卡（web .code：r12、pad 16、mono 13/22）。
-fn code_card(text: &str, error: bool) -> Div {
-    div()
-        .p_4()
-        .rounded(px(12.0))
-        .bg(theme::CODE_BG)
-        .font_family(theme_mono())
-        .text_size(px(13.0))
-        .line_height(px(22.0))
-        .text_color(if error { theme::ERROR } else { theme::TEXT })
-        
-        
-        .child(text.to_string())
-}
 
 /// 助手消息完成后的 footer：复制按钮 + 用时。
 fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> Div {
@@ -1997,33 +1695,6 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
         )
 }
 
-/// 工具显示名 + 图标。
-fn tool_display(name: &str) -> (String, IconName) {
-    match name {
-        "shell" => ("Shell".into(), IconName::SquareTerminal),
-        "fs" => ("Fs".into(), IconName::File),
-        "web_fetch" => ("Web".into(), IconName::Globe),
-        other => (other.to_string(), IconName::Bot),
-    }
-}
-
-/// 多行文本取首行（截断 120 字符）。
-fn first_line(text: &str) -> String {
-    let line = text.lines().next().unwrap_or("");
-    line.chars().take(120).collect()
-}
-
-/// 当前目录名，hero 工作区行用。
-fn workspace_name() -> String {
-    std::env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
-        .unwrap_or_else(|| "workspace".into())
-}
-
-fn theme_mono() -> SharedString {
-    "Consolas".into()
-}
 
 fn attach_tool_result(
     last: Option<&mut ChatEntry>,

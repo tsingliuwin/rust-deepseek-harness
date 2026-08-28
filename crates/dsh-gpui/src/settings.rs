@@ -182,7 +182,7 @@ fn nav_cell(
 }
 
 /// 设置行（web 通用页行：label + 说明 + 右控件，行间 l2 发丝线）。
-fn settings_row(label: &str, desc: &str, control: Div, last: bool) -> Div {
+fn settings_row(label: &str, desc: &str, control: impl IntoElement, last: bool) -> Div {
     let tk = theme::t();
     let mut row = div()
         .w_full()
@@ -324,14 +324,49 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
                 .text_color(tk.text_3)
                 .child("设置保存在本地配置文件中，立即生效。"),
         )
-        .child(settings_row("外观", "选择应用的外观主题", appearance, false))
+        // web 通用页顺序：Agent 预设 → 权限 → 语言 → 外观 → Enter 行为
+        .child(settings_row(
+            "Agent 预设",
+            "对此后新建的会话生效。运行中的会话保持它开始时的预设。",
+            select_chip("set-preset", "标准模式"),
+            false,
+        ))
+        .child(settings_row(
+            "权限",
+            "选择新会话的默认权限模式",
+            select_chip("set-permission", "Workspace Write"),
+            false,
+        ))
         .child(settings_row("语言", "界面语言", language, false))
+        .child(settings_row("外观", "选择应用的外观主题", appearance, false))
         .child(settings_row(
             "繁忙时 Enter 键行为",
             "仅在智能体运行时生效；Shift+Enter 始终换行",
             enter,
             true,
         ))
+}
+
+/// select 形态的选项 chip（web InputBar .select：h28 r8、13/20 medium
+/// secondary、右 12px chevron、透明底 hover 白 8%）。当前版本对应系统
+/// 只有单一模式，chip 为静态展示。
+fn select_chip(id: &'static str, label: &'static str) -> Stateful<Div> {
+    let tk = theme::t();
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px(px(8.0))
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded(px(8.0))
+        .text_size(px(theme::FONT_TAB))
+        .line_height(px(20.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(tk.text_2)
+        .hover(|s| s.bg(tk.hover))
+        .child(label)
+        .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(tk.caption))
 }
 
 /// 模型页（web ModelsSection）：标题/说明 + 已配置提供方 rowCard 列表 +

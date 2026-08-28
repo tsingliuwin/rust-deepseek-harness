@@ -892,8 +892,17 @@ impl AppView {
             MsgBlock::Reasoning { text, open } => {
                 let open = *open;
                 let t = this.clone();
+                let active = self.running
+                    && !self.entries.get(ei).map(|e| e.done).unwrap_or(true);
+                let sweep_ms = if active {
+                    self.turn_started_at.map(|t| t.elapsed().as_millis() as u64)
+                } else {
+                    None
+                };
                 let mut row = div()
                     .id(("think-row", (ei * 1000 + bi) as u64))
+                    .relative()
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .h(px(24.0))
@@ -945,9 +954,11 @@ impl AppView {
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
                             .text_color(theme::t().text_3)
-                            
                             .child(text.clone()),
                     );
+                }
+                if let Some(ms) = sweep_ms {
+                    row = row.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
                 }
                 div().w_full().child(row).into_any_element()
             }
@@ -956,8 +967,16 @@ impl AppView {
                 let open = tool.open;
                 let (label, icon) = tool_display(&tool.name);
                 let t = this.clone();
+                let running = tool.result.is_none();
+                let sweep_ms = if running {
+                    self.turn_started_at.map(|t| t.elapsed().as_millis() as u64)
+                } else {
+                    None
+                };
                 let mut row = div()
                     .id(("tool-row", (ei * 1000 + bi) as u64))
+                    .relative()
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .h(px(24.0))
@@ -987,7 +1006,13 @@ impl AppView {
                             .size(px(12.0))
                             .text_color(theme::t().text_2),
                     )
-                    .child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
+                    .when(tool.error && tool.result.is_some(), |r| {
+                        // web ToolRow leadingFor：终态 error 用状态点替换工具图标
+                        r.child(state_dot(theme::t().error))
+                    })
+                    .when(!(tool.error && tool.result.is_some()), |r| {
+                        r.child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
+                    })
                     .child(
                         div()
                             .text_size(px(theme::FONT_ROW))
@@ -1015,6 +1040,9 @@ impl AppView {
                         tool.result.as_deref(),
                         tool.error,
                     ));
+                }
+                if let Some(ms) = sweep_ms {
+                    row = row.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
                 }
                 div().w_full().child(row).into_any_element()
             }
@@ -1197,7 +1225,13 @@ impl AppView {
                                     cx.notify();
                                 });
                             })
-                            .child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
+                            .when(tool.error && tool.result.is_some(), |r| {
+                        // web ToolRow leadingFor：终态 error 用状态点替换工具图标
+                        r.child(state_dot(theme::t().error))
+                    })
+                    .when(!(tool.error && tool.result.is_some()), |r| {
+                        r.child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
+                    })
                             .child(
                                 div()
                                     .text_size(px(theme::FONT_ROW))
@@ -2347,7 +2381,7 @@ fn main() {
                     let mut cx = cx.clone();
                     async move {
                         loop {
-                            Timer::after(Duration::from_secs(1)).await;
+                            Timer::after(Duration::from_millis(100)).await;
                             let Ok(running) = tick_view.update(&mut cx, |v, _| v.running) else {
                                 return;
                             };

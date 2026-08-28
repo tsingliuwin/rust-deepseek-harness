@@ -197,6 +197,77 @@ pub(crate) fn session_row(
 pub(crate) fn dot_sep() -> Div {
     div().size(px(2.0)).rounded(px(1.0)).bg(theme::t().caption).mx_2()
 }
+
+/// 工具行状态点（web StateDot：外层 10% 光晕 + 60% 实心内核，
+/// 颜色由状态语义决定）。
+pub(crate) fn state_dot(color: gpui::Rgba) -> Div {
+    div()
+        .size(px(8.0))
+        .flex_none()
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .rounded_full()
+                .bg(gpui::Rgba { r: color.r, g: color.g, b: color.b, a: 0.10 }),
+        )
+        .child(
+            div()
+                .absolute()
+                .inset(px(1.5))
+                .rounded_full()
+                .bg(color),
+        )
+}
+
+/// 运行中的行扫光（web .row::after：300px 带自左滑向右，2.6s ease-out +
+/// 10% 尾停后循环；左端渐变 = bg_base 60% 透明）。行容器需
+/// relative + overflow_hidden，扫光为其最后 child。
+pub(crate) fn row_sweep(elapsed_ms: u64, width: f32) -> Div {
+    const PERIOD_MS: u64 = 2600;
+    const BAND: f32 = 300.0;
+    let t = (elapsed_ms % PERIOD_MS) as f32 / PERIOD_MS as f32;
+    // CSS keyframes：0→-300，90% 已到右端（此后保持到 100% 循环）
+    let p = (t / 0.9).min(1.0);
+    let eased = 1.0 - (1.0 - p) * (1.0 - p); // ease-out 近似
+    let left = -BAND + (width + BAND) * eased;
+    let base = theme::t().bg_base;
+    let peak = gpui::Rgba { r: base.r, g: base.g, b: base.b, a: 0.6 };
+    // gpui linear_gradient 仅两个 stop：左右两半各一条渐变合成中峰（≈css 55%）
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(left))
+        .w(px(BAND))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(BAND / 2.0))
+                .bg(gpui::linear_gradient(
+                    90.0,
+                    gpui::linear_color_stop(gpui::transparent_black(), 0.0),
+                    gpui::linear_color_stop(peak, 1.0),
+                )),
+        )
+        .child(
+            div()
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w(px(BAND / 2.0))
+                .bg(gpui::linear_gradient(
+                    90.0,
+                    gpui::linear_color_stop(peak, 0.0),
+                    gpui::linear_color_stop(gpui::transparent_black(), 1.0),
+                )),
+        )
+}
 /// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
 pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {
     let mut card = div()

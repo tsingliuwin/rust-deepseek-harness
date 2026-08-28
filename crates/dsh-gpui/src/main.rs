@@ -1146,14 +1146,15 @@ impl AppView {
 
     /// Switch the agent to a persisted session and rebuild the transcript.
     fn switch_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if let Ok(session) = self.recorder.load(&id) {
-            self.agent.set_session(session);
-            self.rebuild_from_session();
-            self.stats_turns = 0;
-            self.stats_tools = 0;
-            self.tab = CenterTab::Conversation;
-            cx.notify();
-        }
+        // web 端历史会话在我们的 JSONL 目录没有正文：加载失败时降级为
+        // 空 transcript（保留标题与归属，继续可用）。
+        let session = self.recorder.load(&id).unwrap_or_else(|_| Session::new(id.clone()));
+        self.agent.set_session(session);
+        self.rebuild_from_session();
+        self.stats_turns = 0;
+        self.stats_tools = 0;
+        self.tab = CenterTab::Conversation;
+        cx.notify();
     }
 
     /// Create a fresh session and make it current.

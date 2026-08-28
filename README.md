@@ -12,9 +12,9 @@
 |---|---|---|
 | `dsh-llm` | `packages/llm/llm` | `ContentBlock` / `Message` / `StreamChunk` / `FinishReason` / `TokenUsage` / `LlmFailure` / `LlmAdapter` / `BlockAssembler` / `LlmRuntime` + `llm/stream` waterfall |
 | `dsh-llm-deepseek` | `packages/llm/llm-deepseek` | DeepSeek HTTP adapter（reqwest + 手写 SSE；`reasoning_content` 一等 block、tool args 原始 JSON、缓存 token 回减） |
-| `dsh-fs` | `packages/fs` | `fs` 工具（read/write/list/exists） |
-| `dsh-shell` | `packages/shell` | `shell` 工具（`cmd /C` / `sh -c`，spawn_blocking） |
-| `dsh-web` | `packages/web` | `web_fetch` 工具（reqwest GET → 文本，截断） |
+| `dsh-fs` | `packages/fs` | `fs` 工具（read/write/list/exists）+ `FsPolicy` 缝（`AllowAllPolicy` / `WorkspaceContainment` 写沙箱） |
+| `dsh-shell` | `packages/shell` | `shell` 工具（`cmd /C` / `sh -c`，前台超时默认 120s + 每调用覆盖上限 600s，超时 kill） |
+| `dsh-web` | `packages/web` | `web_fetch`（GET → 文本截断）+ `web_search`（DeepSeek anthropic /messages + `web_search_20250305` 服务端工具） |
 | `dsh-search` | `packages/fs/tool-fs-search` | `grep` 工具（进程内 ripgrep：`ignore` walk + `regex` + `globset`，输出格式逐字对齐 `formatGrepOutput`） |
 | `dsh-session` | `packages/core/session` | append-only `SessionEvent` 日志 + `derive_messages()` + `request/header` epoch |
 | `dsh-tools` | `packages/core/tools` | `Tool`(JSON-schema + async execute) + `ToolRegistry` |
@@ -62,7 +62,14 @@ cargo run -p dsh-agent-loop --example tools_demo
 9. **工具专属展开卡** — shell → 终端卡（web TerminalBlock：cwd prompt banner + 30px gutter 状态点 + 输出 224px 内滚动，running 只画 banner）；fs read → 读取卡（web ReadBlock：banner 底 + 48px 行号 gutter）；fs write → 差异卡（web DiffBlock：全 + 行、footer `└ +N -0 · 1 个文件`）；web_fetch → 获取卡（URL 链接 open_url + 截断注记）；read/diff/search 8 行折叠（`… 其余 N 行`/收起）；错误行回退通用 IO 卡；IO 卡输入 pretty JSON（web deriveBody）；
 10. **grep 工具 + 搜索卡** — `dsh-search`（对齐 `tool-fs-search/grep.ts`）：进程内 ripgrep（`ignore` walk 尊重 .gitignore/跳隐藏 + `globset` include 过滤 + `regex` 匹配），250 条上限，输出逐字对齐 web `formatGrepOutput`（`Found N matches` / `Found K of N matches` / `No matches found` + 按文件分组 `Line N: text`）；UI 搜索卡（web SearchBlock matches 形态：摘要头「N 处匹配 · M 个文件」+ 复制、文件头 600 weight 可点击折叠组、行号 tertiary 前缀、8 行头 4 尾 4 + 尾片组头补还）；`tool:grep` prompt section；折叠行模型「搜索」+ pattern 摘要。
 
-**下一步**（其余能力）：compaction / subagent；fs 策略与沙箱 provider、web 搜索 provider、shell 超时与 PTY 等能力细化；glob 工具（搜索卡 paths 形态）。
+11. **glob 工具 + 搜索卡 paths 形态** — `--files --glob --sort=modified --no-ignore --hidden` 语义（含隐藏/被忽略文件、剔除 VCS 目录、只返回文件、修改时间升序、100 条上限 + 截断脚注）；搜索卡双形态（matches 分组 / paths 扁平），`tool:glob` section；
+12. **上下文压缩** — `dsh-compaction`（压缩指令/检查点帧形逐字对齐 web；chars/4 估算；工具配对安全边界）；`SessionEvent::Compaction` + 带序 derive（旧检查点被新压缩替换、检查点插在保留消息前）；agent-loop 轮次起点挂钩（默认 60k tokens/保留 6 条，0 禁用）；persist 双向映射（step/end 补落盘保 seq 对齐）；UI「上下文已压缩」分隔条；
+13. **subagent 工具** — `dsh-subagent`：全新会话驱动子 ReactLoopAgent（同路由/工具/prompt），前台等待末条助手消息作为结果；深度护栏 2 层 + 300s 超时取消；路由随宿主切换同步；
+14. **fs 策略/沙箱 provider** — `FsPolicy` 缝：`AllowAllPolicy` 直通 / `WorkspaceContainment` 写限定工作区根下（`~` 展开 + 尽力规范化，目标不存在回退最近存在祖先）；工作区创建/切换/删除四处同步写根；
+15. **web_search 工具** — DeepSeek anthropic 兼容 `/messages` + `web_search_20250305`（端点/头/请求体逐字对齐，结果块缺失即错误）；queries 1-5 合并去重、20 条上限；输出逐字对齐 `formatSearchOutput`；无 key 不注册；
+16. **shell 超时** — 前台默认 120s、每调用 `timeout_ms` 覆盖（上限 600s clamp），tokio 进程 + 三路并发读 + 超时 kill（`kill_on_drop` 兜底）；PTY 会话与参考实现一致推迟。
+
+**下一步**（可选细化）：subagent 后台运行/持久化子会话（web 的 continuation 服务）；glob 超上限的顶层轮询采样（web sampleAcrossTopLevel）；压缩的 TokenMeter 精确计价与 compaction-tool-result-pruner；PTY 会话（参考实现同样推迟）；搜索卡 paths 形态的 UI 与 glob 输出已落地，结构化元数据通道（web presentationMeta）待 dsh-tools 增设 meta 缝后切换。
 
 ## 备注
 

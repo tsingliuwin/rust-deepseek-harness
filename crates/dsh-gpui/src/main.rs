@@ -4014,7 +4014,7 @@ fn main() {
     // fs 沙箱：写限定在当前工作区根之下（随工作区切换经 AppView 同步）
     let fs_sandbox = Arc::new(dsh_fs::WorkspaceContainment::new(Vec::new()));
     let _fs = tools.register(Arc::new(FsTool::new(fs_sandbox.clone()))).unwrap();
-    let _shell = tools.register(Arc::new(ShellTool)).unwrap();
+    let _shell = tools.register(Arc::new(ShellTool::default())).unwrap();
     let _web = tools.register(Arc::new(WebTool::new())).unwrap();
     let _grep = tools.register(Arc::new(dsh_search::GrepTool)).unwrap();
     let _glob = tools.register(Arc::new(dsh_search::GlobTool)).unwrap();

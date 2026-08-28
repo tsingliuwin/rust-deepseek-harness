@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 dsh-tools = { path = "../dsh-tools" }
+dsh-llm = { path = "../dsh-llm" }
 serde_json.workspace = true
 async-trait.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "io-util"] }

@@ -703,8 +703,7 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
     let t_toggle = this.clone();
     let entry_name = entry.name;
     let dropdown_open = app.adopt_dropdown_open;
-    let mut chooser = div()
-        .relative()
+    let chooser = div()
         .w(px(240.0))
         .child(
             div()
@@ -740,54 +739,9 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
                         .text_color(tk.caption),
                 ),
         );
-    if dropdown_open {
-        let mut menu = div()
-            .id("adopt-menu")
-            .absolute()
-            .top(px(36.0))
-            .left_0()
-            .w(px(240.0))
-            .v_flex()
-            .p(px(4.0))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(tk.border_l2)
-            .bg(tk.surface)
-            .shadow_lg();
-        for ci in candidates.iter() {
-            let t = this.clone();
-            let idx = *ci;
-            let e = &PROVIDER_CATALOG[idx];
-            menu = menu.child(
-                div()
-                    .id(SharedString::from(format!("adopt-pick-{idx}")))
-                    .w_full()
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .px(px(10.0))
-                    .rounded(px(6.0))
-                    .text_size(px(theme::FONT_ROW))
-                    .line_height(px(22.0))
-                    .text_color(tk.text)
-                    .map(|d| if idx == pick { d.bg(tk.hover) } else { d })
-                    .when(idx != pick, |d| d.hover(|s| s.bg(tk.hover)))
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        let idx = idx;
-                        t.update(cx, |v, cx| {
-                            v.adopt_pick = idx;
-                            v.adopt_dropdown_open = false;
-                            cx.notify();
-                        });
-                    })
-                    .child(e.name),
-            );
-        }
-        chooser = chooser.child(menu);
-    }
 
     div()
+        .relative()
         .v_flex()
         .gap(px(14.0))
         .rounded(px(12.0))
@@ -858,6 +812,54 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
                     }
                 })),
         )
+        .when(dropdown_open, |card| {
+            // 菜单画在卡根的最后 child：GPUI 前序绘制，后画的盖住先画的，
+            // 放触发器内会被下方字段透叠。top=pad14+label18+gap6+trigger32+2；left=16 对齐触发器。
+            let mut menu = div()
+                .id("adopt-menu")
+                .absolute()
+                .top(px(72.0))
+                .left(px(16.0))
+                .w(px(240.0))
+                .v_flex()
+                .p(px(4.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(tk.border_l2)
+                .bg(tk.surface)
+                .shadow_lg();
+            for ci in &candidates {
+                let t = this.clone();
+                let idx = *ci;
+                let e = &PROVIDER_CATALOG[idx];
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!("adopt-pick-{idx}")))
+                        .w_full()
+                        .h(px(32.0))
+                        .flex()
+                        .items_center()
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(22.0))
+                        .text_color(tk.text)
+                        .map(|d| if idx == pick { d.bg(tk.hover) } else { d })
+                        .when(idx != pick, |d| d.hover(|s| s.bg(tk.hover)))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            let idx = idx;
+                            t.update(cx, |v, cx| {
+                                v.adopt_pick = idx;
+                                v.adopt_dropdown_open = false;
+                                cx.notify();
+                            });
+                        })
+                        .child(e.name),
+                );
+            }
+            card.child(menu)
+        })
 }
 
 /// 「添加自定义提供方」卡（web CustomProviderCard：六字段 + 模型目录 + 创建）。

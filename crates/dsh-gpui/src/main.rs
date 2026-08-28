@@ -2802,7 +2802,10 @@ impl AppView {
                     Some(e) => {
                         let this = list_this.clone();
                         list_this
-                            .read_with(cx, |v, _| v.render_entry(&e, ix, &this))
+                            .read_with(cx, |v, _| {
+                                // gpui list 无 gap 概念：条目间距用 pb 模拟（web 列 gap 16px）
+                                v.render_entry(&e, ix, &this).pb_4()
+                            })
                             .into_any_element()
                     }
                     None => {

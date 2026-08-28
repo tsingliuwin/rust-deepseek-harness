@@ -38,7 +38,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 // --- 参考 ui-layout/columns.ts 列宽契约 ---------------------------------------
 
@@ -83,8 +83,10 @@ struct ChatEntry {
 struct SessionMeta {
     id: SessionId,
     title: String,
-    /// 相对时间（「刚刚 / 6分钟 / 8天」，由 JSONL 的 mtime 计算）。
+    /// 相对时间（「刚刚 / 6分钟 / 8天」，由文件 mtime 计算）。
     time_label: String,
+    /// 会话的 project cwd（web 布局目录归组依据）。
+    cwd: Option<String>,
 }
 
 /// 详情面板当前选中的工具调用。
@@ -324,6 +326,32 @@ pub(crate) fn save_workspaces(workspaces: &[WorkspaceInfo]) {
     if let Ok(json) = serde_json::to_string_pretty(&doc) {
         let _ = std::fs::write(&path, json);
     }
+}
+
+/// 读 web 会话投影缓存（storages/session_projcache.json）：标题兜底。
+pub(crate) fn load_web_session_metas() -> Vec<(String, String)> {
+    let path = dsh_home().join("storages").join("session_projcache.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
+    let Some(sess) = doc
+        .get("tables")
+        .and_then(|tt| tt.get("sessions"))
+        .and_then(|s| s.as_object())
+    else {
+        return Vec::new();
+    };
+    sess.iter()
+        .filter_map(|(id, row)| {
+            let title = row
+                .get("rows")
+                .and_then(|r| r.get("title"))
+                .and_then(|tt| tt.get("val"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty())?;
+            Some((id.clone(), title))
+        })
+        .collect()
 }
 
 /// 新建会话 id 对齐 web 会话 id 形态（session-<uuid>）。
@@ -780,6 +808,8 @@ struct AppView {
     collapsed_workspaces: std::collections::HashSet<String>,
     /// 当前工作区（hero「选择工作区」；新建会话归属）
     current_workspace: Option<String>,
+    /// 当前会话的 project cwd（写入 web 布局用）
+    current_cwd: String,
     /// 侧栏弹出的行菜单（会话 … / 工作区 … 均用 Option<MenuTarget>）
     sidebar_menu: Option<(String, String, f32)>,
     /// 工作区重命名中的目标 id（弹出小对话框）
@@ -924,6 +954,7 @@ impl AppView {
             workspaces,
             collapsed_workspaces: Default::default(),
             current_workspace: None,
+            current_cwd: String::new(),
             sidebar_menu: None,
             renaming_workspace: None,
             hero_ws_menu: false,
@@ -1053,7 +1084,8 @@ impl AppView {
 
     /// 删除会话：清 JSONL + 列表 + 工作区归属。
     fn delete_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
-        let _ = self.recorder.delete(id);
+        let cwd_hint = self.sessions.iter().find(|s| &s.id == id).and_then(|s| s.cwd.clone());
+        let _ = self.recorder.delete(id, cwd_hint.as_deref());
         self.sessions.retain(|s| &s.id != id);
         for w in self.workspaces.iter_mut() {
             w.session_ids.retain(|s| s != id.as_str());
@@ -1146,9 +1178,18 @@ impl AppView {
 
     /// Switch the agent to a persisted session and rebuild the transcript.
     fn switch_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        // web 端历史会话在我们的 JSONL 目录没有正文：加载失败时降级为
-        // 空 transcript（保留标题与归属，继续可用）。
-        let session = self.recorder.load(&id).unwrap_or_else(|_| Session::new(id.clone()));
+        let cwd_hint = self
+            .sessions
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.cwd.clone());
+        let (session, cwd) = self
+            .recorder
+            .load(&id, cwd_hint.as_deref())
+            .unwrap_or_else(|_| (Session::new(id.clone()), cwd_hint));
+        if let Some(c) = cwd {
+            self.current_cwd = c;
+        }
         self.agent.set_session(session);
         self.rebuild_from_session();
         self.stats_turns = 0;
@@ -1161,6 +1202,17 @@ impl AppView {
     fn new_session(&mut self, cx: &mut Context<Self>) {
         let id = self.alloc_session_id();
         let ws = self.current_workspace.clone();
+        // 会话挂在当前工作区的目录（web 布局），无工作区时挂进程 cwd
+        let cwd = ws
+            .as_ref()
+            .and_then(|wid| self.workspaces.iter().find(|w| &w.id == wid).map(|w| w.path.clone()))
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
+        let _ = self.recorder.create(&id, &cwd, "standard");
+        self.current_cwd = cwd.clone();
         self.agent.set_session(Session::new(id.clone()));
         self.entries.clear();
         self.running = false;
@@ -1170,7 +1222,7 @@ impl AppView {
         self.stats_tools = 0;
         self.tab = CenterTab::Conversation;
         self.assign_session_to_workspace(&id, ws.as_deref());
-        self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into() });
+        self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd) });
         cx.notify();
     }
     /// 虚拟列表条目总数：消息 + 流式状态行 + 统计行。
@@ -2291,14 +2343,30 @@ impl AppView {
                 }
                 // --- 该组会话行 ---
                 if !wcollapsed && !self.group_flat {
+                    // web 语义：会话按其 project cwd 归组（目录即真相）
+                    let w_key = dsh_persist::project_key(&w.path);
+                    let members: Vec<&SessionMeta> = self
+                        .sessions
+                        .iter()
+                        .filter(|m| {
+                            m.cwd
+                                .as_deref()
+                                .map(|c| dsh_persist::project_key(c) == w_key)
+                                .unwrap_or(false)
+                        })
+                        .collect();
                     let w_sids: Vec<String> = if self.order_manual {
-                        w.session_ids.clone()
+                        let manual: Vec<String> = w.session_ids.clone();
+                        let mut ordered: Vec<String> =
+                            manual.into_iter().filter(|s| members.iter().any(|m| m.id.as_str() == s)).collect();
+                        for m in &members {
+                            if !ordered.iter().any(|s| s == m.id.as_str()) {
+                                ordered.push(m.id.as_str().to_string());
+                            }
+                        }
+                        ordered
                     } else {
-                        self.sessions
-                            .iter()
-                            .filter(|m| w.session_ids.iter().any(|s| s == m.id.as_str()))
-                            .map(|m| m.id.as_str().to_string())
-                            .collect()
+                        members.iter().map(|m| m.id.as_str().to_string()).collect()
                     };
                     for sid in &w_sids {
                         if let Some(meta) = self.sessions.iter().find(|m| m.id.as_str() == sid) {
@@ -2328,13 +2396,18 @@ impl AppView {
                     }
                 }
             }
-            // 未分组会话
-            let grouped: std::collections::HashSet<&str> = self
+            // 未分组会话：cwd 缺失或不属于任何工作区
+            let ws_keys: std::collections::HashSet<String> = self
                 .workspaces
                 .iter()
-                .flat_map(|w| w.session_ids.iter().map(|s| s.as_str()))
+                .map(|w| dsh_persist::project_key(&w.path))
                 .collect();
-            for meta in self.sessions.iter().filter(|m| !grouped.contains(m.id.as_str())) {
+            for meta in self.sessions.iter().filter(|m| {
+                m.cwd
+                    .as_deref()
+                    .map(|c| !ws_keys.contains(&dsh_persist::project_key(c)))
+                    .unwrap_or(true)
+            }) {
                 let t_sw = this.clone();
                 let id = meta.id.clone();
                 let active = meta.id == current_id;
@@ -3552,29 +3625,70 @@ fn main() {
     let prompt = Arc::new(SystemPrompt::new());
     let demo_prompt = std::env::var("DSH_PROMPT").ok().filter(|s| !s.trim().is_empty());
 
-    // --- 会话持久化：恢复最近的会话，或新建 ---
+    // --- 会话持久化：与 web 完全共享（--key--/sid/session.jsonl.zstd）---
     let recorder = Arc::new(SessionRecorder::new(sessions_dir()));
-    let existing = recorder.list().unwrap_or_default();
-    let (initial_session, sessions_meta, is_fresh) = if let Some(id) = existing.first() {
-        let meta: Vec<SessionMeta> = existing
-            .iter()
-            .map(|sid| {
-                let title = recorder
-                    .load(sid)
-                    .ok()
-                    .and_then(|s| s.first_user_text())
-                    .map(|t| t.chars().take(30).collect())
-                    .unwrap_or_else(|| "新会话".into());
-                let time_label = session_time_label(&recorder, sid);
-                SessionMeta { id: sid.clone(), title, time_label }
-            })
-            .collect();
-        let session = recorder.load(id).unwrap_or_else(|_| Session::new(id.clone()));
+    let entries = recorder.list().unwrap_or_default();
+    // 相对时间
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let rel = |modified: std::time::SystemTime| -> String {
+        let secs = now_secs
+            .saturating_sub(
+                modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+            );
+        match secs {
+            s if s < 60 => "刚刚".into(),
+            s if s < 3600 => format!("{}分钟", s / 60),
+            s if s < 86400 => format!("{}小时", s / 3600),
+            s if s < 86400 * 30 => format!("{}天", s / 86400),
+            _ => format!("{}个月", secs / 86400 / 30),
+        }
+    };
+    let web_titles: std::collections::HashMap<String, String> =
+        load_web_session_metas().into_iter().collect();
+    let mut sessions_meta: Vec<SessionMeta> = entries
+        .iter()
+        .map(|e| {
+            let title = e
+                .cwd
+                .as_deref()
+                .and_then(|c| recorder.title_of(&e.id, c))
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| web_titles.get(e.id.as_str()).cloned())
+                .unwrap_or_else(|| "新会话".into());
+            SessionMeta {
+                id: e.id.clone(),
+                title,
+                time_label: rel(e.modified),
+                cwd: e.cwd.clone(),
+            }
+        })
+        .collect();
+    let (initial_session, initial_cwd, is_fresh) = if let Some(first) = entries.first() {
+        let (session, cwd) = recorder
+            .load(&first.id, first.cwd.as_deref())
+            .unwrap_or_else(|_| (Session::new(first.id.clone()), first.cwd.clone()));
         let is_fresh = session.entries().is_empty();
-        (session, meta, is_fresh)
+        (session, cwd.unwrap_or_default(), is_fresh)
     } else {
-        let id = SessionId::new(uuid::Uuid::new_v4().to_string());
-        (Session::new(id.clone()), vec![SessionMeta { id, title: "新会话".into(), time_label: String::new() }], true)
+        // 无任何会话：建一个挂在当前目录的空会话
+        let id = new_web_session_id();
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let _ = recorder.create(&id, &cwd, "standard");
+        sessions_meta.push(SessionMeta {
+            id: id.clone(),
+            title: "新会话".into(),
+            time_label: String::new(),
+            cwd: Some(cwd.clone()),
+        });
+        (Session::new(id), cwd, true)
     };
 
     let agent = ReactLoopAgent::new(
@@ -3592,12 +3706,14 @@ fn main() {
     );
     agent.set_session(initial_session);
 
-    // 持久化：每个追加的会话事件写入 JSONL
+    // 持久化：每个追加的会话事件写入 web 布局（cwd 由 AppView 维护）
     let recorder_sink = Arc::clone(&recorder);
     let agent_sink = Arc::clone(&agent);
+    let cwd_slot = Arc::new(std::sync::Mutex::new(initial_cwd.clone()));
     agent.set_event_sink(move |event| {
         let id = agent_sink.session().lock().unwrap().id.clone();
-        let _ = recorder_sink.append(&id, &event);
+        let cwd = cwd_slot.lock().unwrap().clone();
+        let _ = recorder_sink.append(&id, &cwd, &event);
     });
 
     let event_rx = agent.subscribe();
@@ -3807,30 +3923,6 @@ fn valid_route_id(route: &str) -> bool {
         && !route.ends_with('-')
 }
 
-/// 会话 JSONL 的修改时间 → web 侧栏的相对时间文案。
-fn session_time_label(recorder: &SessionRecorder, id: &SessionId) -> String {
-    let path = recorder.path_for(id);
-    let Ok(md) = std::fs::metadata(&path) else {
-        return String::new();
-    };
-    let Ok(modified) = md.modified() else {
-        return String::new();
-    };
-    let Ok(d) = modified.duration_since(SystemTime::UNIX_EPOCH) else {
-        return String::new();
-    };
-    let Some(now) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok() else {
-        return String::new();
-    };
-    let secs = now.as_secs().saturating_sub(d.as_secs());
-    match secs {
-        s if s < 60 => "刚刚".into(),
-        s if s < 3600 => format!("{}分钟", s / 60),
-        s if s < 86400 => format!("{}小时", s / 3600),
-        s if s < 86400 * 30 => format!("{}天", s / 86400),
-        _ => format!("{}个月", secs / 86400 / 30),
-    }
-}
 
 fn message_text(m: &Message) -> String {
     m.content.iter().filter_map(|b| match b {

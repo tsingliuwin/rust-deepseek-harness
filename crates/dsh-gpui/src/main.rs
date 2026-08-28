@@ -1002,6 +1002,15 @@ impl AppView {
             selected_tool: None,
         };
         view.rebuild_from_session();
+        // 虚拟列表长度同步（构造时 rebuild 填充了 entries，列表需知道条数）
+        {
+            let n = view.chat_item_count();
+            view.chat_items = n;
+            view.chat_list.reset(n);
+            if n > 0 {
+                view.chat_list.scroll_to_reveal_item(n - 1);
+            }
+        }
         // 贴底状态跟踪：滚动事件更新可见范围是否含末尾
         {
             let list = view.chat_list.clone();

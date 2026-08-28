@@ -122,7 +122,8 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
         .pb_6()
         .child(content);
 
-    div()
+    let confirm = app.confirm_delete.clone();
+    let panel = div()
         .absolute()
         .size_full()
         .top_0()
@@ -133,6 +134,7 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
         .justify_center()
         .child(
             div()
+                .relative()
                 .w(px(800.0))
                 .h(px(700.0))
                 .flex()
@@ -148,8 +150,99 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
                         .v_flex()
                         .child(header)
                         .child(options),
-                ),
-        )
+                )
+                .when_some(confirm.clone(), |col, id| {
+                    col.child(
+                        // 删除确认 Modal（web deleteDialog：遮罩 + 小卡）
+                        div()
+                            .absolute()
+                            .size_full()
+                            .top_0()
+                            .left_0()
+                            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.3))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(px(420.0))
+                                    .v_flex()
+                                    .gap_3()
+                                    .p_4()
+                                    .rounded(px(16.0))
+                                    .bg(tk.surface)
+                                    .border_1()
+                                    .border_color(tk.border_l2)
+                                    .shadow_lg()
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_ROW))
+                                            .line_height(px(22.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(tk.text)
+                                            .child(format!("删除 {id}？")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_CAPTION))
+                                            .line_height(px(theme::FONT_CAPTION_LEADING))
+                                            .text_color(tk.text_3)
+                                            .child("删除 {id} 会移除其配置；其使用的凭证（如有）由其他位置管理，将会保留。".replace("{id}", &id)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .justify_end()
+                                            .gap_2()
+                                            .child({
+                                                let t = this.clone();
+                                                action_button("del-cancel", "取消", false, move |_, _, cx| {
+                                                    t.update(cx, |v, cx| {
+                                                        v.confirm_delete = None;
+                                                        cx.notify();
+                                                    });
+                                                })
+                                            })
+                                            .child({
+                                                let t = this.clone();
+                                                let id2 = id.clone();
+                                                div()
+                                                    .id("del-confirm")
+                                                    .h(px(36.0))
+                                                    .px(px(14.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(px(18.0))
+                                                    .border_1()
+                                                    .border_color(tk.error)
+                                                    .text_size(px(theme::FONT_ROW))
+                                                    .line_height(px(22.0))
+                                                    .text_color(tk.error)
+                                                    .cursor_pointer()
+                                                    .hover(|st| st.bg(gpui::hsla(0.0, 0.9, 0.55, 0.12)))
+                                                    .on_click(move |_, _, cx| {
+                                                        let id = id2.clone();
+                                                        t.update(cx, |v, cx| {
+                                                            v.remove_provider(&id);
+                                                            v.confirm_delete = None;
+                                                            cx.notify();
+                                                        });
+                                                    })
+                                                    .child(format!("删除 {id}"))
+                                            }),
+                                    ),
+                            ),
+                    )
+                }),
+        );
+
+    panel
+                .flex()
+                .rounded(px(24.0))
+                .overflow_hidden()
+                .bg(tk.surface)
+                .shadow_lg()
 }
 
 /// 导航格（web .navCell：40px、r12、pad(9,16,9,12)、14/22、active 填充）。
@@ -483,14 +576,7 @@ fn provider_row(
         .items_center()
         .gap(px(10.0))
         .child(
-            // 凭据点（web .credentialDot：8px 圆，绿=已配置 红=缺失）
-            div()
-                .size(px(8.0))
-                .rounded_full()
-                .flex_none()
-                .bg(if has_key { tk.green } else { tk.error }),
-        )
-        .child(
+            // web 顺序：名称 → [route 标注] → [自定义 tag] → 凭据点
             div()
                 .text_size(px(theme::FONT_ROW))
                 .line_height(px(22.0))
@@ -522,6 +608,14 @@ fn provider_row(
                 .child("自定义"),
         );
     }
+    head = head.child(
+        // 凭据点（web .credentialDot：8px 圆，绿=已配置 红=缺失）
+        div()
+            .size(px(8.0))
+            .rounded_full()
+            .flex_none()
+            .bg(if has_key { tk.green } else { tk.error }),
+    );
     let mut head = head.child(div().flex_1());
     if active {
         head = head.child(
@@ -578,7 +672,7 @@ fn provider_row(
                 move |_, _, cx| {
                     let id = del_id.clone();
                     t_del.update(cx, |v, cx| {
-                        v.remove_provider(&id);
+                        v.confirm_delete = Some(id);
                         cx.notify();
                     });
                 },
@@ -647,12 +741,40 @@ fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str) -> Div
                         .child(id.to_string()),
                 ),
         )
-        .child(field("API 密钥", Input::new(&app.edit_key).w_full()))
-        .child(hint(if id == "deepseek" {
-            "编辑卡默认 API 地址 https://api.deepseek.com；自定义提供方的 API 地址在折叠区内。"
+        .child(field(
+            "API 密钥",
+            div()
+                .when(id == "deepseek" && app.env_key_locked, |d| {
+                    d.child(
+                        div()
+                            .w_full()
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(tk.border_l2)
+                            .bg(tk.layer1)
+                            .text_size(px(theme::FONT_ROW))
+                            .line_height(px(22.0))
+                            .text_color(tk.text_3)
+                            .child("由启动环境提供（只读）"),
+                    )
+                })
+                .when(id != "deepseek" || !app.env_key_locked, |d| {
+                    d.child(Input::new(&app.edit_key).w_full())
+                }),
+        ))
+        .child(if id == "deepseek" {
+            hint(if app.env_key_locked {
+                "DeepSeek 密钥来自 DEEPSEEK_API_KEY 环境变量，此处不可编辑。"
+            } else {
+                "编辑卡默认 API 地址 https://api.deepseek.com；自定义提供方的 API 地址在折叠区内。"
+            })
         } else {
-            "选择模型目录中的首行作为路由默认模型。"
-        }))
+            hint("选择模型目录中的首行作为路由默认模型。")
+        })
         .child(
             // 自定义设置折叠（web details.customized：12/18 wt500 secondary + 旋转 chevron）
             disclosure(

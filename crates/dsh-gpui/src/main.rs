@@ -204,10 +204,40 @@ pub(crate) struct ProviderCatalogEntry {
 }
 
 pub(crate) const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
-    ProviderCatalogEntry { id: "kimi", name: "Moonshot Kimi", base_url: "https://api.moonshot.cn/v1", model: "kimi-k2-0905-preview" },
-    ProviderCatalogEntry { id: "glm", name: "智谱 GLM", base_url: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.6" },
-    ProviderCatalogEntry { id: "doubao", name: "火山方舟", base_url: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-1-6" },
-    ProviderCatalogEntry { id: "openai", name: "OpenAI 兼容", base_url: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+    ProviderCatalogEntry { id: "amazon-bedrock", name: "Amazon Bedrock", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "ant-ling", name: "Ant Ling", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "anthropic", name: "Anthropic", base_url: "https://api.anthropic.com/v1", model: "claude-3-7-sonnet-latest" },
+    ProviderCatalogEntry { id: "azure-openai-responses", name: "Azure OpenAI", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "cerebras", name: "Cerebras", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "cloudflare-ai-gateway", name: "Cloudflare AI Gateway", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "cloudflare-workers-ai", name: "Cloudflare Workers AI", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "fireworks", name: "Fireworks", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "github-copilot", name: "GitHub Copilot", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "google", name: "Google", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
+    ProviderCatalogEntry { id: "google-vertex", name: "Google Vertex", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "groq", name: "Groq", base_url: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+    ProviderCatalogEntry { id: "huggingface", name: "Hugging Face", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "kimi-coding", name: "Kimi Coding", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "minimax", name: "MiniMax", base_url: "https://api.minimax.chat/v1", model: "" },
+    ProviderCatalogEntry { id: "minimax-cn", name: "MiniMax CN", base_url: "https://api.minimaxi.com/v1", model: "" },
+    ProviderCatalogEntry { id: "mistral", name: "Mistral", base_url: "https://api.mistral.ai/v1", model: "mistral-large-latest" },
+    ProviderCatalogEntry { id: "moonshotai", name: "Moonshot AI", base_url: "https://api.moonshot.ai/v1", model: "kimi-k2-0905-preview" },
+    ProviderCatalogEntry { id: "moonshotai-cn", name: "Moonshot AI CN", base_url: "https://api.moonshot.cn/v1", model: "kimi-k2-0905-preview" },
+    ProviderCatalogEntry { id: "nvidia", name: "NVIDIA", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "openai", name: "OpenAI", base_url: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+    ProviderCatalogEntry { id: "openai-codex", name: "OpenAI Codex", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "opencode", name: "OpenCode", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "opencode-go", name: "OpenCode Go", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "openrouter", name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", model: "" },
+    ProviderCatalogEntry { id: "qwen-token-plan", name: "Qwen Token Plan", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "" },
+    ProviderCatalogEntry { id: "together", name: "Together", base_url: "https://api.together.xyz/v1", model: "" },
+    ProviderCatalogEntry { id: "vercel-ai-gateway", name: "Vercel AI Gateway", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "xai", name: "xAI", base_url: "https://api.x.ai/v1", model: "grok-4" },
+    ProviderCatalogEntry { id: "xiaomi", name: "Xiaomi", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "xiaomi-token-plan-ams", name: "Xiaomi Token Plan AMS", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "xiaomi-token-plan-cn", name: "Xiaomi Token Plan CN", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "xiaomi-token-plan-sgp", name: "Xiaomi Token Plan SGP", base_url: "", model: "" },
+    ProviderCatalogEntry { id: "zai", name: "ZAI", base_url: "", model: "" },
 ];
 
 /// 配置目录（settings.json / 会话 JSONL 所在）。
@@ -247,6 +277,8 @@ struct AppView {
     settings_tab: SettingsTab,
     settings: AppSettings,
     llm_configured: bool,
+    /// DEEPSEEK_API_KEY 由启动环境提供（web keyEnvLocked：只读）。
+    env_key_locked: bool,
     // 模型页添加/编辑卡状态（对齐 web ModelsSection 的 adding/declaring/editing）
     adding: AddingMode,
     adopt_pick: usize,
@@ -254,6 +286,8 @@ struct AppView {
     adopt_customized_open: bool,
     edit_customized_open: bool,
     editing_provider: Option<String>,
+    /// 待删除确认（web deleteDialog：删除前弹确认）。
+    confirm_delete: Option<String>,
     // adopt 卡输入
     adopt_key: Entity<InputState>,
     adopt_base: Entity<InputState>,
@@ -298,6 +332,7 @@ impl AppView {
         active_provider: String,
         settings: AppSettings,
         llm_configured: bool,
+        env_key_locked: bool,
         adopt_key: Entity<InputState>,
         adopt_base: Entity<InputState>,
         dc_route: Entity<InputState>,
@@ -335,12 +370,14 @@ impl AppView {
             settings_tab: SettingsTab::General,
             settings,
             llm_configured,
+            env_key_locked,
             adding: AddingMode::None,
             adopt_pick: 0,
             adopt_dropdown_open: false,
             adopt_customized_open: false,
             edit_customized_open: false,
             editing_provider: None,
+            confirm_delete: None,
             adopt_key,
             adopt_base,
             dc_models: Vec::new(),
@@ -2230,10 +2267,10 @@ fn main() {
                         .auto_grow(1, 14)
                 });
                 let api_input = cx.new(|cx: &mut Context<InputState>| {
-                    InputState::new(window, cx).masked(true).placeholder("输入 API 密钥")
+                    InputState::new(window, cx).masked(true).placeholder("输入 API 密钥，或留空使用环境认证")
                 });
                 let adopt_key = cx.new(|cx: &mut Context<InputState>| {
-                    InputState::new(window, cx).masked(true).placeholder("输入 API 密钥")
+                    InputState::new(window, cx).masked(true).placeholder("输入 API 密钥，或留空使用环境认证")
                 });
                 let adopt_base = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).placeholder("提供方默认")
@@ -2273,6 +2310,7 @@ fn main() {
                         startup_active.clone(),
                         user_settings.clone(),
                         provider == "deepseek" || !user_settings.providers.is_empty(),
+                        provider == "deepseek",
                         adopt_key.clone(),
                         adopt_base.clone(),
                         dc_route.clone(),

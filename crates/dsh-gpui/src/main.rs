@@ -2832,8 +2832,8 @@ impl AppView {
                     }
                 }
             })
+            .size_full()
             .with_sizing_behavior(ListSizingBehavior::Auto);
-            let chat_list_el = chat_list_el;
             center = center
                 .child(
                     // chat tab 用虚拟列表；轨迹保持普通流
@@ -2842,22 +2842,21 @@ impl AppView {
                         .min_h_0()
                         .relative()
                         .child(
-                            div()
-                                .id("chat-scroll")
-                                .h_full()
-                                .px_8()
-                                .map(|d| {
-                                    if self.tab == CenterTab::Conversation {
-                                        d.child(chat_list_el)
-                                    } else {
-                                        let mut c = div()
-                                            .id("traj-scroll")
-                                            .h_full()
-                                            .overflow_y_scroll();
-                                        c = c.child(body);
-                                        c
-                                    }
-                                }),
+                            if self.tab == CenterTab::Conversation {
+                                div()
+                                    .id("chat-scroll")
+                                    .h_full()
+                                    .px_8()
+                                    .child(chat_list_el)
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .id("traj-scroll")
+                                    .h_full()
+                                    .overflow_y_scroll()
+                                    .child(body)
+                                    .into_any_element()
+                            },
                         )
                         .when(show_jump, |d| {
                             d.child(

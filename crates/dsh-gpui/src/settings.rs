@@ -565,7 +565,7 @@ fn provider_row(
 ) -> Div {
     let tk = theme::t();
     let is_deepseek = id == "deepseek";
-    let active = app.active_provider == id;
+    let _active = app.active_provider == id;
     let editing = app.editing_provider.as_deref() == Some(id);
 
     // 行头：凭据点 + 名称 + route 标注 + 自定义 tag + 操作
@@ -616,32 +616,9 @@ fn provider_row(
             .flex_none()
             .bg(if has_key { tk.green } else { tk.error }),
     );
-    let mut head = head.child(div().flex_1());
-    if active {
-        head = head.child(
-            div()
-                .text_size(px(theme::FONT_CAPTION))
-                .line_height(px(theme::FONT_CAPTION_LEADING))
-                .text_color(tk.green)
-                .child("使用中"),
-        );
-    } else {
-        let t_act = this.clone();
-        let act_id = id.to_string();
-        head = head.child(
-            link_button(
-                SharedString::from(format!("prov-use-{id}")),
-                "启用",
-                move |_, _, cx| {
-                    let id = act_id.clone();
-                    t_act.update(cx, |v, cx| {
-                        v.activate_provider(&id);
-                        cx.notify();
-                    });
-                },
-            ),
-        );
-    }
+    // web 的 rowCard 只有 编辑/删除，没有启用动作（当前模型由
+    // composer 的模型选择器管理，不是行卡职责）
+    head = head.child(div().flex_1());
     head = head.child(
         // 编辑（secondary h36 r18）
         action_button(

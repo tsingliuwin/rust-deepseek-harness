@@ -1251,7 +1251,9 @@ impl AppView {
         self.editing_provider = None;
     }
 
-    /// 启用某个已声明的提供方（deepseek 或 custom-*）。
+    /// 切换当前 provider 路由（composer 模型选择器接入后使用；
+    /// web 模型页没有启用按钮，选择在 composer 完成）。
+    #[allow(dead_code)]
     fn activate_provider(&mut self, id: &str) {
         if id == "deepseek" {
             self.agent.set_provider_and_model("deepseek", self.desired_model.clone());

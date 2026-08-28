@@ -256,8 +256,20 @@ pub(crate) fn dsh_home() -> std::path::PathBuf {
 
 /// settings.yaml —— 与 web 版 dsh 共享同一份配置文档（YAML）。
 /// 只读写我们拥有的段，其余段原样保留。
-fn settings_path() -> std::path::PathBuf {
+pub(crate) fn settings_path() -> std::path::PathBuf {
     dsh_home().join("settings.yaml")
+}
+
+/// 用系统默认关联程序直接打开 settings.yaml。
+pub(crate) fn open_settings_file() {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &settings_path().to_string_lossy()])
+        .spawn();
+    #[cfg(not(target_os = "windows"))]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(settings_path())
+        .spawn();
 }
 
 /// .credentials.yaml —— 与 web 共享的密钥文档：{version: 1, refs: {REF: key}}。

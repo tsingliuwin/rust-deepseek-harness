@@ -80,9 +80,8 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
                 .cursor_pointer()
                 .hover(|s| s.bg(tk.hover))
                 .on_click(move |_, _, _cx| {
-                    // 打开配置目录（settings.json / sessions 所在）
-                    let dir = crate::dsh_home();
-                    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+                    // 直接打开 settings.yaml（系统默认关联程序）
+                    crate::open_settings_file();
                     let _ = &t_open;
                 })
                 .child("打开配置文件"),

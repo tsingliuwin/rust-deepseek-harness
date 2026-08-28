@@ -5,7 +5,7 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::{Icon, IconName, StyledExt, input::Input};
+use gpui_component::{Icon, IconName, StyledExt, input::{Input, InputState}};
 
 use crate::{AppView, AppearanceMode, EnterBehavior, SettingsTab};
 use crate::theme;
@@ -334,11 +334,13 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
         ))
 }
 
-/// 模型页（web ModelsSection：标题 + 说明 + provider 卡）。
+/// 模型页（web ModelsSection：标题 + 说明 + provider 卡 + 添加区）。
 fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, _cx: &mut App) -> Div {
     let tk = theme::t();
     let t_save = this.clone();
     let t_model = this.clone();
+    let t_add = this.clone();
+    let t_custom = this.clone();
 
     let model_seg = segmented(
         "set-model",
@@ -351,11 +353,224 @@ fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, _cx:
             t_model.update(cx, |v, cx| {
                 v.desired_model = model.to_string();
                 v.agent.set_provider_and_model("deepseek", model.to_string());
+                v.active_provider = "deepseek".into();
+                v.llm_configured = true;
                 v.persist_settings();
                 cx.notify();
             });
         },
     );
+
+    // DeepSeek 卡（l2 描边、r12、pad 12/14）
+    let deepseek_card = div()
+        .v_flex()
+        .gap_3()
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(tk.border_l2)
+        .px(px(14.0))
+        .py_3()
+        .child(provider_head(
+            "DeepSeek",
+            if app.active_provider == "deepseek" { "使用中" } else if app.llm_configured { "已连接" } else { "未配置（使用 mock）" },
+            app.active_provider == "deepseek",
+            app.llm_configured,
+        ))
+        .child(field("API Key", Input::new(&app.api_input).appearance(false).w_full()))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(pill_button("set-save-key", "保存并启用", true, move |_, _, cx| {
+                    t_save.update(cx, |v, cx| {
+                        v.apply_api_key(cx);
+                        v.active_provider = "deepseek".into();
+                        cx.notify();
+                    });
+                }))
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(theme::FONT_CAPTION_LEADING))
+                        .text_color(tk.text_3)
+                        .child("留空则保持当前路由。"),
+                ),
+        )
+        .child(field("模型", model_seg));
+
+    // 已声明的自定义提供方卡
+    let custom_cards: Vec<Div> = app
+        .settings
+        .providers
+        .iter()
+        .map(|p| {
+            let tc = t_custom.clone();
+            let id = p.id.clone();
+            let td = t_custom.clone();
+            let id2 = p.id.clone();
+            let _ = &tc;
+            let active = app.active_provider == p.id;
+            let base_url = p.base_url.clone();
+            let model = p.model.clone();
+            let name = p.name.clone();
+            let _ = (&tc, &td);
+            div()
+                .v_flex()
+                .gap_2()
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(tk.border_l2)
+                .px(px(14.0))
+                .py_3()
+                .child(provider_head(&name, &format!("{base_url} · {model}"), true, true))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(if active {
+                            div()
+                                .id(SharedString::from(format!("prov-active-{}", id)))
+                                .text_size(px(theme::FONT_CAPTION))
+                                .line_height(px(theme::FONT_CAPTION_LEADING))
+                                .text_color(tk.green)
+                                .child("使用中")
+                                .into_any_element()
+                        } else {
+                            pill_button(
+                                SharedString::from(format!("prov-enable-{}", id)),
+                                "启用",
+                                false,
+                                move |_, _, cx| {
+                                    let id = id.clone();
+                                    tc.update(cx, |v, cx| {
+                                        v.activate_provider(&id);
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .into_any_element()
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("prov-del-{}", id2)))
+                                .h(px(28.0))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded(px(14.0))
+                                .border_1()
+                                .border_color(tk.border_l2)
+                                .text_size(px(theme::FONT_TAB))
+                                .line_height(px(20.0))
+                                .text_color(tk.text_2)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(tk.hover))
+                                .on_click(move |_, _, cx| {
+                                    let id = id2.clone();
+                                    td.update(cx, |v, cx| {
+                                        v.remove_provider(&id);
+                                        cx.notify();
+                                    });
+                                })
+                                .child("删除"),
+                        ),
+                )
+        })
+        .collect();
+
+    // 添加区（web .addBlock：编辑卡 或 两枚等宽虚线按钮）
+    let add_block: Div = if app.adding_provider {
+        let t_cancel = this.clone();
+        let t_preset = this.clone();
+        div()
+            .v_flex()
+            .gap_3()
+            .rounded(px(12.0))
+            .bg(tk.layer1)
+            .px(px(16.0))
+            .py(px(14.0))
+            .child(
+                div()
+                    .text_size(px(theme::FONT_ROW))
+                    .line_height(px(22.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tk.text)
+                    .child("添加提供方"),
+            )
+            .child(
+                div()
+                    .v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_CAPTION))
+                            .line_height(px(theme::FONT_CAPTION_LEADING))
+                            .text_color(tk.text_3)
+                            .child("预设（点击填充，OpenAI 兼容）"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(preset_chip("chip-moonshot", "Moonshot Kimi", "Kimi", "https://api.moonshot.cn/v1", "kimi-k2-0905-preview", &t_preset))
+                            .child(preset_chip("chip-zhipu", "智谱 GLM", "GLM", "https://open.bigmodel.cn/api/paas/v4", "glm-4.6", &t_preset))
+                            .child(preset_chip("chip-ark", "火山方舟", "方舟", "https://ark.cn-beijing.volces.com/api/v3", "doubao-seed-1-6", &t_preset))
+                            .child(preset_chip("chip-openai", "OpenAI 兼容", "", "", "", &t_preset)),
+                    ),
+            )
+            .child(field("名称", Input::new(&app.np_name).appearance(false).w_full()))
+            .child(field("Base URL", Input::new(&app.np_base).appearance(false).w_full()))
+            .child(field("API Key", Input::new(&app.np_key).appearance(false).w_full()))
+            .child(field("默认模型", Input::new(&app.np_model).appearance(false).w_full()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(pill_button("set-add-provider", "保存并启用", true, move |_, window, cx| {
+                        // 保存后清空编辑卡（此闭包同时持有 window）
+                        let entities = t_add.read_with(cx, |v, _| {
+                            (v.np_name.clone(), v.np_base.clone(), v.np_key.clone(), v.np_model.clone())
+                        });
+                        t_add.update(cx, |v, cx| {
+                            v.add_custom_provider(cx);
+                            cx.notify();
+                        });
+                        let (a, b, c, d) = entities;
+                        for e in [a, b, c, d] {
+                            e.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                        }
+                    }))
+                    .child(pill_button("set-add-cancel", "取消", false, move |_, _, cx| {
+                        t_cancel.update(cx, |v, cx| {
+                            v.adding_provider = false;
+                            cx.notify();
+                        });
+                    })),
+            )
+    } else {
+        let t_open1 = this.clone();
+        let t_open2 = this.clone();
+        div()
+            .flex()
+            .flex_wrap()
+            .gap(px(10.0))
+            .child(add_button("set-add-known", "添加提供方", IconName::Plus, move |_, _, cx| {
+                t_open1.update(cx, |v, cx| {
+                    v.adding_provider = true;
+                    cx.notify();
+                });
+            }))
+            .child(add_button("set-add-custom", "添加自定义提供方", IconName::Plus, move |_, _, cx| {
+                t_open2.update(cx, |v, cx| {
+                    v.adding_provider = true;
+                    cx.notify();
+                });
+            }))
+    };
 
     div()
         .v_flex()
@@ -376,104 +591,170 @@ fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, _cx:
                 .text_color(tk.text_3)
                 .child("配置模型提供方；保存后对新会话生效。"),
         )
+        .child(deepseek_card)
+        .children(custom_cards)
+        .child(add_block)
+}
+
+/// provider 卡头（图标 + 名称 + 右侧状态/URL）。
+fn provider_head(name: &str, status: &str, active: bool, configured: bool) -> Div {
+    let tk = theme::t();
+    let color = if active {
+        tk.green
+    } else if configured {
+        tk.text_2
+    } else {
+        tk.text_3
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_2p5()
+        .min_w_0()
+        .child(Icon::new(IconName::Bot).size(px(16.0)).text_color(tk.accent))
         .child(
-            // provider 卡（web .rowCard：l2 描边、r12、pad 12/14）
             div()
-                .v_flex()
-                .gap_3()
-                .rounded(px(12.0))
-                .border_1()
-                .border_color(tk.border_l2)
-                .px(px(14.0))
-                .py_3()
-                .child(
-                    // 卡头：图标 + 名称 + 状态
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2p5()
-                        .child(Icon::new(IconName::Bot).size(px(16.0)).text_color(tk.accent))
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_ROW))
-                                .line_height(px(22.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(tk.text)
-                                .child("DeepSeek"),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .line_height(px(theme::FONT_CAPTION_LEADING))
-                                .text_color(if app.llm_configured { tk.green } else { tk.text_3 })
-                                .child(if app.llm_configured { "已连接" } else { "未配置（使用 mock）" }),
-                        ),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .line_height(px(theme::FONT_CAPTION_LEADING))
-                                .text_color(tk.text_3)
-                                .child("API Key"),
-                        )
-                        .child(Input::new(&app.api_input).appearance(false).w_full())
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .child(
-                            div()
-                                .id("set-save-key")
-                                .h(px(28.0))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .rounded(px(14.0))
-                                .bg(tk.accent)
-                                .text_color(gpui::white())
-                                .text_size(px(theme::FONT_TAB))
-                                .line_height(px(20.0))
-                                .font_weight(FontWeight::MEDIUM)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(tk.accent_hover))
-                                .on_click(move |_, _, cx| {
-                                    t_save.update(cx, |v, cx| {
-                                        v.apply_api_key(cx);
-                                        cx.notify();
-                                    });
-                                })
-                                .child("保存并启用"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .line_height(px(theme::FONT_CAPTION_LEADING))
-                                .text_color(tk.text_3)
-                                .child("留空则保持当前路由。"),
-                        ),
-                )
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_CAPTION))
-                                .line_height(px(theme::FONT_CAPTION_LEADING))
-                                .text_color(tk.text_3)
-                                .child("模型"),
-                        )
-                        .child(model_seg),
-                ),
+                .text_size(px(theme::FONT_ROW))
+                .line_height(px(22.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(tk.text)
+                .child(name.to_string()),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(theme::FONT_CAPTION))
+                .line_height(px(theme::FONT_CAPTION_LEADING))
+                .text_color(color)
+                .child(status.to_string()),
         )
 }
+
+/// 字段行（label + 控件）。
+fn field(label: &str, control: impl IntoElement) -> Div {
+    let tk = theme::t();
+    div()
+        .v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_size(px(theme::FONT_CAPTION))
+                .line_height(px(theme::FONT_CAPTION_LEADING))
+                .text_color(tk.text_3)
+                .child(label.to_string()),
+        )
+        .child(control)
+}
+
+/// 胶囊按钮（主色填充 / 描边两型）。
+fn pill_button(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    primary: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let tk = theme::t();
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded(px(14.0))
+        .map(|d| {
+            if primary {
+                d.bg(tk.accent).text_color(gpui::white()).hover(|s| s.bg(tk.accent_hover))
+            } else {
+                d.border_1()
+                    .border_color(tk.border_l2)
+                    .text_color(tk.text_2)
+                    .hover(|s| s.bg(tk.hover))
+            }
+        })
+        .text_size(px(theme::FONT_TAB))
+        .line_height(px(20.0))
+        .font_weight(if primary { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(label)
+}
+
+/// 添加区虚线按钮（web .addButton：等宽、h44、r12、l3 虚线、+ 图标）。
+fn add_button(
+    id: &'static str,
+    label: &'static str,
+    icon: IconName,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let tk = theme::t();
+    div()
+        .id(id)
+        .flex_1()
+        .min_w(px(180.0))
+        .h(px(44.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_1p5()
+        .rounded(px(12.0))
+        .border_1()
+        .border_dashed()
+        .border_color(tk.border_l3)
+        .text_size(px(theme::FONT_ROW))
+        .line_height(px(22.0))
+        .text_color(tk.text)
+        .cursor_pointer()
+        .hover(|s| s.bg(tk.hover))
+        .on_click(on_click)
+        .child(Icon::new(icon).size(px(14.0)).text_color(tk.text_2))
+        .child(label)
+}
+
+/// 预设 chip（点击把预设填进编辑卡）。
+fn preset_chip(
+    id: &'static str,
+    label: &'static str,
+    name: &'static str,
+    base: &'static str,
+    model: &'static str,
+    this: &Entity<AppView>,
+) -> Stateful<Div> {
+    let tk = theme::t();
+    let t = this.clone();
+    div()
+        .id(id)
+        .h(px(28.0))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded(px(14.0))
+        .border_1()
+        .border_color(tk.border_l2)
+        .text_size(px(theme::FONT_TAB))
+        .line_height(px(20.0))
+        .text_color(tk.text_2)
+        .cursor_pointer()
+        .hover(|s| s.bg(tk.hover))
+        .on_click(move |_, window, cx| {
+            let entities = t.read_with(cx, |v, _| (v.np_name.clone(), v.np_base.clone(), v.np_model.clone()));
+            let (a, b, c) = entities;
+            if !name.is_empty() {
+                a.update(cx, |s: &mut InputState, cx| s.set_value(name, window, cx));
+            }
+            if !base.is_empty() {
+                b.update(cx, |s: &mut InputState, cx| s.set_value(base, window, cx));
+            }
+            if !model.is_empty() {
+                c.update(cx, |s: &mut InputState, cx| s.set_value(model, window, cx));
+            }
+        })
+        .child(label)
+}
+
 
 /// 空态页（插件 / Agent 预设）。
 fn placeholder_page(title: &str, desc: &str) -> Div {

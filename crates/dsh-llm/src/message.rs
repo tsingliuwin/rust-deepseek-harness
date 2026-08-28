@@ -37,6 +37,35 @@ pub enum MessageSource {
         #[serde(rename = "callId")]
         call_id: CallId,
     },
+    /// Producer-injected context (web merge-extensible open vocabulary:
+    /// agent-instructions / skill-catalog / session-reference / …; kind is
+    /// the web source.kind verbatim). The UI renders this as a context
+    /// injection row (ContextInjectionRow); it still belongs to the
+    /// model-visible surface (derive_messages keeps it).
+    #[serde(rename = "context")]
+    Context {
+        /// web source.kind original text (kebab-case)
+        #[serde(rename = "contextKind")]
+        context_kind: String,
+        /// producer field carried by the plugin kind
+        #[serde(default)]
+        plugin: Option<String>,
+        /// Semantic information form (instructions/catalog/snapshot/notice/relay/recall)
+        #[serde(default)]
+        form: Option<String>,
+        /// Producer-declared one-line summary attached to the notice form
+        #[serde(default)]
+        summary: Option<String>,
+        /// agent-instruction changed file paths (label source)
+        #[serde(default)]
+        changes_paths: Vec<String>,
+        /// session-reference cited session labels (label source for the recall role)
+        #[serde(default)]
+        reference_labels: Vec<String>,
+        /// skill-invocation name
+        #[serde(default)]
+        name: Option<String>,
+    },
 }
 
 /// One immutable message representation shared by delivery, durable history,

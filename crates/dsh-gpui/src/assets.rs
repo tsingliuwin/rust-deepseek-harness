@@ -97,6 +97,7 @@ impl AssetSource for AppAssets {
             "icons/window-minimize.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/window-minimize.svg") as &[u8]))),
             "icons/window-restore.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/window-restore.svg") as &[u8]))),
             "brands/fish.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/brands/fish.svg") as &[u8]))),
+            "icons/context-injection.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/context-injection.svg") as &[u8]))),
             "brands/hero-glow.png" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/brands/hero-glow.png") as &[u8]))),
             _ => Ok(None),
         }
@@ -105,6 +106,7 @@ impl AssetSource for AppAssets {
     fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
         Ok(vec![
             "brands/fish.svg".into(),
+            "icons/context-injection.svg".into(),
             "brands/hero-glow.png".into(),
             "icons/a-large-small.svg".into(),
             "icons/arrow-down.svg".into(),

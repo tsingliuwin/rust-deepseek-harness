@@ -73,6 +73,20 @@ enum Role {
     Error,
     /// 系统提示分隔条（压缩检查点等非消息事件的可视化）
     Notice,
+    /// 上下文注入（web ContextMessageNode → ContextInjectionRow）：
+    /// 生产者注入的 user 消息，按注入行渲染而非用户气泡
+    Context,
+}
+
+/// 上下文注入行的展示信息（web contextProvenance/contextForm 投影）。
+#[derive(Clone, Default)]
+struct ContextInfo {
+    /// 标题：上下文注入 / 跨会话召回
+    title: &'static str,
+    /// 生产者标签（plugin 名 / 变更路径 / 引用会话名 / skill 名 / kind 兜底）
+    label: Option<String>,
+    /// notice 形态的一行摘要（120 字符截断）
+    summary: Option<String>,
 }
 
 #[derive(Clone)]
@@ -84,6 +98,10 @@ struct ChatEntry {
     elapsed: Option<Duration>,
     /// 所属轮次（web turn-process 折叠的分组键；0 = 首轮前的裸条目）。
     turn: u64,
+    /// 上下文注入行信息（仅 Role::Context）
+    context: Option<ContextInfo>,
+    /// 折叠行展开态（上下文注入行用）
+    open: bool,
 }
 
 /// One session shown in the sidebar list.
@@ -976,6 +994,44 @@ struct AppView {
     turn_expanded: std::collections::HashSet<u64>,
 }
 
+/// web contextProvenance/contextForm 投影：标题（注入/召回）+ 生产者
+/// 标签（changes[].path / plugin / name / references[].label / kind 兜底）
+/// + notice 形态的 120 字符摘要。
+fn context_info(
+    kind: &str,
+    plugin: &Option<String>,
+    form: &Option<String>,
+    summary: &Option<String>,
+    changes_paths: &[String],
+    reference_labels: &[String],
+    name: &Option<String>,
+) -> ContextInfo {
+    let label = match kind {
+        "session-reference" => non_empty(reference_labels.join(", ")).or_else(|| Some(kind.to_string())),
+        "agent-instructions" => non_empty(changes_paths.join(", ")).or_else(|| Some(kind.to_string())),
+        "plugin" => plugin.clone().filter(|p| !p.is_empty()).or_else(|| Some(kind.to_string())),
+        "skill-invocation" => name.clone().filter(|n| !n.is_empty()).or_else(|| Some(kind.to_string())),
+        other => Some(other.to_string()),
+    };
+    let title = if kind == "session-reference" { "跨会话召回" } else { "上下文注入" };
+    let bounded = summary.as_ref().and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else if t.chars().count() <= 120 {
+            Some(t.to_string())
+        } else {
+            Some(format!("{}…", t.chars().take(119).collect::<String>()))
+        }
+    });
+    let _ = form;
+    ContextInfo { title, label, summary: bounded }
+}
+
+fn non_empty(s: String) -> Option<String> {
+    if s.trim().is_empty() { None } else { Some(s) }
+}
+
 /// 单轮折叠派生（web turn-process 节点数据的对应物）。
 #[derive(Clone, Copy)]
 struct TurnFold {
@@ -1236,48 +1292,34 @@ impl AppView {
                             _ => None,
                         })
                         .collect();
-                    if !text.is_empty() {
+                    if text.is_empty() {
+                        return;
+                    }
+                    // 生产者注入的上下文 → ContextInjectionRow（非用户气泡）
+                    if let MessageSource::Context { context_kind, plugin, form, summary, changes_paths, reference_labels, name } =
+                        &m.source
+                    {
+                        let info = context_info(context_kind, plugin, form, summary, changes_paths, reference_labels, name);
                         self.entries.push(ChatEntry {
-                            role: Role::User,
+                            role: Role::Context,
                             blocks: vec![MsgBlock::Text(text)],
                             done: true,
                             elapsed: None,
                             turn: cur_turn,
+                            context: Some(info),
+                            open: false,
                         });
+                        return;
                     }
-                }
-                SessionEvent::AssistantMessage { message, .. } => {
-                    let mut blocks = Vec::new();
-                    for b in &message.content {
-                        match b {
-                            ContentBlock::Text { text } => blocks.push(MsgBlock::Text(text.clone())),
-                            ContentBlock::Reasoning { text } => {
-                                blocks.push(MsgBlock::Reasoning { text: text.clone(), open: false })
-                            }
-                            ContentBlock::ToolCall { id, name, arguments } => {
-                                blocks.push(MsgBlock::Tool(ToolBlock {
-                                    id: id.0.clone(),
-                                    name: name.clone(),
-                                    arguments: arguments.clone(),
-                                    result: None,
-                                    error: false,
-                                    open: false,
-                                    expanded: false,
-                                    collapsed_groups: Vec::new(),
-                                }))
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !blocks.is_empty() {
-                        self.entries.push(ChatEntry {
-                            role: Role::Assistant,
-                            blocks,
-                            done: true,
-                            elapsed: None,
-                            turn: cur_turn,
-                        });
-                    }
+                    self.entries.push(ChatEntry {
+                        role: Role::User,
+                        blocks: vec![MsgBlock::Text(text)],
+                        done: true,
+                        elapsed: None,
+                        turn: cur_turn,
+                        context: None,
+                        open: false,
+                    });
                 }
                 SessionEvent::ToolResult { message, .. } => {
                     if let Some(ContentBlock::ToolResult { tool_call_id, content, is_error }) =
@@ -1294,7 +1336,9 @@ impl AppView {
                     }
                 }
                 SessionEvent::Compaction { .. } => {
-                    self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, turn: cur_turn });
+                    self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, turn: cur_turn, context: None,
+open: false,
+});
                 }
                 _ => {}
             }
@@ -1405,7 +1449,9 @@ impl AppView {
             done: true,
             elapsed: None,
             turn: self.ui_turn,
-        });
+         context: None,
+open: false,
+});
         self.sync_chat_list(true);
     }
 
@@ -1418,7 +1464,9 @@ impl AppView {
                 done: false,
                 elapsed: None,
                 turn: self.ui_turn,
-            });
+             context: None,
+open: false,
+});
         }
         self.entries.last_mut().unwrap()
     }
@@ -1491,10 +1539,14 @@ impl AppView {
                     done: true,
                     elapsed: None,
                     turn: self.ui_turn,
-                });
+                 context: None,
+open: false,
+});
             }
             AgentEvent::Compacted { .. } => {
-                self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, turn: self.ui_turn });
+                self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, turn: self.ui_turn, context: None,
+open: false,
+});
             }
         }
         // 智能吸底：只有用户本来就贴在底部时才跟随滚动（web 同款行为）；
@@ -2345,6 +2397,110 @@ impl AppView {
                             div().flex_1().min_w_0().text_color(theme::t().text_2).child(text),
                         ),
                 )
+            }
+            Role::Context => {
+                // 上下文注入行（web ContextInjectionRow，DisclosureRow from
+                // Figma 10:2482）：24px 头行（图标+标题+点+生产者+点+摘要）
+                // + 展开体（代码底、141px 上限、11/16 mono tertiary）
+                let info = entry.context.clone().unwrap_or_default();
+                let open = entry.open;
+                let t = this.clone();
+                let body = entry
+                    .blocks
+                    .first()
+                    .map(|b| match b {
+                        MsgBlock::Text(t) => t.clone(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default();
+                let mut header = div()
+                    .id(("ctx-row", ei as u64))
+                    .flex()
+                    .items_center()
+                    .h(px(24.0))
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .rounded(px(6.0))
+                    .hover(|s| s.bg(theme::t().hover))
+                    .on_click(move |_, _, cx| {
+                        t.update(cx, |v, cx| {
+                            if let Some(e) = v.entries.get_mut(ei) {
+                                e.open = !e.open;
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
+                            .size(px(12.0))
+                            .text_color(theme::t().text_2),
+                    )
+                    .child(
+                        gpui::svg()
+                            .path("icons/context-injection.svg")
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex_none()
+                            .text_color(theme::t().text_2),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::FONT_ROW))
+                            .line_height(px(theme::FONT_ROW_LEADING))
+                            .text_color(theme::t().text)
+                            .child(info.title),
+                    );
+                if let Some(label) = &info.label {
+                    header = header.child(dot_sep()).child(
+                        div()
+                            .flex_none()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(theme::FONT_ROW))
+                            .line_height(px(theme::FONT_ROW_LEADING))
+                            .text_color(theme::t().text_3)
+                            .child(label.clone()),
+                    );
+                }
+                if let Some(summary) = &info.summary {
+                    header = header.child(dot_sep()).child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(theme::FONT_ROW))
+                            .line_height(px(theme::FONT_ROW_LEADING))
+                            .text_color(theme::t().text_3)
+                            .child(summary.clone()),
+                    );
+                }
+                let mut wrap = div().w_full().v_flex().child(header);
+                if open {
+                    wrap = wrap.child(
+                        div()
+                            .id(("ctx-body", ei as u64))
+                            .ml(px(22.0))
+                            .mt(px(4.0))
+                            .max_h(px(141.0))
+                            .overflow_y_scroll()
+                            .rounded(px(8.0))
+                            .bg(theme::t().code_bg)
+                            .pt(px(10.0))
+                            .pr(px(16.0))
+                            .pb(px(12.0))
+                            .pl(px(12.0))
+                            .font_family(theme_mono())
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .text_color(theme::t().text_3)
+                            .child(body),
+                    );
+                }
+                div().w_full().v_flex().child(wrap)
             }
             Role::Notice => {
                 // 压缩分隔条：居中 hairline + 说明文字（web compaction 提示行）
@@ -3282,7 +3438,7 @@ impl AppView {
                                 // 零高隐藏；答案条目隐藏本步 reasoning 块
                                 if let Some(f) = v.turn_process_folds().get(&e.turn).copied() {
                                     let expanded = v.turn_expanded.contains(&e.turn);
-                                    let member = e.role == Role::Assistant
+                                    let member = matches!(e.role, Role::Assistant | Role::Context)
                                         && f.first_process <= ix
                                         && ix < f.answer;
                                     if member {
@@ -3524,7 +3680,8 @@ impl AppView {
         }
         let mut by_turn: std::collections::HashMap<u64, Vec<usize>> = Default::default();
         for (i, e) in self.entries.iter().enumerate() {
-            if e.role == Role::Assistant {
+            // 上下文注入也是过程证据（web：fold 进过程组，不计入摘要计数）
+            if matches!(e.role, Role::Assistant | Role::Context) {
                 by_turn.entry(e.turn).or_default().push(i);
             }
         }
@@ -3533,7 +3690,9 @@ impl AppView {
             if self.turn_open == Some(t) || idxs.len() < 2 {
                 continue;
             }
-            let answer = *idxs.last().unwrap();
+            let Some(answer) = idxs.iter().rev().find(|&&i| self.entries[i].role == Role::Assistant).copied() else {
+                continue;
+            };
             let answer_entry = &self.entries[answer];
             let has_text = answer_entry
                 .blocks

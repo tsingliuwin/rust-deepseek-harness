@@ -453,7 +453,72 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
             if let Some(id) = d.get("id").and_then(|i| i.as_str()) {
                 msg.id = MessageId(id.to_string());
             }
-            msg.source = MessageSource::User;
+            // web source.kind 开放词汇：user 之外都是生产者注入的上下文
+            // （ContextInjectionRow 展示语义），kind/plugin/form/summary/
+            // label 原料原样保留
+            let src = d.get("source");
+            let kind = src
+                .and_then(|s| s.get("kind"))
+                .and_then(|k| k.as_str())
+                .unwrap_or("user");
+            msg.source = match kind {
+                "user" => MessageSource::User,
+                "plugin" => MessageSource::Context {
+                    context_kind: kind.to_string(),
+                    plugin: src
+                        .and_then(|s| s.get("plugin"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    form: src
+                        .and_then(|s| s.get("form"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    summary: src
+                        .and_then(|s| s.get("summary"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    changes_paths: Vec::new(),
+                    reference_labels: Vec::new(),
+                    name: None,
+                },
+                other => MessageSource::Context {
+                    context_kind: other.to_string(),
+                    plugin: src
+                        .and_then(|s| s.get("plugin"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    form: src
+                        .and_then(|s| s.get("form"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    summary: src
+                        .and_then(|s| s.get("summary"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    changes_paths: src
+                        .and_then(|s| s.get("changes"))
+                        .and_then(|c| c.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|c| c.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    reference_labels: src
+                        .and_then(|s| s.get("references"))
+                        .and_then(|c| c.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|c| c.get("label").and_then(|p| p.as_str()).map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    name: src
+                        .and_then(|s| s.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                },
+            };
             Some(SessionEvent::UserMessage(msg))
         }
         "assistant/message" => {
@@ -517,13 +582,54 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         SessionEvent::TurnStart { turn } => Some(row("turn/start", serde_json::json!({"turn": turn}))),
         SessionEvent::TurnEnd { turn, .. } => Some(row("turn/end", serde_json::json!({"turn": turn, "reason": {"kind": "completed"}}))),
         SessionEvent::StepStart { turn, step } => Some(row("step/start", serde_json::json!({"turn": turn, "step": step}))),
-        SessionEvent::UserMessage(m) => Some(row("user/message", serde_json::json!({
-            "content": blocks_to_web(&m.content),
-            "source": {"kind": "user"},
-            "role": "user",
-            "id": m.id.0,
-            "surfaceOp": "append",
-        }))),
+        SessionEvent::UserMessage(m) => {
+            // source 按真实词汇序列化（web merge-extensible sum）：
+            // user 原样；注入类还原 kind/plugin/form/summary/changes/references
+            let source = match &m.source {
+                MessageSource::User => serde_json::json!({"kind": "user"}),
+                MessageSource::Context { context_kind, plugin, form, summary, changes_paths, reference_labels, name } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("kind".into(), serde_json::json!(context_kind));
+                    if let Some(p) = plugin {
+                        o.insert("plugin".into(), serde_json::json!(p));
+                    }
+                    if let Some(f) = form {
+                        o.insert("form".into(), serde_json::json!(f));
+                    }
+                    if let Some(x) = summary {
+                        o.insert("summary".into(), serde_json::json!(x));
+                    }
+                    if !changes_paths.is_empty() {
+                        o.insert(
+                            "changes".into(),
+                            serde_json::Value::Array(
+                                changes_paths.iter().map(|p| serde_json::json!({"action": "set", "path": p})).collect(),
+                            ),
+                        );
+                    }
+                    if !reference_labels.is_empty() {
+                        o.insert(
+                            "references".into(),
+                            serde_json::Value::Array(
+                                reference_labels.iter().map(|l| serde_json::json!({"label": l})).collect(),
+                            ),
+                        );
+                    }
+                    if let Some(n) = name {
+                        o.insert("name".into(), serde_json::json!(n));
+                    }
+                    serde_json::Value::Object(o)
+                }
+                _ => serde_json::json!({"kind": "user"}),
+            };
+            Some(row("user/message", serde_json::json!({
+                "content": blocks_to_web(&m.content),
+                "source": source,
+                "role": "user",
+                "id": m.id.0,
+                "surfaceOp": "append",
+            })))
+        }
         SessionEvent::AssistantMessage { turn, step, message, .. } => Some(row("assistant/message", serde_json::json!({
             "turn": turn, "step": step,
             "message": {"role": "assistant", "content": blocks_to_web(&message.content)},
@@ -579,6 +685,49 @@ mod tests {
         assert_eq!(row["identity"]["cwd"], "/tmp/ws");
         assert_eq!(row["rows"]["title"]["val"], "你好");
         assert_eq!(row["rows"]["title"]["ver"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn injection_sources_parse_and_round_trip() {
+        // web 注入行（agent-instructions + changes[].path）解析为
+        // MessageSource::Context 并经 zstd 往返保留
+        let line = serde_json::json!({
+            "type": "user/message",
+            "data": {
+                "id": "m1",
+                "role": "user",
+                "content": [{"type": "text", "text": "<system-reminder>…</system-reminder>"}],
+                "source": {
+                    "kind": "agent-instructions",
+                    "form": "instructions",
+                    "baseline": true,
+                    "changes": [{"action": "set", "path": "packages/AGENTS.md"}]
+                },
+                "surfaceOp": "append"
+            }
+        });
+        let ev = web_line_to_event(&line).expect("user message event");
+        let SessionEvent::UserMessage(m) = &ev else { panic!("wrong event") };
+        let MessageSource::Context { context_kind, changes_paths, form, .. } = &m.source else {
+            panic!("expected Context source, got {:?}", m.source)
+        };
+        assert_eq!(context_kind, "agent-instructions");
+        assert_eq!(changes_paths, &vec!["packages/AGENTS.md".to_string()]);
+        assert_eq!(form, &Some("instructions".to_string()));
+
+        let dir = std::env::temp_dir().join(format!("dsh-persist-ctx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = SessionRecorder::new(dir.join("sessions"));
+        let id = SessionId::new("session-ctx");
+        rec.create(&id, "/tmp/ws", "standard").unwrap();
+        rec.append(&id, "/tmp/ws", &ev).unwrap();
+        let (session, _) = rec.load(&id, Some("/tmp/ws")).unwrap();
+        let reloaded = session.entries().iter().find_map(|e| match &e.event {
+            SessionEvent::UserMessage(m) => Some(m.source.clone()),
+            _ => None,
+        });
+        assert_eq!(reloaded, Some(m.source.clone()));
         std::fs::remove_dir_all(&dir).ok();
     }
 

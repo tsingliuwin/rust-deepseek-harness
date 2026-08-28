@@ -57,8 +57,9 @@ cargo run -p dsh-agent-loop --example tools_demo
 5. **退避重试** — `ResolvedRetryPolicy` 判定/指数退避、`LlmRuntime.provider_retry_policy`、`attach_retry`（attempt 计数 + turn 清理）；
 6. **fiber/inject 注入 + 可补丁 config** — `Scope`/`Fiber`/`Plugin`/`PluginManager`，`inject` 依赖排序挂载，`Patch` 按 id 替换/插入/删除，dispose 逆序回收；
 7. **fs/shell/web 工具包 + 会话持久化** — `dsh-fs`/`dsh-shell`/`dsh-web` 注册进 `ToolRegistry`；`dsh-persist` JSONL 落盘，启动恢复最近会话，会话列表可切换/新建。
+8. **ToolRow 收尾 + hero 光晕** — 工具行折叠模型对齐 web `toolRowModel`（标题按工具/op 定名、摘要取 command/path/url、失败行摘要替换为输出首行）；fs read|write 的 path 下划线链接（剥工作区根 + `~` 缩写，点击宿主应用打开）；Inspect pill（hover 显现，点击跳轨迹 tab 并 scroll_to_item 定位）；Think/工具行运行扫光恢复；hero 空态蓝色光晕（figma 313:14109 椭圆高斯模糊预渲染资产，宽随卡缩放、中心锚卡面）；代码块 banner、亮色主题（设置外观分段 + 跟随系统）此前已落地。
 
-**下一步**（UI 收尾 + 其余能力）：工具展开卡/详情与 web 版 ToolRow 逐像素对齐（IO 卡 150px 滚动、Inspect pill）；代码块 banner（语言标签 + 复制）；hero 空态蓝色光晕；亮色主题；compaction / subagent；fs 策略与沙箱 provider、web 搜索 provider、shell 超时与 PTY 等能力细化。
+**下一步**（其余能力）：compaction / subagent；fs 策略与沙箱 provider、web 搜索 provider、shell 超时与 PTY 等能力细化；工具专属展开卡（web TerminalBlock/DiffBlock/ReadBlock/SearchBlock/WebBlock 替代通用 IO 卡）。
 
 ## 备注
 

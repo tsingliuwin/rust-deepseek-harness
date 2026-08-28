@@ -69,6 +69,8 @@ cargo run -p dsh-agent-loop --example tools_demo
 15. **web_search 工具** — DeepSeek anthropic 兼容 `/messages` + `web_search_20250305`（端点/头/请求体逐字对齐，结果块缺失即错误）；queries 1-5 合并去重、20 条上限；输出逐字对齐 `formatSearchOutput`；无 key 不注册；
 16. **shell 超时** — 前台默认 120s、每调用 `timeout_ms` 覆盖（上限 600s clamp），tokio 进程 + 三路并发读 + 超时 kill（`kill_on_drop` 兜底）；PTY 会话与参考实现一致推迟。
 
+17. **轮次过程折叠**（同步 web 0.1.2-alpha.1 的 8b09a0be52）：已完成轮次在 compact 视图（默认）下，把最终答案之前的 Think/早前回复/工具行折叠为单一控制行（计数省零、全零「已思考」、subagent 单列），点击展开整组；答案条目折叠时隐藏本步 reasoning；打开的轮次永不折叠；设置「对话视图」= `ui-chat.transcriptView`。
+
 **下一步**（可选细化）：subagent 后台运行/持久化子会话（web 的 continuation 服务）；glob 超上限的顶层轮询采样（web sampleAcrossTopLevel）；压缩的 TokenMeter 精确计价与 compaction-tool-result-pruner；PTY 会话（参考实现同样推迟）；搜索卡 paths 形态的 UI 与 glob 输出已落地，结构化元数据通道（web presentationMeta）待 dsh-tools 增设 meta 缝后切换。
 
 ## 备注

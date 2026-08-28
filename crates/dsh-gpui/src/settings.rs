@@ -7,7 +7,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{Icon, IconName, StyledExt, input::{Input, InputState}};
 
-use crate::{AppView, AppearanceMode, AddingMode, EnterBehavior, SettingsTab, PROVIDER_CATALOG, valid_route_id};
+use crate::{AppView, AppearanceMode, AddingMode, EnterBehavior, SettingsTab, TranscriptView, PROVIDER_CATALOG, valid_route_id};
 use crate::theme;
 
 /// 设置弹层（挂在根视图最上层）。
@@ -397,6 +397,25 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
         },
     );
 
+    let t_transcript = this.clone();
+    let transcript = segmented(
+        "set-transcript",
+        &[
+            ("常规", app.settings.transcript_view == TranscriptView::Normal, true),
+            ("紧凑", app.settings.transcript_view == TranscriptView::Compact, true),
+        ],
+        move |i, _, _, cx| {
+            let mode = if i == 0 { TranscriptView::Normal } else { TranscriptView::Compact };
+            t_transcript.update(cx, |v, cx| {
+                if v.settings.transcript_view != mode {
+                    v.settings.transcript_view = mode;
+                    v.persist_settings();
+                    cx.notify();
+                }
+            });
+        },
+    );
+
     div()
         .v_flex()
         .pt_2()
@@ -416,7 +435,7 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
                 .text_color(tk.text_3)
                 .child("设置保存在本地配置文件中，立即生效。"),
         )
-        // web 通用页顺序：Agent 预设 → 权限 → 语言 → 外观 → Enter 行为
+    // web 通用页顺序：Agent 预设 → 权限 → 语言 → 外观 → Enter 行为
         .child(settings_row(
             "Agent 预设",
             "对此后新建的会话生效。运行中的会话保持它开始时的预设。",
@@ -435,8 +454,9 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
             "繁忙时 Enter 键行为",
             "仅在智能体运行时生效；Shift+Enter 始终换行",
             enter,
-            true,
+            false,
         ))
+        .child(settings_row("对话视图", "已完成轮次的过程折叠显示", transcript, true))
 }
 
 /// select 形态的选项 chip（web InputBar .select：h28 r8、13/20 medium
@@ -521,7 +541,6 @@ fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, cx: 
                 }))
         }
     };
-
     div()
         .v_flex()
         .pt_2()

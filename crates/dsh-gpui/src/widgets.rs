@@ -368,6 +368,46 @@ pub(crate) fn row_sweep(elapsed_ms: u64, width: f32) -> Div {
 /// 中段以「… 其余 N 行」折叠钮开合）。
 const CARD_MAX_LINES: usize = 8;
 
+/// 轮次过程折叠控制行（web TurnProcessNodeView .root：全宽 33px、
+/// 底部 l2 分隔线、label 14/24 secondary 省略 + chevron 16 tertiary
+/// （闭→右/开→下，web 为 -90°→0° 旋转同观感）、闭合时下距 8px）。
+pub(crate) fn turn_process_control(
+    uid: u64,
+    label: &str,
+    open: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(("turn-process", uid))
+        .w_full()
+        .h(px(33.0))
+        .pb(px(8.0))
+        .flex()
+        .items_center()
+        .border_b_1()
+        .border_color(theme::t().border_l2)
+        .text_color(theme::t().text_2)
+        .cursor_pointer()
+        .when(!open, |d| d.mb(px(8.0)))
+        .on_click(on_toggle)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(14.0))
+                .line_height(px(24.0))
+                .child(label.to_string()),
+        )
+        .child(
+            Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
+                .size(px(16.0))
+                .text_color(theme::t().text_3),
+        )
+}
+
 /// 折叠行（web FoldToggle + .expand：左对齐、tertiary、hover secondary）。
 /// 点击回调由持有状态的渲染站点注入。
 pub(crate) fn fold_toggle(

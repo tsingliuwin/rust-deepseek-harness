@@ -82,6 +82,8 @@ struct ChatEntry {
     done: bool,
     /// 回合用时（TurnStarted → TurnEnded）。
     elapsed: Option<Duration>,
+    /// 所属轮次（web turn-process 折叠的分组键；0 = 首轮前的裸条目）。
+    turn: u64,
 }
 
 /// One session shown in the sidebar list.
@@ -150,11 +152,24 @@ pub(crate) enum EnterBehavior {
     Interrupt,
 }
 
+/// 已完成轮次的对话视图（web `ui-chat.transcriptView`；compact 默认）。
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) enum TranscriptView {
+    #[serde(rename = "normal")]
+    Normal,
+    #[serde(rename = "compact")]
+    #[default]
+    Compact,
+}
+
 /// 持久化到 settings.json 的用户设置。
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AppSettings {
     pub(crate) appearance: AppearanceMode,
     pub(crate) enter: EnterBehavior,
+    /// 对话视图（ui-chat.transcriptView；serde 缺省 = compact）
+    #[serde(default)]
+    pub(crate) transcript_view: TranscriptView,
     pub(crate) model: String,
     /// 用户声明的 OpenAI 兼容提供方（web 模型页「添加提供方 / 添加自定义提供方」）。
     #[serde(default)]
@@ -166,6 +181,7 @@ impl Default for AppSettings {
         Self {
             appearance: AppearanceMode::System,
             enter: EnterBehavior::Queue,
+            transcript_view: TranscriptView::Compact,
             model: "deepseek-chat".into(),
             providers: Vec::new(),
         }
@@ -546,6 +562,10 @@ fn load_user_config() -> (AppSettings, String, String, bool, String) {
             _ => AppearanceMode::System,
         };
     }
+    // 对话视图：ui-chat.transcriptView（compact 默认）
+    if let Some(v) = get(&["ui-chat", "transcriptView"]).and_then(|v| v.as_str().map(|s| s.to_string())) {
+        settings.transcript_view = if v == "normal" { TranscriptView::Normal } else { TranscriptView::Compact };
+    }
     // Enter：ui-conversation.busyEnter
     if let Some(v) = get(&["ui-conversation", "busyEnter"]).and_then(|v| v.as_str().map(|s| s.to_string())) {
         settings.enter = if v == "steer" { EnterBehavior::Interrupt } else { EnterBehavior::Queue };
@@ -692,6 +712,17 @@ fn persist_user_config(
         .into(),
     );
     mapping.insert("ui-conversation".into(), serde_yaml::Value::Mapping(conv));
+    // 对话视图：ui-chat.transcriptView
+    let mut chat = serde_yaml::Mapping::new();
+    chat.insert(
+        "transcriptView".into(),
+        match settings.transcript_view {
+            TranscriptView::Normal => "normal",
+            TranscriptView::Compact => "compact",
+        }
+        .into(),
+    );
+    mapping.insert("ui-chat".into(), serde_yaml::Value::Mapping(chat));
     // 外观：ui-theme.preference
     let mut theme = serde_yaml::Mapping::new();
     theme.insert(
@@ -937,6 +968,22 @@ struct AppView {
     selected_tool: Option<ToolDetail>,
     /// 轨迹 tab 滚动句柄（Inspect pill 跳转 scroll_to_item）
     traj_scroll: ScrollHandle,
+    /// 当前（或最近）轮次号（web turn-process 的分组键）
+    ui_turn: u64,
+    /// 仍打开的轮次（TurnStarted→TurnEnded；打开的轮次不折叠）
+    turn_open: Option<u64>,
+    /// 手动展开过的轮次（compact 默认折叠；web 的页内存 manual overrides）
+    turn_expanded: std::collections::HashSet<u64>,
+}
+
+/// 单轮折叠派生（web turn-process 节点数据的对应物）。
+#[derive(Clone, Copy)]
+struct TurnFold {
+    first_process: usize,
+    answer: usize,
+    tools: usize,
+    messages: usize,
+    subagents: usize,
 }
 
 impl AppView {
@@ -1056,6 +1103,9 @@ impl AppView {
             tab: CenterTab::Conversation,
             selected_tool: None,
             traj_scroll: ScrollHandle::new(),
+            ui_turn: 0,
+            turn_open: None,
+            turn_expanded: Default::default(),
         };
         view.rebuild_from_session();
         // 虚拟列表长度同步（构造时 rebuild 填充了 entries，列表需知道条数）
@@ -1173,8 +1223,10 @@ impl AppView {
         self.selected_tool = None;
         let session = self.agent.session();
         let session = session.lock().unwrap();
+        let mut cur_turn = 0u64;
         for entry in session.entries() {
             match &entry.event {
+                SessionEvent::TurnStart { turn } => cur_turn = *turn,
                 SessionEvent::UserMessage(m) => {
                     let text: String = m
                         .content
@@ -1190,6 +1242,7 @@ impl AppView {
                             blocks: vec![MsgBlock::Text(text)],
                             done: true,
                             elapsed: None,
+                            turn: cur_turn,
                         });
                     }
                 }
@@ -1222,6 +1275,7 @@ impl AppView {
                             blocks,
                             done: true,
                             elapsed: None,
+                            turn: cur_turn,
                         });
                     }
                 }
@@ -1240,11 +1294,13 @@ impl AppView {
                     }
                 }
                 SessionEvent::Compaction { .. } => {
-                    self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None });
+                    self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, turn: cur_turn });
                 }
                 _ => {}
             }
         }
+        self.ui_turn = cur_turn;
+        self.turn_open = None; // 回放态全部视为已关闭（可折叠判定成立）
         self.sync_chat_list(true);
     }
 
@@ -1348,6 +1404,7 @@ impl AppView {
             blocks: vec![MsgBlock::Text(text)],
             done: true,
             elapsed: None,
+            turn: self.ui_turn,
         });
         self.sync_chat_list(true);
     }
@@ -1360,6 +1417,7 @@ impl AppView {
                 blocks: Vec::new(),
                 done: false,
                 elapsed: None,
+                turn: self.ui_turn,
             });
         }
         self.entries.last_mut().unwrap()
@@ -1383,10 +1441,12 @@ impl AppView {
 
     fn push_event(&mut self, ev: AgentEvent) {
         match ev {
-            AgentEvent::TurnStarted { .. } => {
+            AgentEvent::TurnStarted { turn } => {
                 self.running = true;
                 self.turn_started_at = Some(Instant::now());
                 self.stats_turns += 1;
+                self.ui_turn = turn;
+                self.turn_open = Some(turn);
             }
             AgentEvent::TextDelta { text } => self.push_text(&text),
             AgentEvent::ReasoningDelta { text } => self.push_reasoning(&text),
@@ -1410,7 +1470,7 @@ impl AppView {
                 attach_tool_result(last, &tool_call_id.0, result.0.as_str(), is_error);
             }
             AgentEvent::AssistantMessage { .. } => {}
-            AgentEvent::TurnEnded { .. } => {
+            AgentEvent::TurnEnded { turn, .. } => {
                 self.running = false;
                 let elapsed = self.turn_started_at.map(|t| t.elapsed());
                 if let Some(e) = self.entries.last_mut() {
@@ -1418,6 +1478,9 @@ impl AppView {
                     e.elapsed = elapsed;
                 }
                 self.turn_started_at = None;
+                self.turn_open = None;
+                // 该轮折尔回到 compact 默认（web：manual overrides 保留其余轮）
+                self.turn_expanded.remove(&turn);
             }
             AgentEvent::Error { message, .. } => {
                 self.running = false;
@@ -1427,10 +1490,11 @@ impl AppView {
                     blocks: vec![MsgBlock::Text(message)],
                     done: true,
                     elapsed: None,
+                    turn: self.ui_turn,
                 });
             }
             AgentEvent::Compacted { .. } => {
-                self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None });
+                self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, turn: self.ui_turn });
             }
         }
         // 智能吸底：只有用户本来就贴在底部时才跟随滚动（web 同款行为）；
@@ -3213,8 +3277,65 @@ impl AppView {
                         let this = list_this.clone();
                         list_this
                             .read_with(cx, |v, _| {
+                                // 轮次过程折叠（web turn-process，compact 默认）：
+                                // 过程组首条目的槽位渲染控制行；闭合时其余成员
+                                // 零高隐藏；答案条目隐藏本步 reasoning 块
+                                if let Some(f) = v.turn_process_folds().get(&e.turn).copied() {
+                                    let expanded = v.turn_expanded.contains(&e.turn);
+                                    let member = e.role == Role::Assistant
+                                        && f.first_process <= ix
+                                        && ix < f.answer;
+                                    if member {
+                                        let t_ctl = this.clone();
+                                        if ix == f.first_process {
+                                            let mut labels: Vec<String> = Vec::new();
+                                            if f.tools > 0 {
+                                                labels.push(format!("{} 次工具调用", f.tools));
+                                            }
+                                            if f.messages > 0 {
+                                                labels.push(format!("{} 条消息", f.messages));
+                                            }
+                                            if f.subagents > 0 {
+                                                labels.push(format!("{} 个 subagent", f.subagents));
+                                            }
+                                            let label = if labels.is_empty() {
+                                                "已思考".to_string()
+                                            } else {
+                                                labels.join(" · ")
+                                            };
+                                            let control = widgets::turn_process_control(
+                                                ix as u64,
+                                                &label,
+                                                expanded,
+                                                move |_, _, cx| {
+                                                    t_ctl.update(cx, |v, cx| {
+                                                        if !v.turn_expanded.remove(&e.turn) {
+                                                            v.turn_expanded.insert(e.turn);
+                                                        }
+                                                        cx.notify();
+                                                    });
+                                                },
+                                            );
+                                            if expanded {
+                                                return control
+                                                    .child(v.render_entry(&e, ix, &this))
+                                                    .into_any_element();
+                                            }
+                                            return control.into_any_element();
+                                        }
+                                        if !expanded {
+                                            // 隐藏成员：零高占位（无 pb，不出 16px 缝）
+                                            return div().into_any_element();
+                                        }
+                                    }
+                                    if ix == f.answer && !expanded {
+                                        let mut answer = e.clone();
+                                        answer.blocks.retain(|b| !matches!(b, MsgBlock::Reasoning { .. }));
+                                        return v.render_entry(&answer, ix, &this).pb_4().into_any_element();
+                                    }
+                                }
                                 // gpui list 无 gap 概念：条目间距用 pb 模拟（web 列 gap 16px）
-                                v.render_entry(&e, ix, &this).pb_4()
+                                v.render_entry(&e, ix, &this).pb_4().into_any_element()
                             })
                             .into_any_element()
                     }
@@ -3389,6 +3510,68 @@ impl AppView {
             .gap(px(36.0))
             .child(tab("tab-chat", "对话", self.tab == CenterTab::Conversation, t1))
             .child(tab("tab-traj", "轨迹", self.tab == CenterTab::Trajectory, t2))
+    }
+
+    /// 轮次过程折叠派生（web turn-process Definition 语义，1:1）：
+    /// 已关闭轮 + 末条助手条目含非空文本且无工具块 → 该条目为答案边界；
+    /// 边界前的助手条目（reasoning/早前回复/工具行）构成过程组。
+    /// 错误行与 Notice（压缩检查点）独立在外，始终可见。
+    /// 仅 compact 视图参与；返回 turn -> 折叠信息。
+    fn turn_process_folds(&self) -> std::collections::HashMap<u64, TurnFold> {
+        let mut out = std::collections::HashMap::new();
+        if self.settings.transcript_view != TranscriptView::Compact {
+            return out;
+        }
+        let mut by_turn: std::collections::HashMap<u64, Vec<usize>> = Default::default();
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.role == Role::Assistant {
+                by_turn.entry(e.turn).or_default().push(i);
+            }
+        }
+        for (t, idxs) in by_turn {
+            // 打开的轮次不折叠；答案自身不算过程（<2 条 = 无过程组）
+            if self.turn_open == Some(t) || idxs.len() < 2 {
+                continue;
+            }
+            let answer = *idxs.last().unwrap();
+            let answer_entry = &self.entries[answer];
+            let has_text = answer_entry
+                .blocks
+                .iter()
+                .any(|b| matches!(b, MsgBlock::Text(x) if !x.trim().is_empty()));
+            let has_tool = answer_entry.blocks.iter().any(|b| matches!(b, MsgBlock::Tool(_)));
+            if !has_text || has_tool {
+                continue;
+            }
+            let process: Vec<usize> = idxs.iter().copied().take_while(|&i| i < answer).collect();
+            if process.is_empty() {
+                continue;
+            }
+            let (mut tools, mut subagents, mut messages) = (0usize, 0usize, 0usize);
+            for &i in &process {
+                let e = &self.entries[i];
+                let mut reply = false;
+                for b in &e.blocks {
+                    match b {
+                        // subagent 委派单独计数（web 同名规则：subagent / subagent_*）
+                        MsgBlock::Tool(tool) => {
+                            if tool.name == "subagent" || tool.name.starts_with("subagent_") {
+                                subagents += 1;
+                            } else {
+                                tools += 1;
+                            }
+                        }
+                        MsgBlock::Text(x) if !x.trim().is_empty() => reply = true,
+                        _ => {}
+                    }
+                }
+                if reply {
+                    messages += 1;
+                }
+            }
+            out.insert(t, TurnFold { first_process: process[0], answer, tools, messages, subagents });
+        }
+        out
     }
 
     /// 消息流（748px 内容列 + 16px 项间距，ChatView .column）。

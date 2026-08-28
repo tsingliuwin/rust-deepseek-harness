@@ -821,7 +821,6 @@ pub(crate) struct GrepSearch {
     pub total: usize,
     pub groups: Vec<(String, Vec<(usize, String)>)>,
 }
-
 /// 解析 `Found N matches` / `Found K of N matches` 头 + `path` + `Line N:
 /// text` 分组正文；`No matches found` → 空 groups。非 grep 文本返回 None。
 pub(crate) fn parse_grep_result(text: &str) -> Option<GrepSearch> {
@@ -855,41 +854,113 @@ pub(crate) fn parse_grep_result(text: &str) -> Option<GrepSearch> {
 }
 
 /// 文件组折叠回调（每次按组下标构造）。
+/// glob 结果的结构化还原（web globSearchMeta paths 形态；截断信息来自
+/// `… of N paths` 脚注）。
+pub(crate) struct GlobPaths {
+    pub truncated: bool,
+    pub total: usize,
+    pub paths: Vec<String>,
+}
+
+pub(crate) fn parse_glob_result(text: &str) -> Option<GlobPaths> {
+    if text.trim() == "No files found" {
+        return Some(GlobPaths { truncated: false, total: 0, paths: Vec::new() });
+    }
+    let mut paths = Vec::new();
+    let mut truncated = false;
+    let mut total = 0usize;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("(Showing ") {
+            // "(Showing K of N paths. …)"
+            truncated = true;
+            total = rest.split(" of ").nth(1)?.split(' ').next()?.parse().ok()?;
+            continue;
+        }
+        if !line.is_empty() {
+            paths.push(line.to_string());
+        }
+    }
+    if !truncated {
+        total = paths.len();
+    }
+    Some(GlobPaths { truncated, total, paths })
+}
+
+/// 搜索卡数据（web SearchBlock 的两种 kind）。
+pub(crate) enum SearchCardData<'a> {
+    Matches { search: &'a GrepSearch },
+    Paths { paths: &'a GlobPaths },
+}
+
 pub(crate) type GroupToggleFactory =
     Box<dyn Fn(usize) -> Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>;
 
-/// 搜索卡（web SearchBlock kind='matches'：banner 底头行（摘要 + 复制）+
-/// 分组正文（文件头 600 weight + 计数，可点击折叠该组；匹配行行号 tertiary
-/// 前缀），mono 13/22，8 行上限头 4 尾 4，尾片落进组内时补还文件头行）。
+/// 搜索卡（web SearchBlock 两种 kind：matches=分组匹配（文件头可折叠、
+/// 尾片组头补还），paths=扁平路径列表；banner 底摘要头 + 复制，mono 13/22，
+/// 8 行上限头 4 尾 4）。
 pub(crate) fn search_card(
     uid: u64,
-    search: &GrepSearch,
+    data: SearchCardData<'_>,
     expanded: bool,
     collapsed_groups: &[usize],
     on_fold: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + Clone,
     on_group: GroupToggleFactory,
 ) -> Div {
-    let groups = &search.groups;
-    let total = search.total;
-    let truncated = search.truncated;
-    let shown: usize = groups.iter().map(|(_, m)| m.len()).sum();
-    let summary = if truncated {
-        format!("显示 {shown} / 共 {total} 处匹配 · {} 个文件", groups.len())
-    } else {
-        format!("{shown} 处匹配 · {} 个文件", groups.len())
-    };
-    let copy_text = {
-        let mut s = String::new();
-        for (i, (path, matches)) in groups.iter().enumerate() {
-            if i > 0 {
-                s.push_str("\n\n");
+    // 形态相关：摘要文案、复制文本、扁平行序
+    enum SRow {
+        File(usize),
+        Match(usize, usize, String),
+        Path(String),
+    }
+    let (summary, copy_text, rows, empty): (String, String, Vec<SRow>, bool) = match &data {
+        SearchCardData::Matches { search } => {
+            let groups = &search.groups;
+            let shown: usize = groups.iter().map(|(_, m)| m.len()).sum();
+            let summary = if search.truncated {
+                format!("显示 {shown} / 共 {} 处匹配 · {} 个文件", search.total, groups.len())
+            } else {
+                format!("{shown} 处匹配 · {} 个文件", groups.len())
+            };
+            let mut copy = String::new();
+            let mut rows = Vec::new();
+            for (gi, (_, matches)) in groups.iter().enumerate() {
+                let collapsed = collapsed_groups.contains(&gi);
+                rows.push(SRow::File(gi));
+                if collapsed {
+                    continue;
+                }
+                for (n, line) in matches {
+                    rows.push(SRow::Match(gi, *n, line.clone()));
+                }
             }
-            s.push_str(path);
-            for (n, line) in matches {
-                s.push_str(&format!("\n{n}: {line}"));
+            for (i, (path, matches)) in groups.iter().enumerate() {
+                if i > 0 {
+                    copy.push_str("\n\n");
+                }
+                copy.push_str(path);
+                for (n, line) in matches {
+                    copy.push_str(&format!("\n{n}: {line}"));
+                }
             }
+            let empty = rows.is_empty();
+            (summary, copy, rows, empty)
         }
-        s
+        SearchCardData::Paths { paths } => {
+            let shown = paths.paths.len();
+            let summary = if paths.truncated {
+                format!("显示 {shown} / 共 {} 个路径", paths.total)
+            } else {
+                format!("{shown} 个路径")
+            };
+            let copy = paths.paths.join("\n");
+            let rows = paths.paths.iter().map(|p| SRow::Path(p.clone())).collect();
+            let empty = paths.paths.is_empty();
+            (summary, copy, rows, empty)
+        }
+    };
+    let shown = match &data {
+        SearchCardData::Matches { search } => search.groups.iter().map(|(_, m)| m.len()).sum(),
+        SearchCardData::Paths { paths } => paths.paths.len(),
     };
     let mut header = div()
         .flex()
@@ -926,22 +997,6 @@ pub(crate) fn search_card(
                 .child("复制"),
         );
     }
-    // 扁平行序：File(gi) 头 + 组内 Match 行（折叠组只留头）
-    enum SRow {
-        File(usize),
-        Match(usize, usize, String),
-    }
-    let mut rows: Vec<SRow> = Vec::new();
-    for (gi, (_, matches)) in groups.iter().enumerate() {
-        let collapsed = collapsed_groups.contains(&gi);
-        rows.push(SRow::File(gi));
-        if collapsed {
-            continue;
-        }
-        for (n, line) in matches {
-            rows.push(SRow::Match(gi, *n, line.clone()));
-        }
-    }
     let total_rows = rows.len();
     let hidden = total_rows.saturating_sub(CARD_MAX_LINES);
     let capped = hidden > 0 && !expanded;
@@ -951,10 +1006,15 @@ pub(crate) fn search_card(
     } else {
         (total_rows, 0..0)
     };
+    let groups_ref: Option<&Vec<(String, Vec<(usize, String)>)>> = match &data {
+        SearchCardData::Matches { search } => Some(&search.groups),
+        SearchCardData::Paths { .. } => None,
+    };
     let render_row = |row: &SRow, on_group: &GroupToggleFactory| -> AnyElement {
         match row {
             SRow::File(gi) => {
-                let (path, matches) = &groups[*gi];
+                let Some(groups) = groups_ref else { return div().into_any_element() };
+                let Some((path, matches)) = groups.get(*gi) else { return div().into_any_element() };
                 let count = matches.len();
                 div()
                     .id(SharedString::from(format!("search-g-{uid}-{gi}")))
@@ -1005,6 +1065,13 @@ pub(crate) fn search_card(
                 )
                 .child(div().min_w_0().text_color(theme::t().text).child(line.clone()))
                 .into_any_element(),
+            SRow::Path(path) => div()
+                .min_h(px(22.0))
+                .whitespace_nowrap()
+                .pl(px(14.0))
+                .text_color(theme::t().text)
+                .child(path.clone())
+                .into_any_element(),
         }
     };
     let mut body = div()
@@ -1049,7 +1116,7 @@ pub(crate) fn search_card(
         .rounded(px(12.0))
         .bg(theme::t().code_bg)
         .child(header)
-        .when(shown == 0, |card| {
+        .when(empty, |card| {
             card.child(
                 div()
                     .px(px(14.0))
@@ -1061,11 +1128,12 @@ pub(crate) fn search_card(
                     .child("未找到结果"),
             )
         })
-        .when(shown > 0, |card| card.child(body))
+        .when(!empty, |card| card.child(body))
 }
 
 /// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
-pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {    let mut card = div()
+pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {
+    let mut card = div()
         .ml_1()
         .mt_1()
         .mb_1()
@@ -1175,6 +1243,11 @@ pub(crate) fn tool_row_texts(name: &str, args: &str) -> (String, String, Option<
             None,
         ),
         "grep" => (
+            "搜索".into(),
+            pick(&["pattern"]).unwrap_or_else(|| first_line(args)),
+            None,
+        ),
+        "glob" => (
             "搜索".into(),
             pick(&["pattern"]).unwrap_or_else(|| first_line(args)),
             None,

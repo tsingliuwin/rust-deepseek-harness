@@ -22,6 +22,14 @@ pub const GREP_MAX_MATCHES: usize = 250;
 /// 截断，UTF-8 边界天然安全）。
 const GREP_MAX_LINE_CHARS: usize = 2000;
 
+/// glob 工具内联保留的路径上限（web GLOB_MAX_RESULTS，同 Claude Code
+/// GlobTool 的结果上限）。
+pub const GLOB_MAX_RESULTS: usize = 100;
+
+/// 目录发现列表永不进入的 VCS 元数据目录（web GLOB_VCS_EXCLUDES）：
+/// glob 用 --no-ignore --hidden 语义，不排除会每次都翻出这些目录。
+const GLOB_VCS_EXCLUDES: [&str; 6] = [".git", ".svn", ".hg", ".bzr", ".jj", ".sl"];
+
 /// 单文件读取上限（字节）；超出按二进制跳过。ripgrep 默认无大小上限，
 /// 这里加一道护栏防止超大文件拖垮进程内搜索。
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -238,6 +246,126 @@ fn shell_expand(p: &str) -> String {
     p.to_string()
 }
 
+/// 模型面向的 `glob` 工具：按路径模式发现文件，修改时间升序（web
+/// `rg --files --glob --sort=modified --no-ignore --hidden` 语义——包含
+/// 隐藏与被忽略文件、剔除 VCS 元数据目录、只返回文件从不返回目录）。
+/// 无分隔符的模式按任意深度的 basename 匹配（web 模式描述）。
+pub struct GlobTool;
+
+impl GlobTool {
+    /// 路径页格式（web formatGlobPage 的不可保存恢复分支）：正文 + 截断脚注。
+    fn format_page(items: &[String], seen: usize) -> String {
+        let body = items.join("\n");
+        format!(
+            "{body}\n\n(Showing {} of {seen} paths. The complete result could not be saved; narrow pattern or path to see more.)",
+            items.len()
+        )
+    }
+
+    /// web renderGlobPaths 的平头分支（sampleOverCapGlobResults 关闭态：
+    /// 截断保留修改时间序头部）。
+    fn format_output(paths: &[String]) -> String {
+        if paths.is_empty() {
+            return "No files found".into();
+        }
+        if paths.len() <= GLOB_MAX_RESULTS {
+            return paths.join("\n");
+        }
+        Self::format_page(&paths[..GLOB_MAX_RESULTS], paths.len())
+    }
+}
+
+#[async_trait]
+impl Tool for GlobTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "glob".into(),
+            description: "Find files whose paths match a glob pattern. Returns matching file paths — never directories — \
+including hidden and ignored files (VCS metadata directories are excluded), in modification-time order. \
+Up to 100 paths come back inline; a larger result returns the first 100 in modification-time order and says so. \
+This tool does not enumerate directory entries."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob pattern to match file paths against (e.g. \"**/*.rs\", \"src/**/*.test.js\"). A pattern with no \"/\" matches the basename at any depth, so \"*\" and \"*.rs\" both search the whole tree; include a separator to anchor the depth." },
+                    "path": { "type": "string", "description": "Directory to search in. Defaults to the session workspace; a relative path resolves against it." }
+                },
+                "required": ["pattern"]
+            }),
+        }
+    }
+
+    async fn execute(&self, input: &ToolExecutionInput) -> ToolExecutionResult {
+        let pattern = input.arguments.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path = input.arguments.get("path").and_then(|v| v.as_str()).map(str::to_string);
+        tokio::task::spawn_blocking(move || run_glob(&pattern, path))
+            .await
+            .unwrap_or_else(|e| ToolExecutionResult::error(format!("glob failed: {e}")))
+    }
+}
+
+/// glob 执行：ignore walk 关闭全部忽略规则（--no-ignore --hidden）、
+/// 剪除 VCS 目录、glob 匹配、修改时间升序、100 条内联上限。
+fn run_glob(pattern: &str, path: Option<String>) -> ToolExecutionResult {
+    if pattern.trim().is_empty() {
+        return ToolExecutionResult::error("pattern must be a non-empty string");
+    }
+    let glob = match globset::Glob::new(pattern) {
+        Ok(g) => g.compile_matcher(),
+        Err(e) => return ToolExecutionResult::error(format!("invalid pattern: {e}")),
+    };
+    let root: PathBuf = match &path {
+        Some(p) => PathBuf::from(shell_expand(p)),
+        None => match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(e) => return ToolExecutionResult::error(format!("glob failed: {e}")),
+        },
+    };
+    if !root.is_dir() {
+        return ToolExecutionResult::error(format!("glob failed: not a directory: {}", root.display()));
+    }
+    // basename 匹配（模式无分隔符）：任意深度按文件名匹配（web 模式语义）
+    let by_basename = !pattern.contains('/');
+    let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let walker = ignore::WalkBuilder::new(&root)
+        .hidden(true)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .filter_entry(|entry| {
+            // 剪除 VCS 元数据目录（web --glob=!**/.git 等）
+            !(entry.depth() > 0 && GLOB_VCS_EXCLUDES.iter().any(|v| entry.file_name() == *v))
+        })
+        .build();
+    for entry in walker.flatten() {
+        let file = entry.path();
+        if !file.is_file() {
+            continue;
+        }
+        let display = file.strip_prefix(&root).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let hit = if by_basename {
+            file.file_name().is_some_and(|n| glob.is_match(n.to_string_lossy().as_ref()))
+        } else {
+            glob.is_match(&display)
+        };
+        if !hit {
+            continue;
+        }
+        let mtime = file
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        found.push((mtime, display));
+    }
+    // rg --sort=modified：修改时间升序（稳定排序保同刻路径序）
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let paths: Vec<String> = found.into_iter().map(|(_, p)| p).collect();
+    ToolExecutionResult::text(GlobTool::format_output(&paths))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,8 +398,7 @@ mod tests {
 
     /// 端到端：临时目录 + gitignore 语义 + include 过滤 + 行号与分组输出。
     #[tokio::test]
-    async fn greps_workspace_end_to_end() {
-        let dir = std::env::temp_dir().join(format!("dsh-search-test-{}", std::process::id()));
+    async fn greps_workspace_end_to_end() {        let dir = std::env::temp_dir().join(format!("dsh-search-test-{}", std::process::id()));
         let src = dir.join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("a.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
@@ -289,13 +416,10 @@ mod tests {
         let input = dsh_tools::ToolExecutionInput::with_raw_arguments(
             dsh_llm::CallId("test".into()),
             "grep".into(),
-            r#"{"pattern": "alpha"}"#.into(),
+            // 显式传 path（进程级 cwd 在并行测试里不可依赖）
+            format!(r#"{{"pattern": "alpha", "path": {}}}"#, serde_json::to_string(&dir).unwrap()).into(),
         );
-        // chdir 到临时目录，让默认根 = 工作区
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
         let result = GrepTool.execute(&input).await;
-        std::env::set_current_dir(prev).unwrap();
         let ToolExecutionResult { content, is_error, .. } = &result;
         assert!(!is_error, "{result:?}");
         let text = content
@@ -311,6 +435,59 @@ mod tests {
         assert!(!text.contains(".hidden"), "{text}");
         assert!(text.contains("src/a.rs\nLine 1: fn alpha() {}"), "{text}");
         assert!(text.contains("src/b.txt\nLine 1: alpha here"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端：glob 发现文件（含被忽略/隐藏文件）、剔除 VCS 目录与子目录、
+    /// basename 模式任意深度匹配、截断脚注。
+    #[tokio::test]
+    async fn globs_workspace_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("dsh-glob-test-{}", std::process::id()));
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(src.join("nested.rs"), "fn n() {}\n").unwrap();
+        std::fs::write(dir.join("top.txt"), "t\n").unwrap();
+        std::fs::write(dir.join("skipped.rs"), "s\n").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/config"), "x\n").unwrap();
+
+        let run = |raw: String| async move {
+            let input = dsh_tools::ToolExecutionInput::with_raw_arguments(
+                dsh_llm::CallId("t".into()),
+                "glob".into(),
+                raw,
+            );
+            GlobTool.execute(&input).await
+        };
+        // basename 模式：*.rs 命中任意深度，剔除 .git 内文件；skipped.rs 在根上
+        let result = run(format!(r#"{{"pattern": "*.rs", "path": {}}}"#, serde_json::to_string(&dir).unwrap())).await;
+        let ToolExecutionResult { content, is_error, .. } = &result;
+        assert!(!is_error, "{result:?}");
+        let text = content
+            .iter()
+            .find_map(|b| match b {
+                dsh_llm::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains("src/a.rs"), "{text}");
+        assert!(text.contains("src/nested.rs"), "{text}");
+        assert!(text.contains("skipped.rs"), "{text}");
+        assert!(!text.contains(".git"), "{text}");
+        // include 分隔符模式锚定深度：src/ 下全部文件
+        let result = run(format!(r#"{{"pattern": "src/*", "path": {}}}"#, serde_json::to_string(&dir).unwrap())).await;
+        let ToolExecutionResult { content, is_error, .. } = &result;
+        assert!(!is_error, "{result:?}");
+        let text = content
+            .iter()
+            .find_map(|b| match b {
+                dsh_llm::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains("src/a.rs") && text.contains("src/nested.rs"), "{text}");
+        assert!(!text.contains("top.txt"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

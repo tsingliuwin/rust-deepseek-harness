@@ -1973,7 +1973,7 @@ impl AppView {
                                     };
                                     widgets::search_card(
                                         uid,
-                                        &search,
+                                        widgets::SearchCardData::Matches { search: &search },
                                         tool.expanded,
                                         &tool.collapsed_groups,
                                         move |_, _, cx| {
@@ -1987,6 +1987,38 @@ impl AppView {
                                             });
                                         },
                                         Box::new(mk_group),
+                                    )
+                                    .into_any_element()
+                                }
+                                None => widgets::io_card(
+                                    uid,
+                                    &pretty_args,
+                                    tool.result.as_deref(),
+                                    tool.error,
+                                )
+                                .into_any_element(),
+                            }
+                        }
+                        "glob" if !tool.error && tool.result.is_some() => {
+                            match widgets::parse_glob_result(tool.result.as_deref().unwrap_or("")) {
+                                Some(paths) => {
+                                    let t_fold = this.clone();
+                                    widgets::search_card(
+                                        uid,
+                                        widgets::SearchCardData::Paths { paths: &paths },
+                                        tool.expanded,
+                                        &tool.collapsed_groups,
+                                        move |_, _, cx| {
+                                            t_fold.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    tool.expanded = !tool.expanded;
+                                                }
+                                                cx.notify();
+                                            });
+                                        },
+                                        Box::new(|_| Box::new(|_, _, _| {})),
                                     )
                                     .into_any_element()
                                 }
@@ -3926,11 +3958,17 @@ fn main() {
     let _shell = tools.register(Arc::new(ShellTool)).unwrap();
     let _web = tools.register(Arc::new(WebTool::new())).unwrap();
     let _grep = tools.register(Arc::new(dsh_search::GrepTool)).unwrap();
+    let _glob = tools.register(Arc::new(dsh_search::GlobTool)).unwrap();
     let prompt = Arc::new(SystemPrompt::new());
     // web tool:grep section：引导模型用 grep 工具而非 shell grep
     let _grep_section = prompt.add_section(dsh_system_prompt::PromptSection {
         name: "tool:grep".into(),
         text: "Use the grep tool — not shell grep or rg — to search file contents. Use read on a matched file when you need surrounding context.".into(),
+    });
+    // web tool:glob section：引导用 glob 工具而非 shell find
+    let _glob_section = prompt.add_section(dsh_system_prompt::PromptSection {
+        name: "tool:glob".into(),
+        text: "Use the glob tool — not shell find — to discover files by path pattern. A pattern with no \"/\" matches basenames at any depth, so \"*\" matches every file in the tree rather than its top level. Results are files only, never directories, and include hidden and ignored files: a result that fits comes back in modification-time order, while a larger one keeps the modification-time-ordered head.".into(),
     });
     let demo_prompt = std::env::var("DSH_PROMPT").ok().filter(|s| !s.trim().is_empty());
 

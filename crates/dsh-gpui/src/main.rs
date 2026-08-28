@@ -260,6 +260,30 @@ pub(crate) struct WorkspaceInfo {
     pub(crate) session_ids: Vec<String>,
 }
 
+/// 当前时刻的 UTC RFC3339（毫秒，web createdAt/updatedAt 的同一形制）。
+pub(crate) fn iso8601_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let millis = now.subsec_millis();
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, m, sec) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // civil-from-days（Howard Hinnant 算法）
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{sec:02}.{millis:03}Z")
+}
+
 /// 读写 ~/.dsh/storages/workspace.json（与 web 共享同一份文档）。
 /// 只动 `workspaceIds`（顺序）与 `tables.workspaces`，其余原样。
 pub(crate) fn load_workspaces() -> Vec<WorkspaceInfo> {
@@ -313,16 +337,31 @@ pub(crate) fn save_workspaces(workspaces: &[WorkspaceInfo]) {
             o.insert("workspaceIds".into(), serde_json::Value::Array(ids));
         });
     }
+    // web 写的工作区行带 createdAt/updatedAt：写回时原样保留（新工作区
+    // 用当前时刻补齐），否则每次 rust 保存都会抹掉 web 的元数据
+    let old_table: serde_json::Map<String, serde_json::Value> = doc
+        .get("tables")
+        .and_then(|tt| tt.get("workspaces"))
+        .and_then(|w| w.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let now = iso8601_now();
     let mut table = serde_json::Map::new();
     for w in workspaces {
-        table.insert(
-            w.id.clone(),
-            serde_json::json!({
-                "path": w.path,
-                "title": w.title,
-                "sessionIds": w.session_ids,
-            }),
-        );
+        let prev = old_table.get(&w.id).cloned().unwrap_or(serde_json::json!({}));
+        let mut row = serde_json::Map::new();
+        for (k, v) in prev.as_object().map(|o| o.iter()).into_iter().flatten() {
+            if k != "path" && k != "title" && k != "sessionIds" {
+                row.insert(k.clone(), v.clone());
+            }
+        }
+        row.entry("createdAt".to_string())
+            .or_insert_with(|| serde_json::json!(now));
+        row.insert("updatedAt".to_string(), serde_json::json!(now));
+        row.insert("path".into(), serde_json::json!(w.path));
+        row.insert("title".into(), serde_json::json!(w.title));
+        row.insert("sessionIds".into(), serde_json::json!(w.session_ids));
+        table.insert(w.id.clone(), serde_json::Value::Object(row));
     }
     if let Some(tt) = doc.get_mut("tables") {
         tt.as_object_mut().map(|o| {
@@ -1298,6 +1337,11 @@ impl AppView {
             && !text.is_empty()
         {
             meta.title = text.chars().take(30).collect();
+            // 标题落盘（web session/title 事件 + session_projcache 投影行），
+            // 否则 web 端看到的本会话永远无标题
+            let title = meta.title.clone();
+            let cwd = self.current_cwd.clone();
+            let _ = self.recorder.append(&current, &cwd, &SessionEvent::SessionTitle { title });
         }
         self.entries.push(ChatEntry {
             role: Role::User,

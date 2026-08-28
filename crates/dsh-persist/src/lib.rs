@@ -93,7 +93,61 @@ impl SessionRecorder {
         });
         let mut buf = Vec::new();
         writeln!(buf, "{}", header)?;
-        self.write_compressed(&file, &buf)
+        self.write_compressed(&file, &buf)?;
+        // projcache 身份行：web 侧栏冷启动先读投影（identity 足够定位）
+        self.touch_projcache(id, cwd, 0, None);
+        Ok(())
+    }
+
+    fn projcache_path(&self) -> PathBuf {
+        self.root
+            .parent()
+            .unwrap_or(&self.root)
+            .join("storages")
+            .join("session_projcache.json")
+    }
+
+    /// 把会话投影写入 `storages/session_projcache.json`（web 是该文档的
+    /// 另一个写者：读-改-写合并，只动 `tables.sessions.<id>` 的 identity
+    /// 与 rows.title）。`title = None` 只建/保 identity（web SessionTitle
+    /// 投影行形：`rows.title = {ver:1, seq, val}`，latest-wins）。
+    pub fn touch_projcache(&self, id: &SessionId, cwd: &str, seq: u64, title: Option<&str>) {
+        let path = self.projcache_path();
+        let mut doc: serde_json::Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "unit": {"name": "session_projcache", "version": 3},
+                    "global": null,
+                    "tables": {"sessions": {}}
+                })
+            });
+        let Some(tables) = doc.get_mut("tables").and_then(|t| t.as_object_mut()) else { return };
+        let sessions = tables.entry("sessions".to_string()).or_insert_with(|| serde_json::json!({}));
+        let Some(sessions) = sessions.as_object_mut() else { return };
+        let row = sessions.entry(id.as_str().to_string()).or_insert_with(|| serde_json::json!({}));
+        let Some(row) = row.as_object_mut() else { return };
+        let identity = row.entry("identity".to_string()).or_insert_with(|| {
+            serde_json::json!({"createdAt": now_ms(), "cwd": cwd})
+        });
+        if let Some(obj) = identity.as_object_mut() {
+            // cwd 以最近一次写入为准（会话可跨工作区移动）
+            obj.insert("cwd".into(), serde_json::json!(cwd));
+        }
+        if let Some(title) = title {
+            let rows = row.entry("rows".to_string()).or_insert_with(|| serde_json::json!({}));
+            if let Some(rows) = rows.as_object_mut() {
+                rows.insert(
+                    "title".into(),
+                    serde_json::json!({"ver": 1, "seq": seq, "val": title}),
+                );
+            }
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&doc) {
+            let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+            let _ = std::fs::write(&path, text);
+        }
     }
 
     /// 追加一个事件（web 信封行；读-改-写整文件压缩）。
@@ -106,6 +160,9 @@ impl SessionRecorder {
             lines = self.read_lines(&file).0;
         }
         let seq = last_seq + 1;
+        if let SessionEvent::SessionTitle { title } = event {
+            self.touch_projcache(id, cwd, seq, Some(title));
+        }
         let row = event_to_web_line(event, seq, now_ms());
         let mut buf = String::new();
         for l in &lines {
@@ -431,6 +488,14 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
         // 我们自己的压缩/步末事件（step/end 落盘保证 seq 1:1 对齐，
         // 压缩的 beforeSeq 依赖它；web 端按未知类型忽略）
         "step/end" => Some(SessionEvent::StepEnd { turn: num(data, "turn"), step: num(data, "step") }),
+        // 会话标题（web SessionTitleEventData；只取 title，latest-wins）
+        "session/title" => Some(SessionEvent::SessionTitle {
+            title: data?
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
         "compaction/summary" => Some(SessionEvent::Compaction {
             before_seq: num(data, "beforeSeq"),
             summary: data?.get("summary").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -482,6 +547,54 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         SessionEvent::Compaction { before_seq, summary } => {
             Some(row("compaction/summary", serde_json::json!({"beforeSeq": before_seq, "summary": summary})))
         }
+        SessionEvent::SessionTitle { title } => Some(row(
+            "session/title",
+            serde_json::json!({"title": title, "messageSeqs": [], "source": {"kind": "fallback"}}),
+        )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn title_round_trips_to_web_artifacts() {
+        let dir = std::env::temp_dir().join(format!("dsh-persist-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = SessionRecorder::new(dir.join("sessions"));
+        let id = SessionId::new("session-test");
+        rec.create(&id, "/tmp/ws", "standard").unwrap();
+        rec.append(&id, "/tmp/ws", &SessionEvent::SessionTitle { title: "你好".into() }).unwrap();
+
+        // 事件可读回（web session/title 行）
+        assert_eq!(rec.title_of(&id, "/tmp/ws"), Some("你好".into()));
+        // projcache 投影行落盘（web 侧栏冷启动来源）
+        let pc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("storages").join("session_projcache.json")).unwrap(),
+        ).unwrap();
+        let row = &pc["tables"]["sessions"]["session-test"];
+        assert_eq!(row["identity"]["cwd"], "/tmp/ws");
+        assert_eq!(row["rows"]["title"]["val"], "你好");
+        assert_eq!(row["rows"]["title"]["ver"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn list_scans_all_project_buckets() {
+        let dir = std::env::temp_dir().join(format!("dsh-persist-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = SessionRecorder::new(dir.join("sessions"));
+        let a = SessionId::new("session-a");
+        let b = SessionId::new("session-b");
+        rec.create(&a, "/tmp/ws-a", "standard").unwrap();
+        rec.create(&b, "/tmp/ws-b", "standard").unwrap();
+        let list = rec.list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|e| e.id == a && e.cwd.as_deref() == Some("/tmp/ws-a")));
+        assert!(list.iter().any(|e| e.id == b && e.cwd.as_deref() == Some("/tmp/ws-b")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

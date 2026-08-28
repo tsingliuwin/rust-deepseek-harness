@@ -91,6 +91,9 @@ pub enum SessionEvent {
         before_seq: u64,
         summary: String,
     },
+    /// 会话标题（log-only，latest-wins；不进模型可见面）。
+    /// web SessionTitleEventData 的 title 部分（messageSeqs/source 不落盘）。
+    SessionTitle { title: String },
 }
 
 /// A log entry: the event plus its monotonic sequence number.

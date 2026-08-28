@@ -29,6 +29,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{
     text::{TextView, TextViewStyle},
+    tooltip::Tooltip,
     Icon, IconName, Root, StyledExt,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -152,7 +153,46 @@ impl RenderOnce for MarkdownBlock {
             .rounded(px(12.0))
             .p(px(16.0));
         style.is_dark = true;
-        TextView::markdown(self.id, self.text, window, cx).style(style)
+        TextView::markdown(self.id, self.text, window, cx)
+            .style(style)
+            .code_block_actions(|code, _window, _cx| {
+                // 语言 + 复制 浮标（web CodeBlock .banner 的浮层形态）
+                let lang = code.lang().unwrap_or_else(|| "text".into());
+                let text = code.code();
+                let mut hasher = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(&text, &mut hasher);
+                let copy_id: SharedString = format!("md-copy-{:x}", std::hash::Hasher::finish(&hasher)).into();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(14.0))
+                            .font_family(theme_mono())
+                            .text_color(theme::CAPTION)
+                            .child(lang),
+                    )
+                    .child(
+                        div()
+                            .id(copy_id)
+                            .size(px(20.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .text_color(theme::TEXT_3)
+                            .hover(|s| s.text_color(theme::TEXT).bg(theme::HOVER))
+                            .tooltip(tip("复制代码"))
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
+                            })
+                            .child(Icon::new(IconName::Copy).size(px(12.0))),
+                    )
+                    .into_any_element()
+            })
     }
 }
 
@@ -162,11 +202,11 @@ enum DragSide {
     Details,
 }
 
+/// 列宽拖拽载荷（借鉴 Zed redistributable_columns 的 on_drag/on_drag_move
+/// 模式：拖起后由整窗 on_drag_move 跟手，指针越出把手也不丢事件）。
 #[derive(Clone, Copy)]
-struct DragState {
+struct ColumnDrag {
     side: DragSide,
-    start_x: f32,
-    start_width: f32,
 }
 
 // --- 根视图 ------------------------------------------------------------------
@@ -196,7 +236,8 @@ struct AppView {
     details_open: bool,
     details_width: f32,
     viewport: f32,
-    drag: Option<DragState>,
+    // 消息流吸底（贴底才自动滚动，偏离则给「回到底部」）
+    chat_sticky: bool,
     // 会话运行态
     running: bool,
     turn_started_at: Option<Instant>,
@@ -247,7 +288,7 @@ impl AppView {
             details_open: true,
             details_width: DETAILS_DEFAULT,
             viewport: 1280.0,
-            drag: None,
+            chat_sticky: true,
             running: false,
             turn_started_at: None,
             stats_turns: 0,
@@ -344,6 +385,7 @@ impl AppView {
             self.stats_turns = 0;
             self.stats_tools = 0;
             self.tab = CenterTab::Conversation;
+            self.chat_scroll.scroll_to_bottom();
             cx.notify();
         }
     }
@@ -359,8 +401,14 @@ impl AppView {
         self.stats_turns = 0;
         self.stats_tools = 0;
         self.tab = CenterTab::Conversation;
+        self.chat_scroll.scroll_to_bottom();
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into() });
         cx.notify();
+    }
+
+    /// 消息流当前是否贴底（offset 向下滚动趋于 -max，阈值 40px）。
+    fn chat_near_bottom(&self) -> bool {
+        self.chat_scroll.offset().y <= -self.chat_scroll.max_offset().height + px(40.0)
     }
 
     fn current_session_id(&self) -> SessionId {
@@ -465,7 +513,11 @@ impl AppView {
                 });
             }
         }
-        self.chat_scroll.scroll_to_bottom();
+        // 智能吸底：只有用户本来就贴在底部时才跟随滚动（web 同款行为）；
+        // 用户上翻阅读时不再被流式输出拽走。
+        if self.chat_near_bottom() {
+            self.chat_scroll.scroll_to_bottom();
+        }
     }
 
     /// 从会话日志回读指定工具调用的最新结果文本。
@@ -641,6 +693,7 @@ impl AppView {
                     );
                 if open {
                     row = row.child(io_card(
+                        (ei * 1000 + bi) as u64,
                         &tool.arguments,
                         tool.result.as_deref(),
                         tool.error,
@@ -695,6 +748,7 @@ impl AppView {
                             .cursor_pointer()
                             .text_color(theme::CAPTION)
                             .hover(|s| s.text_color(theme::TEXT_2).bg(theme::HOVER))
+                            .tooltip(tip("复制"))
                             .on_click(move |_, _, cx| {
                                 let text = text.clone();
                                 t.update(cx, |_, cx| {
@@ -881,6 +935,7 @@ impl Render for AppView {
         let has_text = !self.input.read_with(cx, |s, _| s.value().trim().is_empty());
 
         let this = cx.entity();
+        let drag_target = this.clone();
 
         let mut root = div()
             .size_full()
@@ -888,13 +943,36 @@ impl Render for AppView {
             .relative()
             .bg(theme::BG_BASE)
             .text_color(theme::TEXT)
+            // Zed redistributable_columns 模式：拖拽期间 move 事件全窗捕获，
+            // 指针越过 8px 把手也照常跟手（捕获阶段，一处分发）。
+            .on_drag_move::<ColumnDrag>(move |ev, window, cx| {
+                let side = ev.drag(cx).side;
+                let x: f32 = ev.event.position.x.into();
+                let vw: f32 = window.viewport_size().width.into();
+                drag_target.update(cx, |v, cx| match side {
+                    DragSide::Sidebar => {
+                        let w = x.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                        if (w - v.sidebar_width).abs() > 0.5 {
+                            v.sidebar_width = w;
+                            cx.notify();
+                        }
+                    }
+                    DragSide::Details => {
+                        let w = (vw - x).clamp(DETAILS_MIN, DETAILS_MAX);
+                        if (w - v.details_width).abs() > 0.5 {
+                            v.details_width = w;
+                            cx.notify();
+                        }
+                    }
+                });
+            })
             .child(self.render_sidebar(collapsed, sw, this.clone()));
         if !collapsed {
-            root = root.child(drag_handle(DragSide::Sidebar, this.clone()));
+            root = root.child(drag_handle(DragSide::Sidebar));
         }
         root = root.child(self.render_center(cw, this.clone(), has_text));
         if dw > 0.0 {
-            root = root.child(drag_handle(DragSide::Details, this.clone()));
+            root = root.child(drag_handle(DragSide::Details));
             root = root.child(self.render_details(dw, this.clone()));
         }
         if self.settings_open {
@@ -1024,18 +1102,18 @@ impl AppView {
                 .pb_1p5()
                 .gap_3()
                 .child(
-                    rail_icon("sb-expand", IconName::PanelLeftOpen, move |_, _, cx| {
+                    rail_icon("sb-expand", IconName::PanelLeftOpen, "展开侧边栏", move |_, _, cx| {
                         t_expand.update(cx, |v, cx| { v.sidebar_collapsed = false; cx.notify(); });
                     }),
                 )
                 .child(
-                    rail_icon("sb-new", IconName::Plus, move |_, _, cx| {
+                    rail_icon("sb-new", IconName::Plus, "新建会话", move |_, _, cx| {
                         t_new.update(cx, |v, cx| { v.new_session(cx); });
                     }),
                 )
                 .child(div().flex_grow())
                 .child(
-                    rail_icon("sb-settings", IconName::Settings, move |_, _, cx| {
+                    rail_icon("sb-settings", IconName::Settings, "设置", move |_, _, cx| {
                         t_settings.update(cx, |v, cx| { v.settings_open = true; cx.notify(); });
                     }),
                 );
@@ -1093,7 +1171,7 @@ impl AppView {
                                 ),
                         )
                         .child(
-                            icon_btn("sb-collapse", IconName::PanelLeftClose, theme::TEXT_2, move |_, _, cx| {
+                            icon_btn("sb-collapse", IconName::PanelLeftClose, theme::TEXT_2, "收起侧边栏", move |_, _, cx| {
                                 t_collapse.update(cx, |v, cx| { v.sidebar_collapsed = true; cx.notify(); });
                             }),
                         ),
@@ -1228,17 +1306,53 @@ impl AppView {
                 CenterTab::Conversation => self.render_chat(&this),
                 CenterTab::Trajectory => self.render_trajectory(&this),
             };
+            let show_jump = !self.chat_near_bottom();
+            let t_jump = this.clone();
             center = center
                 .child(
+                    // 相对定位包裹层承载「回到底部」浮钮（web ChatView .toBottom）
                     div()
-                        .id("chat-scroll")
                         .flex_1()
                         .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.chat_scroll)
-                        .px_8()
-                        .vertical_scrollbar(&self.chat_scroll)
-                        .child(body),
+                        .relative()
+                        .child(
+                            div()
+                                .id("chat-scroll")
+                                .h_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.chat_scroll)
+                                .px_8()
+                                .vertical_scrollbar(&self.chat_scroll)
+                                .child(body),
+                        )
+                        .when(show_jump, |d| {
+                            d.child(
+                                div()
+                                    .id("chat-jump-bottom")
+                                    .absolute()
+                                    .right(px(24.0))
+                                    .bottom(px(16.0))
+                                    .size(px(34.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(theme::BORDER_L2)
+                                    .bg(theme::SURFACE)
+                                    .text_color(theme::TEXT_2)
+                                    .cursor_pointer()
+                                    .shadow_md()
+                                    .hover(|s| s.bg(theme::SURFACE_2).text_color(theme::TEXT))
+                                    .tooltip(tip("回到底部"))
+                                    .on_click(move |_, _, cx| {
+                                        t_jump.update(cx, |v, _cx| {
+                                            v.chat_scroll.scroll_to_bottom();
+                                        });
+                                    })
+                                    .child(Icon::new(IconName::ChevronDown).size(px(16.0))),
+                            )
+                        }),
                 )
                 .child(self.render_composer_area(t, has_text));
         }
@@ -1293,7 +1407,7 @@ impl AppView {
                     )
                     .child(div().flex_1())
                     .child(
-                        icon_btn("details-toggle", IconName::PanelRight, theme::TEXT_2, move |_, _, cx| {
+                        icon_btn("details-toggle", IconName::PanelRight, theme::TEXT_2, "详情", move |_, _, cx| {
                             t_details.update(cx, |v, cx| { v.details_open = !v.details_open; cx.notify(); });
                         }),
                     ),
@@ -1453,7 +1567,7 @@ impl AppView {
             .flex()
             .items_center()
             .gap_4()
-            .child(icon_btn("composer-add", IconName::Plus, theme::TEXT, |_, _, _| {}))
+            .child(icon_btn("composer-add", IconName::Plus, theme::TEXT, "添加附件", |_, _, _| {}))
             .child(
                 div()
                     .id("composer-mode")
@@ -1512,6 +1626,7 @@ impl AppView {
                 .justify_center()
                 .cursor_pointer()
                 .hover(|s| s.bg(theme::ACCENT_HOVER))
+                .tooltip(tip("停止生成"))
                 .on_click(move |_, _, cx| {
                     t_stop.update(cx, |v, _cx| {
                         v.agent.cancel();
@@ -1532,6 +1647,7 @@ impl AppView {
                 .cursor_pointer()
                 .when(!has_text, |d| d.opacity(0.4))
                 .when(has_text, |d| d.hover(|s| s.bg(theme::ACCENT_HOVER)))
+                .tooltip(tip("发送 (Enter)"))
                 .on_click(move |_, window, cx| {
                     t_send.update(cx, |v, cx| v.send_from_composer(window, cx));
                 })
@@ -1632,7 +1748,7 @@ impl AppView {
                             .child("详情"),
                     )
                     .child(
-                        icon_btn("details-close", IconName::Close, theme::TEXT_2, move |_, _, cx| {
+                        icon_btn("details-close", IconName::Close, theme::TEXT_2, "关闭详情", move |_, _, cx| {
                             t.update(cx, |v, cx| { v.details_open = false; cx.notify(); });
                         }),
                     ),
@@ -1643,51 +1759,29 @@ impl AppView {
 
 // --- 小组件 / 帮手 -----------------------------------------------------------
 
-/// 一个可拖拽的列宽把手（透明 8px 热区，web AppFrame .handle）。
-fn drag_handle(side: DragSide, this: Entity<AppView>) -> Div {
-    let down = this.clone();
-    let mv = this.clone();
-    let up = this.clone();
+/// 列宽把手：`on_drag` 起拖（借鉴 Zed render_column_resize_divider），
+/// 宽度由根容器上的 `on_drag_move::<ColumnDrag>` 按指针绝对位置跟手更新。
+fn drag_handle(side: DragSide) -> Stateful<Div> {
     div()
+        .id(SharedString::from(match side {
+            DragSide::Sidebar => "drag-sidebar",
+            DragSide::Details => "drag-details",
+        }))
         .w(px(8.0))
         .h_full()
         .flex_none()
         .mx(px(-4.0))
         .cursor_col_resize()
-        .on_mouse_down(gpui::MouseButton::Left, move |ev, _window, cx| {
-            let start_x: f32 = ev.position.x.into();
-            down.update(cx, |v, cx| {
-                let start_width = match side {
-                    DragSide::Sidebar => v.sidebar_width,
-                    DragSide::Details => v.details_width,
-                };
-                v.drag = Some(DragState { side, start_x, start_width });
-                cx.notify();
-            });
-        })
-        .on_mouse_move(move |ev, _window, cx| {
-            let x: f32 = ev.position.x.into();
-            mv.update(cx, |v, cx| {
-                if let Some(d) = v.drag {
-                    let delta = x - d.start_x;
-                    match d.side {
-                        DragSide::Sidebar => {
-                            v.sidebar_width = (d.start_width + delta).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-                        }
-                        DragSide::Details => {
-                            v.details_width = (d.start_width - delta).clamp(DETAILS_MIN, DETAILS_MAX);
-                        }
-                    }
-                    cx.notify();
-                }
-            });
-        })
-        .on_mouse_up(gpui::MouseButton::Left, move |_ev, _window, cx| {
-            up.update(cx, |v, cx| {
-                v.drag = None;
-                cx.notify();
-            });
-        })
+        .hover(|s| s.bg(theme::BORDER_L2))
+        .on_drag(
+            ColumnDrag { side },
+            |_drag, _offset, _window, cx| cx.new(|_| gpui::Empty),
+        )
+}
+
+/// hover 提示（gpui-component Tooltip）。
+fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |_window, cx| cx.new(|_| Tooltip::new(text)).into()
 }
 
 /// 28px 圆形图标按钮（web .iconButton）。
@@ -1695,6 +1789,7 @@ fn icon_btn(
     id: &'static str,
     icon: IconName,
     color: impl Into<Hsla>,
+    tooltip: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     div()
@@ -1708,6 +1803,7 @@ fn icon_btn(
         .text_color(color)
         .cursor_pointer()
         .hover(|s| s.bg(theme::HOVER))
+        .tooltip(tip(tooltip))
         .on_click(on_click)
         .child(Icon::new(icon).size(px(16.0)))
 }
@@ -1716,6 +1812,7 @@ fn icon_btn(
 fn rail_icon(
     id: &'static str,
     icon: IconName,
+    tooltip: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     div()
@@ -1728,6 +1825,7 @@ fn rail_icon(
         .text_color(theme::TEXT)
         .cursor_pointer()
         .hover(|s| s.bg(theme::HOVER))
+        .tooltip(tip(tooltip))
         .on_click(on_click)
         .child(Icon::new(icon).size(px(18.0)))
 }
@@ -1771,8 +1869,8 @@ fn dot_sep() -> Div {
     div().size(px(2.0)).rounded(px(1.0)).bg(theme::CAPTION).mx_2()
 }
 
-/// 工具行 / 输入输出卡（web ToolRow .ioCard）。
-fn io_card(input: &str, output: Option<&str>, error: bool) -> Div {
+/// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
+fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {
     let mut card = div()
         .ml_1()
         .mt_1()
@@ -1782,15 +1880,15 @@ fn io_card(input: &str, output: Option<&str>, error: bool) -> Div {
         .border_1()
         .border_color(theme::BORDER_L1)
         .bg(theme::CODE_BG);
-    card = card.child(io_section("输入", input, false));
+    card = card.child(io_section(uid * 2, "输入", input, false));
     if let Some(out) = output {
         card = card.child(div().h(px(1.0)).w_full().bg(theme::BORDER_L2));
-        card = card.child(io_section("输出", out, error));
+        card = card.child(io_section(uid * 2 + 1, "输出", out, error));
     }
     card
 }
 
-fn io_section(label: &str, text: &str, error: bool) -> Div {
+fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div {
     div()
         .v_flex()
         .px_4()
@@ -1806,6 +1904,9 @@ fn io_section(label: &str, text: &str, error: bool) -> Div {
         )
         .child(
             div()
+                .id(("io-scroll", uid))
+                .max_h(px(150.0))
+                .overflow_y_scroll()
                 .font_family(theme_mono())
                 .text_size(px(12.0))
                 .line_height(px(18.0))
@@ -1870,6 +1971,7 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
                 .cursor_pointer()
                 .text_color(theme::CAPTION)
                 .hover(|s| s.text_color(theme::TEXT_2).bg(theme::HOVER))
+                .tooltip(tip("复制"))
                 .on_click(move |_, _, cx| {
                     t.update(cx, |v, cx| {
                         // 复制本条助手消息全部文本块
@@ -2067,6 +2169,24 @@ fn main() {
                                 app.push_event(ev);
                                 cx.notify();
                             });
+                        }
+                    }
+                })
+                .detach();
+
+                // 流式期间每秒重绘一次，让状态行的耗时计时跳动
+                let tick_view = app.clone();
+                cx.spawn(move |cx: &mut AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        loop {
+                            Timer::after(Duration::from_secs(1)).await;
+                            let Ok(running) = tick_view.update(&mut cx, |v, _| v.running) else {
+                                return;
+                            };
+                            if running {
+                                let _ = tick_view.update(&mut cx, |_, cx| cx.notify());
+                            }
                         }
                     }
                 })

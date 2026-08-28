@@ -1691,10 +1691,18 @@ impl AppView {
                             .pt_1()
                             .pb_1()
                             .pl(px(22.0))
+                            .pr_2()
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
                             .text_color(theme::t().text_3)
-                            .child(text.clone()),
+                            // web .thinkBody：pre-wrap 语义——逐行渲染保留段落
+                            .v_flex()
+                            .gap(px(4.0))
+                            .children(
+                                text.lines().map(|l| {
+                                    div().child(l.to_string())
+                                })
+                            ),
                     );
                 }
                 if let Some(ms) = sweep_ms {

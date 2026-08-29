@@ -3791,6 +3791,7 @@ impl AppView {
 
     /// 空会话 hero：标题 + 工作区行 + 居中输入卡（HeroShell）。
     fn render_hero(&self, this: Entity<AppView>, has_text: bool, center_w: f32) -> Div {
+        let hero_this = this.clone();
         // web ConversationRoot .heroGlow：资产 1051×468 对设计卡 776，宽随卡缩放，
         // 中心锚在卡面（底边上方 92px），translate(-50%, 50%) 使椭圆中心落在锚上。
         let stack_w = (center_w - 48.0).min(COMPOSER_CARD_WIDTH);
@@ -3896,80 +3897,6 @@ impl AppView {
                                     )
                                     .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption))
                             })
-                            .when(self.hero_ws_menu, |row| {
-                                let mut menu = div()
-                                    .id("hero-ws-menu")
-                                    .absolute()
-                                    .top(px(32.0))
-                                    .left(px(20.0))
-                                    .w(px(220.0))
-                                    .v_flex()
-                                    .p(px(4.0))
-                                    .rounded(px(8.0))
-                                    .border_1()
-                                    .border_color(theme::t().border_l2)
-                                    .bg(theme::t().surface)
-                                    .shadow_lg();
-                                for w in &self.workspaces {
-                                    let t = this.clone();
-                                    let id = w.id.clone();
-                                    let title = w.title.clone();
-                                    let selected = self.current_workspace.as_deref() == Some(id.as_str());
-                                    menu = menu.child(
-                                        div()
-                                            .id(SharedString::from(format!("hero-ws-{id}")))
-                                            .h(px(32.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .px(px(10.0))
-                                            .rounded(px(6.0))
-                                            .cursor_pointer()
-                                            .map(|d| if selected { d.bg(theme::t().hover) } else { d })
-                                            .when(!selected, |d| d.hover(|s| s.bg(theme::t().hover)))
-                                            .on_click(move |_, _, cx| {
-                                                let id = id.clone();
-                                                t.update(cx, |v, cx| {
-                                                    v.current_workspace = Some(id);
-                                                    v.sync_fs_sandbox();
-                                                    v.hero_ws_menu = false;
-                                                    cx.notify();
-                                                });
-                                            })
-                                            .child(Icon::new(IconName::FolderClosed).size(px(14.0)).text_color(theme::t().text_2))
-                                            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child(title)),
-                                    );
-                                }
-                                let t_add = this.clone();
-                                menu = menu
-                                    .child(div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2))
-                                    .child(
-                                        div()
-                                            .id("hero-ws-add")
-                                            .h(px(32.0))
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .px(px(10.0))
-                                            .rounded(px(6.0))
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(theme::t().hover))
-                                            .on_click(move |_, _, cx| {
-                                                t_add.update(cx, |v, cx| {
-                                                    v.hero_ws_menu = false;
-                                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                                        let p = path.to_string_lossy().to_string();
-                                                        if !v.workspaces.iter().any(|w| w.path == p) {
-                                                            v.create_workspace(p, cx);
-                                                        }
-                                                    }
-                                                });
-                                            })
-                                            .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
-                                            .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),
-                                    );
-                                row.child(menu)
-                            })
                             .child(
                                 div()
                                     .id("hero-mode")
@@ -3992,7 +3919,129 @@ impl AppView {
                                     ),
                             ),
                     )
-                    .child(self.composer_card(this, has_text)),
+                    .child(self.composer_card(this, has_text))
+                    // 下拉面板挂在栈层级（输入卡之后渲染 → 绘制在其上，
+                    // 对齐 web .workspaceRow z-index:10 的效果）；遮罩提供
+                    // 点击外部关闭
+                    .when(self.hero_ws_menu, |stack| {
+                        let t_overlay = hero_this.clone();
+                        let mut menu = div()
+                            .id("hero-ws-menu")
+                            .absolute()
+                            .top(px(76.0))
+                            .left(px(20.0))
+                            .w(px(220.0))
+                            .v_flex()
+                            .p(px(4.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme::t().border_l2)
+                            .bg(theme::t().surface)
+                            .shadow_lg();
+                        for w in &self.workspaces {
+                                let t = hero_this.clone();
+                                let id = w.id.clone();
+                                let title = w.title.clone();
+                                let selected = self.current_workspace.as_deref() == Some(id.as_str());
+                                menu = menu.child(
+                                    div()
+                                        .id(SharedString::from(format!("hero-ws-{id}")))
+                                        .h(px(32.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px(px(10.0))
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .map(|d| if selected { d.bg(theme::t().hover) } else { d })
+                                        .when(!selected, |d| d.hover(|s| s.bg(theme::t().hover)))
+                                        .on_click(move |_, _, cx| {
+                                            let id = id.clone();
+                                            t.update(cx, |v, cx| {
+                                                v.current_workspace = Some(id);
+                                                v.sync_fs_sandbox();
+                                                v.hero_ws_menu = false;
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(Icon::new(IconName::FolderClosed).size(px(14.0)).text_color(theme::t().text_2))
+                                        .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child(title)),
+                                );
+                            }
+                            let t_add = hero_this.clone();
+                            menu = menu
+                                .child(div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2))
+                                .child(
+                                    div()
+                                        .id("hero-ws-add")
+                                        .h(px(32.0))
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px(px(10.0))
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::t().hover))
+                                        .on_click(move |_, _, cx| {
+                                            t_add.update(cx, |v, cx| {
+                                                v.hero_ws_menu = false;
+                                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                    let p = path.to_string_lossy().to_string();
+                                                    if !v.workspaces.iter().any(|w| w.path == p) {
+                                                        v.create_workspace(p, cx);
+                                                    }
+                                                }
+                                            });
+                                        })
+                                        .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
+                                        .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),
+                                );
+                        let t_add = hero_this.clone();
+                        menu = menu
+                            .child(div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2))
+                            .child(
+                                div()
+                                    .id("hero-ws-add")
+                                    .h(px(32.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px(px(10.0))
+                                    .rounded(px(6.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::t().hover))
+                                    .on_click(move |_, _, cx| {
+                                        t_add.update(cx, |v, cx| {
+                                            v.hero_ws_menu = false;
+                                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                                let p = path.to_string_lossy().to_string();
+                                                if !v.workspaces.iter().any(|w| w.path == p) {
+                                                    v.create_workspace(p, cx);
+                                                }
+                                            }
+                                        });
+                                    })
+                                    .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
+                                    .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),
+                            );
+                        stack
+                            .child(
+                                div()
+                                    .id("hero-ws-overlay")
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .on_click(move |_, _, cx| {
+                                        t_overlay.update(cx, |v, cx| {
+                                            v.hero_ws_menu = false;
+                                            cx.notify();
+                                        });
+                                    }),
+                            )
+                            .child(menu)
+                    }),
             )
     }
 

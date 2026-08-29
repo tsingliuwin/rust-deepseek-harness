@@ -55,7 +55,7 @@ pub enum AgentEvent {
     ReasoningDelta { text: String },
     ToolCall { tool_call_id: CallId, name: String, arguments: String },
     ToolResult { tool_call_id: CallId, is_error: bool },
-    AssistantMessage { message: Message },
+    AssistantMessage { message: Message, usage: Option<dsh_llm::TokenUsage> },
     TurnEnded { turn: u64, reason: TurnEndReason },
     /// 压缩事务完成：影子区前 `shadowed_messages` 条消息已由检查点替换。
     Compacted { shadowed_messages: usize },
@@ -509,9 +509,9 @@ impl ReactLoopAgent {
                 step,
                 message: message.clone(),
                 interrupted: false,
-                usage,
+                usage: usage.clone(),
             });
-            self.emit_ui(AgentEvent::AssistantMessage { message: message.clone() });
+            self.emit_ui(AgentEvent::AssistantMessage { message: message.clone(), usage });
 
             if matches!(finish, FinishReason::MaxTokens) {
                 return StepEnd::Concluded(TurnEndReason::MaxTokens);

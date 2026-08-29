@@ -985,6 +985,19 @@ struct AppView {
     turn_started_at: Option<Instant>,
     stats_turns: u64,
     stats_tools: u64,
+    stats_steps: u64,
+    stats_input_tokens: u64,
+    stats_output_tokens: u64,
+    stats_cache_read: u64,
+    stats_cache_write: u64,
+    /// 本轮工具调用计时（call_id → 起始时刻）
+    tool_starts: std::collections::HashMap<String, std::time::Instant>,
+    /// 本轮累计工具耗时（LLM 时间 = 轮用时 − 工具时间）
+    turn_tool_time: std::time::Duration,
+    /// 会话级累计 LLM / 工具耗时（TurnEnded 结转；不持久化——重载会话
+    /// 该组整体省略，web StatsLine 同语义：无数据的组整段丢弃）
+    session_llm_time: std::time::Duration,
+    session_tool_time: std::time::Duration,
     // 中栏 tab + 详情选中
     tab: CenterTab,
     selected_tool: Option<ToolDetail>,
@@ -1034,6 +1047,53 @@ fn context_info(
 
 fn non_empty(s: String) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
+}
+
+/// 时长格式（web formatDuration 风格：<60s 一位小数秒，否则 分+秒）。
+fn fmt_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}m{}s", secs as u64 / 60, (secs as u64) % 60)
+    }
+}
+
+/// web StatsLine 文本：组按「 | 」连接，无数据的组整段丢弃——
+/// 计数（轮·步）、耗时（LLM/工具调用）、token（缓存命中 + 输入/输出）。
+fn stats_line_text(
+    turns: u64,
+    steps: u64,
+    llm: std::time::Duration,
+    tool: std::time::Duration,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read: u64,
+) -> String {
+    let mut groups: Vec<String> = Vec::new();
+    if steps > 0 {
+        groups.push(format!("{turns} 轮 · {steps} 步"));
+        let mut durations: Vec<String> = Vec::new();
+        if llm.as_secs_f64() > 0.0 {
+            durations.push(format!("LLM {}", fmt_duration(llm)));
+        }
+        if tool.as_secs_f64() > 0.0 {
+            durations.push(format!("工具调用 {}", fmt_duration(tool)));
+        }
+        if !durations.is_empty() {
+            groups.push(durations.join(" · "));
+        }
+    }
+    if input_tokens > 0 || output_tokens > 0 {
+        // 计费输入 = 总输入 − 缓存读（web billedInputTokens）
+        let billed = input_tokens.saturating_sub(cache_read);
+        if cache_read > 0 {
+            let pct = cache_read as f64 / (cache_read + billed) as f64 * 100.0;
+            groups.push(format!("缓存命中 {pct:.0}%"));
+        }
+        groups.push(format!("输入 {billed} tok · 输出 {output_tokens} tok"));
+    }
+    groups.join(" | ")
 }
 
 /// 单轮折叠派生（web turn-process 节点数据的对应物）。
@@ -1165,6 +1225,15 @@ impl AppView {
             turn_started_at: None,
             stats_turns: 0,
             stats_tools: 0,
+            stats_steps: 0,
+            stats_input_tokens: 0,
+            stats_output_tokens: 0,
+            stats_cache_read: 0,
+            stats_cache_write: 0,
+            tool_starts: Default::default(),
+            turn_tool_time: std::time::Duration::ZERO,
+            session_llm_time: std::time::Duration::ZERO,
+            session_tool_time: std::time::Duration::ZERO,
             tab: CenterTab::Conversation,
             selected_tool: None,
             traj_scroll: ScrollHandle::new(),
@@ -1289,12 +1358,36 @@ impl AppView {
         self.running = false;
         self.turn_started_at = None;
         self.selected_tool = None;
+        self.stats_turns = 0;
+        self.stats_tools = 0;
+        self.stats_steps = 0;
+        self.stats_input_tokens = 0;
+        self.stats_output_tokens = 0;
+        self.stats_cache_read = 0;
+        self.stats_cache_write = 0;
+        self.session_llm_time = std::time::Duration::ZERO;
+        self.session_tool_time = std::time::Duration::ZERO;
+        self.turn_tool_time = std::time::Duration::ZERO;
+        self.tool_starts.clear();
         let session = self.agent.session();
         let session = session.lock().unwrap();
         let mut cur_turn = 0u64;
         for entry in session.entries() {
             match &entry.event {
-                SessionEvent::TurnStart { turn } => cur_turn = *turn,
+                SessionEvent::TurnStart { turn } => {
+                    cur_turn = *turn;
+                    self.stats_turns += 1;
+                }
+                SessionEvent::AssistantMessage { usage, .. } => {
+                    self.stats_steps += 1;
+                    if let Some(u) = usage {
+                        self.stats_input_tokens += u.input_tokens;
+                        self.stats_output_tokens += u.output_tokens;
+                        if let Some(cr) = u.cache_read_tokens { self.stats_cache_read += cr; }
+                        if let Some(cw) = u.cache_write_tokens { self.stats_cache_write += cw; }
+                    }
+                }
+                SessionEvent::ToolCall { .. } => { self.stats_tools += 1; }
                 SessionEvent::UserMessage(m) => {
                     let text: String = m
                         .content
@@ -1384,8 +1477,6 @@ open: false,
         self.sync_fs_sandbox();
         self.agent.set_session(session);
         self.rebuild_from_session();
-        self.stats_turns = 0;
-        self.stats_tools = 0;
         self.tab = CenterTab::Conversation;
         // 虚拟列表长度同步（切换后条目数变了；不 reset 则仍按旧长度渲染）
         self.sync_chat_list(true);
@@ -1418,6 +1509,15 @@ open: false,
         self.selected_tool = None;
         self.stats_turns = 0;
         self.stats_tools = 0;
+        self.stats_steps = 0;
+        self.stats_input_tokens = 0;
+        self.stats_output_tokens = 0;
+        self.stats_cache_read = 0;
+        self.stats_cache_write = 0;
+        self.session_llm_time = std::time::Duration::ZERO;
+        self.session_tool_time = std::time::Duration::ZERO;
+        self.turn_tool_time = std::time::Duration::ZERO;
+        self.tool_starts.clear();
         self.tab = CenterTab::Conversation;
         self.assign_session_to_workspace(&id, ws.as_deref());
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd) });
@@ -1482,6 +1582,19 @@ open: false,
     /// 消息流当前是否贴底（scroll handler 维护的可见范围判断）。
     fn chat_near_bottom(&self) -> bool {
         self.list_bottom.get()
+    }
+
+    /// web StatsLine 文本（组内数据缺失时整组省略）。
+    fn stats_line(&self) -> String {
+        stats_line_text(
+            self.stats_turns,
+            self.stats_steps,
+            self.session_llm_time,
+            self.session_tool_time,
+            self.stats_input_tokens,
+            self.stats_output_tokens,
+            self.stats_cache_read,
+        )
     }
 
     fn current_session_id(&self) -> SessionId {
@@ -1558,11 +1671,14 @@ open: false,
                 self.stats_turns += 1;
                 self.ui_turn = turn;
                 self.turn_open = Some(turn);
+                self.turn_tool_time = std::time::Duration::ZERO;
+                self.tool_starts.clear();
             }
             AgentEvent::TextDelta { text } => self.push_text(&text),
             AgentEvent::ReasoningDelta { text } => self.push_reasoning(&text),
             AgentEvent::ToolCall { tool_call_id, name, arguments: args } => {
                 self.stats_tools += 1;
+                self.tool_starts.insert(tool_call_id.0.clone(), Instant::now());
                 self.last_assistant().blocks.push(MsgBlock::Tool(ToolBlock {
                     id: tool_call_id.0,
                     name,
@@ -1575,18 +1691,34 @@ open: false,
                 }));
             }
             AgentEvent::ToolResult { tool_call_id, is_error } => {
+                if let Some(start) = self.tool_starts.remove(&tool_call_id.0) {
+                    self.turn_tool_time += start.elapsed();
+                }
                 // 实时结果文本从会话日志回读（事件本身只带 id/error）。
                 let result = self.latest_tool_result_text(&tool_call_id.0);
                 let last = self.entries.last_mut();
                 attach_tool_result(last, &tool_call_id.0, result.0.as_str(), is_error);
             }
-            AgentEvent::AssistantMessage { .. } => {}
+            AgentEvent::AssistantMessage { usage, .. } => {
+                self.stats_steps += 1;
+                if let Some(u) = usage {
+                    self.stats_input_tokens += u.input_tokens;
+                    self.stats_output_tokens += u.output_tokens;
+                    if let Some(cr) = u.cache_read_tokens { self.stats_cache_read += cr; }
+                    if let Some(cw) = u.cache_write_tokens { self.stats_cache_write += cw; }
+                }
+            }
             AgentEvent::TurnEnded { turn, .. } => {
                 self.running = false;
                 let elapsed = self.turn_started_at.map(|t| t.elapsed());
                 if let Some(e) = self.entries.last_mut() {
                     e.done = true;
                     e.elapsed = elapsed;
+                }
+                // 结转本轮 LLM/工具耗时（web sessionStats 的 llmMs/toolMs）
+                if let Some(total) = elapsed {
+                    self.session_llm_time += total.saturating_sub(self.turn_tool_time);
+                    self.session_tool_time += self.turn_tool_time;
                 }
                 self.turn_started_at = None;
                 self.turn_open = None;
@@ -3579,10 +3711,7 @@ impl AppView {
                                         .whitespace_nowrap()
                                         .overflow_hidden()
                                         .text_ellipsis()
-                                        .child(format!(
-                                            "{} 轮 · {} 次工具调用",
-                                            v.stats_turns, v.stats_tools
-                                        ))
+                                        .child(v.stats_line())
                                         .into_any_element()
                                 }
                             })
@@ -3827,10 +3956,7 @@ impl AppView {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(format!(
-                        "{} 轮 · {} 次工具调用",
-                        self.stats_turns, self.stats_tools
-                    )),
+                    .child(self.stats_line()),
             );
         }
         div().w_full().child(col)

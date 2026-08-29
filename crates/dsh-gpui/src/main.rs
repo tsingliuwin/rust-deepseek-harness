@@ -971,6 +971,8 @@ struct AppView {
     chat_items: usize,
     /// 列表当前是否贴底（scroll handler 维护）
     list_bottom: Rc<Cell<bool>>,
+    /// 下一次 sync 强制 reset（会话切换/重建：内容整体替换）
+    chat_reset_pending: bool,
     // 布局状态
     last_drag_tick: Instant,
     sidebar_collapsed: bool,
@@ -1152,6 +1154,7 @@ impl AppView {
             chat_list: ListState::new(0, ListAlignment::Top, px(100.0)),
             chat_items: 0,
             list_bottom: Rc::new(Cell::new(true)),
+            chat_reset_pending: false,
             last_drag_tick: Instant::now(),
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT,
@@ -1354,6 +1357,7 @@ open: false,
         }
         self.ui_turn = cur_turn;
         self.turn_open = None; // 回放态全部视为已关闭（可折叠判定成立）
+        self.chat_reset_pending = true;
         self.sync_chat_list(true);
     }
 
@@ -1461,8 +1465,15 @@ open: false,
     /// 同步列表长度并按需滚底（流式期间沿用贴底语义）。
     fn sync_chat_list(&mut self, force_bottom: bool) {
         let n = self.chat_item_count();
+        // append-only 增长（流式）走 splice：保留滚动锚点——reset 会清
+        // logical_scroll_top 把视图弹回顶部，吸底跟随随之失效
+        if self.chat_reset_pending || n < self.chat_items {
+            self.chat_list.reset(n);
+            self.chat_reset_pending = false;
+        } else if n > self.chat_items {
+            self.chat_list.splice(self.chat_items..self.chat_items, n);
+        }
         self.chat_items = n;
-        self.chat_list.reset(n);
         if n > 0 && (force_bottom || self.list_bottom.get()) {
             self.chat_list.scroll_to_reveal_item(n - 1);
         }

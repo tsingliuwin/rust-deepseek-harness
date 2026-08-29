@@ -2133,10 +2133,11 @@ open: false,
                     None
                 };
                 let summary_text = failure.clone().unwrap_or_else(|| {
-                    file_path
-                        .as_deref()
-                        .map(|p| widgets::display_path(p, &self.current_cwd))
-                        .unwrap_or(summary)
+                    // 有链接的 read/write 摘要 = 相对化后的 path；
+                    // list/exists 等无链接 op 的摘要同样剥工作区根/~ 前缀
+                    // （web relativizeToCwd 作用于全部文件工具摘要）
+                    let raw = file_path.as_deref().unwrap_or(summary.as_str());
+                    widgets::display_path(raw, &self.current_cwd)
                 });
                 let t = this.clone();
                 let running = tool.result.is_none();
@@ -2758,6 +2759,8 @@ open: false,
             for (bi, block) in entry.blocks.iter().enumerate() {
                 if let MsgBlock::Tool(tool) = block {
                     let (label, icon) = tool_display(&tool.name);
+                    let (_, traj_summary, _) = widgets::tool_row_texts(&tool.name, &tool.arguments);
+                    let traj_summary = widgets::display_path(&traj_summary, &self.current_cwd);
                     let t = this.clone();
                     let name = tool.name.clone();
                     let arguments = tool.arguments.clone();
@@ -2811,7 +2814,7 @@ open: false,
                                     .text_size(px(theme::FONT_ROW))
                                     .line_height(px(theme::FONT_ROW_LEADING))
                                     .text_color(theme::t().text_3)
-                                    .child(first_line(&tool.arguments)),
+                                    .child(traj_summary),
                             )
                             .into_any_element(),
                     );

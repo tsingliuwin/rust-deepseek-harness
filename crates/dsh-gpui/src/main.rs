@@ -901,6 +901,8 @@ struct AppView {
     fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
     /// 会话工作目录句柄（工具执行基准 + 模型可见上下文）
     workdir: dsh_tools::Workdir,
+    /// 持久化 sink 的 cwd 槽（= current_cwd；草稿会话首次落盘的桶位）
+    persist_cwd: Arc<std::sync::Mutex<String>>,
     sessions: Vec<SessionMeta>,
     /// 工作区列表（与 web 共享 storages/workspace.json）
     workspaces: Vec<WorkspaceInfo>,
@@ -1113,6 +1115,7 @@ impl AppView {
         subagent: Arc<dsh_subagent::SubagentTool>,
         fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
         workdir: dsh_tools::Workdir,
+        persist_cwd: Arc<std::sync::Mutex<String>>,
         sessions: Vec<SessionMeta>,
         input: Entity<InputState>,
         #[allow(dead_code)] // 被 DeepSeek 卡引用
@@ -1163,6 +1166,7 @@ impl AppView {
             subagent,
             fs_sandbox,
             workdir,
+            persist_cwd,
             sessions,
             entries: Vec::new(),
             input,
@@ -1488,15 +1492,17 @@ open: false,
         if self.running {
             return;
         }
-        let ws = self.current_workspace.clone();
-        let cwd = ws
-            .as_ref()
-            .and_then(|wid| self.workspaces.iter().find(|w| &w.id == wid).map(|w| w.path.clone()))
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            });
+        // web startSession：目标 = 显式选择 ?? 当前会话所属 ?? 最近工作区；
+        // 一个工作区都没有 → 纯草稿（不落盘）
+        let Some(ws_id) = self.resolve_target_workspace() else {
+            self.enter_blank_draft(cx);
+            return;
+        };
+        let Some(cwd) = self.workspaces.iter().find(|w| w.id == ws_id).map(|w| w.path.clone()) else {
+            self.enter_blank_draft(cx);
+            return;
+        };
+        let ws = Some(ws_id.clone());
         // web connectWorkspace 语义：目标工作区已有空白会话则复用之，
         // 绝不每次点击都新建（否则空会话灌满列表）
         if let Some(blank) = self.blank_session_in(&cwd) {
@@ -1530,6 +1536,58 @@ open: false,
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd) });
         cx.notify();
     }
+    /// 新会话的目标工作区（web startSession 链）：显式选择 ?? 当前会话
+    /// 所属 ?? 最近工作区（最近会话所属优先，退列首）。
+    fn resolve_target_workspace(&self) -> Option<String> {
+        if let Some(id) = self.current_workspace.clone() {
+            return Some(id);
+        }
+        let cur = self.current_session_id();
+        if let Some(w) = self
+            .workspaces
+            .iter()
+            .find(|w| w.session_ids.iter().any(|sid| sid == cur.as_str()))
+        {
+            return Some(w.id.clone());
+        }
+        for meta in &self.sessions {
+            if let Some(w) = self.workspaces.iter().find(|w| {
+                w.session_ids.iter().any(|sid| sid == meta.id.as_str())
+            }) {
+                return Some(w.id.clone());
+            }
+        }
+        self.workspaces.first().map(|w| w.id.clone())
+    }
+
+    /// 零工作区的纯草稿（web sessions.clear() 同语义）：内存会话、
+    /// 不落盘、不进列表；工作目录 = 进程 cwd（工具仍有执行基准）。
+    fn enter_blank_draft(&mut self, cx: &mut Context<Self>) {
+        self.agent.set_session(Session::new(self.alloc_session_id()));
+        self.entries.clear();
+        self.running = false;
+        self.turn_started_at = None;
+        self.selected_tool = None;
+        self.stats_turns = 0;
+        self.stats_tools = 0;
+        self.stats_steps = 0;
+        self.stats_input_tokens = 0;
+        self.stats_output_tokens = 0;
+        self.stats_cache_read = 0;
+        self.stats_cache_write = 0;
+        self.session_llm_time = std::time::Duration::ZERO;
+        self.session_tool_time = std::time::Duration::ZERO;
+        self.turn_tool_time = std::time::Duration::ZERO;
+        self.tool_starts.clear();
+        self.current_cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.sync_fs_sandbox();
+        self.chat_reset_pending = true;
+        self.sync_chat_list(true);
+        cx.notify();
+    }
+
     /// 目标目录下已知的空白会话（web summary.blank 的等价判定：
     /// 当前会话直接查内存；其余按 meta.cwd 过滤后加载验证）。
     fn blank_session_in(&self, cwd: &str) -> Option<SessionId> {
@@ -2055,7 +2113,8 @@ open: false,
             self.current_cwd.clone()
         };
         self.fs_sandbox.set_roots(vec![std::path::PathBuf::from(root.clone())]);
-        self.workdir.set(root);
+        self.workdir.set(root.clone());
+        *self.persist_cwd.lock().unwrap() = root;
     }
 
     /// 宿主路由切换：主 agent 与子 agent 工具同步。
@@ -4772,18 +4831,18 @@ fn main() {
             }
         })
         .collect();
+    let startup_workspaces = load_workspaces();
     let (initial_session, initial_cwd, is_fresh) = if let Some(first) = entries.first() {
         let (session, cwd) = recorder
             .load(&first.id, first.cwd.as_deref())
             .unwrap_or_else(|_| (Session::new(first.id.clone()), first.cwd.clone()));
         let is_fresh = session.entries().is_empty();
         (session, cwd.unwrap_or_default(), is_fresh)
-    } else {
-        // 无任何会话：建一个挂在当前目录的空会话
+    } else if let Some(ws) = startup_workspaces.first() {
+        // web startSession：无会话时连接最近工作区（其空白会话），
+        // 绝不落在进程目录
         let id = new_web_session_id();
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
+        let cwd = ws.path.clone();
         let _ = recorder.create(&id, &cwd, "standard");
         sessions_meta.push(SessionMeta {
             id: id.clone(),
@@ -4792,6 +4851,9 @@ fn main() {
             cwd: Some(cwd.clone()),
         });
         (Session::new(id), cwd, true)
+    } else {
+        // 零工作区：纯草稿（不落盘、不进列表；hero 引导选择工作区）
+        (Session::new(new_web_session_id()), std::env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(), true)
     };
 
     let agent = ReactLoopAgent::new(
@@ -4815,6 +4877,7 @@ fn main() {
     let recorder_sink = Arc::clone(&recorder);
     let agent_sink = Arc::clone(&agent);
     let cwd_slot = Arc::new(std::sync::Mutex::new(initial_cwd.clone()));
+    let cwd_slot_for_view = Arc::clone(&cwd_slot);
     agent.set_event_sink(move |event| {
         let id = agent_sink.session().lock().unwrap().id.clone();
         let cwd = cwd_slot.lock().unwrap().clone();
@@ -4832,7 +4895,7 @@ fn main() {
     };
 
     // 工作区（与 web 共享 storages/workspace.json，进入窗口闭包用）
-    let startup_workspaces = load_workspaces();
+
     let _ = &stored_deepseek_key;
 
     // 注册用户声明的自定义提供方（OpenAI 兼容，复用 DeepSeek adapter）
@@ -4951,6 +5014,7 @@ fn main() {
                         subagent_tool.clone(),
                         fs_sandbox.clone(),
                         workdir.clone(),
+                        cwd_slot_for_view,
                         sessions_meta.clone(),
                         input.clone(),
                         api_input,

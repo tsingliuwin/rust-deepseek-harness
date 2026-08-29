@@ -318,6 +318,50 @@ pub(crate) fn iso8601_now() -> String {
     format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{sec:02}.{millis:03}Z")
 }
 
+/// 读 web 共享的全局归档集（workspace.json global.archivedSessionIds）。
+pub(crate) fn load_archived_ids() -> Vec<String> {
+    let path = dsh_home().join("storages").join("workspace.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|doc| {
+            doc.get("global")
+                .and_then(|g| g.get("archivedSessionIds"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// 把会话追加进共享归档集（读-改-写合并；web archiveSession 同语义：
+/// 已在集合内的 id 不重复写）。
+pub(crate) fn archive_session_doc(id: &str) {
+    let path = dsh_home().join("storages").join("workspace.json");
+    let mut doc: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "unit": {"name": "workspace", "version": 2},
+                "global": {"initialized": true, "workspaceIds": [], "archivedSessionIds": []},
+                "tables": {"workspaces": {}}
+            })
+        });
+    if let Some(g) = doc.get_mut("global").and_then(|g| g.as_object_mut()) {
+        let entry = g
+            .entry("archivedSessionIds".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(arr) = entry.as_array_mut()
+            && !arr.iter().any(|x| x.as_str() == Some(id))
+        {
+            arr.push(serde_json::json!(id));
+        }
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&doc) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
 /// 读写 ~/.dsh/storages/workspace.json（与 web 共享同一份文档）。
 /// 只动 `workspaceIds`（顺序）与 `tables.workspaces`，其余原样。
 pub(crate) fn load_workspaces() -> Vec<WorkspaceInfo> {
@@ -910,6 +954,8 @@ struct AppView {
     collapsed_workspaces: std::collections::HashSet<String>,
     /// 当前工作区（hero「选择工作区」；新建会话归属）
     current_workspace: Option<String>,
+    /// 已归档会话（web 全局 archivedSessionIds；从所有分组视图隐藏）
+    archived: std::collections::HashSet<String>,
     /// 当前会话的 project cwd（写入 web 布局用）
     current_cwd: String,
     /// 侧栏弹出的行菜单（会话 … / 工作区 … 均用 Option<MenuTarget>）
@@ -1182,6 +1228,7 @@ impl AppView {
             workspaces,
             collapsed_workspaces: Default::default(),
             current_workspace: None,
+            archived: load_archived_ids().into_iter().collect(),
             current_cwd: String::new(),
             sidebar_menu: None,
             renaming_workspace: None,
@@ -1337,21 +1384,18 @@ impl AppView {
         save_workspaces(&self.workspaces);
     }
 
-    /// 删除会话：清 JSONL + 列表 + 工作区归属。
-    fn delete_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+    /// 归档会话（web archiveSession）：写入共享归档集，从所有分组视图
+    /// 隐藏；日志保留、workspace 归属不动（web：archiving never touches
+    /// workspace accounting，unarchive 时原位恢复）。单向，无取消 UI。
+    fn archive_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
         if self.running && self.current_session_id() == *id {
             return;
         }
-        let cwd_hint = self.sessions.iter().find(|s| &s.id == id).and_then(|s| s.cwd.clone());
-        let _ = self.recorder.delete(id, cwd_hint.as_deref());
-        self.sessions.retain(|s| &s.id != id);
-        for w in self.workspaces.iter_mut() {
-            w.session_ids.retain(|s| s != id.as_str());
-        }
-        save_workspaces(&self.workspaces);
+        archive_session_doc(id.as_str());
+        self.archived.insert(id.as_str().to_string());
         if self.current_session_id() == *id {
-            // 当前会话被删：建一个新的空会话
-            self.new_session(cx);
+            // 归档当前会话：留在原地（web 同——归档不影响打开的视图），
+            // 仅列表隐藏
         }
         cx.notify();
     }
@@ -1599,7 +1643,11 @@ open: false,
             return Some(current);
         }
         for meta in &self.sessions {
-            if meta.id == current || meta.cwd.as_deref() != Some(cwd) {
+            // web connectWorkspace：已归档的空白会话不可复用
+            if meta.id == current
+                || self.archived.contains(meta.id.as_str())
+                || meta.cwd.as_deref() != Some(cwd)
+            {
                 continue;
             }
             if let Ok((session, _)) = self.recorder.load(&meta.id, Some(cwd))
@@ -3169,6 +3217,9 @@ impl AppView {
                 // web searchTree：匹配会话平铺（工作区行常规渲染跳过）
                 let needle = self.search_query.to_lowercase();
                 for meta in &self.sessions {
+                    if self.archived.contains(meta.id.as_str()) {
+                        continue;
+                    }
                     if !meta.title.to_lowercase().contains(&needle) {
                         continue;
                     }
@@ -3313,10 +3364,11 @@ impl AppView {
                         .sessions
                         .iter()
                         .filter(|m| {
-                            m.cwd
-                                .as_deref()
-                                .map(|c| dsh_persist::project_key(c) == w_key)
-                                .unwrap_or(false)
+                            !self.archived.contains(m.id.as_str())
+                                && m.cwd
+                                    .as_deref()
+                                    .map(|c| dsh_persist::project_key(c) == w_key)
+                                    .unwrap_or(false)
                         })
                         .collect();
                     let w_sids: Vec<String> = if self.order_manual {
@@ -3367,10 +3419,11 @@ impl AppView {
                 .map(|w| dsh_persist::project_key(&w.path))
                 .collect();
             for meta in self.sessions.iter().filter(|m| {
-                m.cwd
-                    .as_deref()
-                    .map(|c| !ws_keys.contains(&dsh_persist::project_key(c)))
-                    .unwrap_or(true)
+                !self.archived.contains(m.id.as_str())
+                    && m.cwd
+                        .as_deref()
+                        .map(|c| !ws_keys.contains(&dsh_persist::project_key(c)))
+                        .unwrap_or(true)
             }) {
                 let t_sw = this.clone();
                 let id = meta.id.clone();
@@ -3678,12 +3731,12 @@ impl AppView {
                                 let t1 = this.clone();
                                 let id1 = target.clone();
                                 vec![
-                                    sb_menu_row("sess-del", "删除会话", true, move |_, _, cx| {
+                                    sb_menu_row("sess-archive", "归档会话", true, move |_, _, cx| {
                                         let id = id1.clone();
                                         t1.update(cx, |v, cx| {
                                             v.sidebar_menu = None;
                                             let sid = dsh_llm::SessionId::new(id);
-                                            v.delete_session(&sid, cx);
+                                            v.archive_session(&sid, cx);
                                         });
                                     }).into_any_element(),
                                 ]

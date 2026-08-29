@@ -3588,13 +3588,18 @@ impl AppView {
                         .child({
                             let t_add_ws = this.clone();
                             icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, _, cx| {
-                                t_add_ws.update(cx, |v, cx| {
-                                    // web 添加工作区唯一路径：选一个主机目录
-                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        let p = path.to_string_lossy().to_string();
-                                        if !v.workspaces.iter().any(|w| w.path == p) {
-                                            v.create_workspace(p, cx);
-                                        }
+                                // rfd 同步对话框在 GPUI 主线程派发里跑模态
+                                // NSOpenPanel 会 panic_cannot_unwind abort；
+                                // 改异步 API（completion 回调式）
+                                let t = t_add_ws.clone();
+                                let _ = cx.spawn(async move |cx| {
+                                    if let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await {
+                                        let p = folder.path().to_string_lossy().to_string();
+                                        let _ = t.update(cx, |v, cx| {
+                                            if !v.workspaces.iter().any(|w| w.path == p) {
+                                                v.create_workspace(p, cx);
+                                            }
+                                        });
                                     }
                                 });
                             })
@@ -4349,13 +4354,19 @@ impl AppView {
                                         .cursor_pointer()
                                         .hover(|s| s.bg(theme::t().hover))
                                         .on_click(move |_, _, cx| {
-                                            t_add.update(cx, |v, cx| {
+                                            t_add.update(cx, |v, _cx| {
                                                 v.hero_ws_menu = false;
-                                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                                    let p = path.to_string_lossy().to_string();
-                                                    if !v.workspaces.iter().any(|w| w.path == p) {
-                                                        v.create_workspace(p, cx);
-                                                    }
+                                            });
+                                            // 异步目录拾取（同步模态会 abort，见侧栏同名钮）
+                                            let t = t_add.clone();
+                                            let _ = cx.spawn(async move |cx| {
+                                                if let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await {
+                                                    let p = folder.path().to_string_lossy().to_string();
+                                                    let _ = t.update(cx, |v, cx| {
+                                                        if !v.workspaces.iter().any(|w| w.path == p) {
+                                                            v.create_workspace(p, cx);
+                                                        }
+                                                    });
                                                 }
                                             });
                                         })

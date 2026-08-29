@@ -3593,7 +3593,10 @@ impl AppView {
                                 // 改异步 API（completion 回调式）
                                 let t = t_add_ws.clone();
                                 let _ = cx.spawn(async move |cx| {
-                                    if let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await {
+                                    eprintln!("[ws-pick] await folder dialog...");
+                                    let picked = rfd::AsyncFileDialog::new().pick_folder().await;
+                                    eprintln!("[ws-pick] resolved: {:?}", picked.as_ref().map(|f| f.path().to_string_lossy().to_string()));
+                                    if let Some(folder) = picked {
                                         let p = folder.path().to_string_lossy().to_string();
                                         let _ = t.update(cx, |v, cx| {
                                             if !v.workspaces.iter().any(|w| w.path == p) {
@@ -4353,14 +4356,18 @@ impl AppView {
                                         .rounded(px(6.0))
                                         .cursor_pointer()
                                         .hover(|s| s.bg(theme::t().hover))
-                                        .on_click(move |_, _, cx| {
+                                        .on_click(move |_, window, cx| {
                                             t_add.update(cx, |v, _cx| {
                                                 v.hero_ws_menu = false;
                                             });
-                                            // 异步目录拾取（同步模态会 abort，见侧栏同名钮）
+                                            // 异步目录拾取 + 显式父窗（缺省 rfd 取
+                                            // NSApp.windows().firstObject()，GPUI 下
+                                            // 可能挂到不可见窗口导致面板永不出现）
                                             let t = t_add.clone();
+                                            let dialog = rfd::AsyncFileDialog::new().set_parent(window);
                                             let _ = cx.spawn(async move |cx| {
-                                                if let Some(folder) = rfd::AsyncFileDialog::new().pick_folder().await {
+                                                let picked = dialog.pick_folder().await;
+                                                if let Some(folder) = picked {
                                                     let p = folder.path().to_string_lossy().to_string();
                                                     let _ = t.update(cx, |v, cx| {
                                                         if !v.workspaces.iter().any(|w| w.path == p) {

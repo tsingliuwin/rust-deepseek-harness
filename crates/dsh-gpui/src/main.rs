@@ -1571,7 +1571,8 @@ open: false,
             self.chat_list.reset(n);
             self.chat_reset_pending = false;
         } else if n > self.chat_items {
-            self.chat_list.splice(self.chat_items..self.chat_items, n);
+            // splice 的第二参数是替换后的数量：空范围插 (n - 旧总数) 条
+            self.chat_list.splice(self.chat_items..self.chat_items, n - self.chat_items);
         }
         self.chat_items = n;
         if n > 0 && (force_bottom || self.list_bottom.get()) {
@@ -3701,17 +3702,22 @@ impl AppView {
                                 if ix == v.entries.len() && v.running {
                                     v.render_status_line().into_any_element()
                                 } else {
-                                    // 统计行（web StatsLine）
+                                    // 统计行（web StatsLine）：流内居中
                                     div()
                                         .w_full()
-                                        .text_center()
-                                        .text_size(px(theme::FONT_CAPTION))
-                                        .line_height(px(20.0))
-                                        .text_color(theme::t().text_3)
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(v.stats_line())
+                                        .flex()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .max_w_full()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .text_ellipsis()
+                                                .text_size(px(theme::FONT_CAPTION))
+                                                .line_height(px(20.0))
+                                                .text_color(theme::t().text_3)
+                                                .child(v.stats_line()),
+                                        )
                                         .into_any_element()
                                 }
                             })
@@ -3947,16 +3953,17 @@ impl AppView {
         if self.stats_turns > 0 && !self.running {
             // web StatsLine：流内居中，12/20 tertiary，nowrap ellipsis
             col = col.child(
-                div()
-                    .w_full()
-                    .text_center()
-                    .text_size(px(theme::FONT_CAPTION))
-                    .line_height(px(20.0))
-                    .text_color(theme::t().text_3)
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(self.stats_line()),
+                div().w_full().flex().justify_center().child(
+                    div()
+                        .max_w_full()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(20.0))
+                        .text_color(theme::t().text_3)
+                        .child(self.stats_line()),
+                ),
             );
         }
         div().w_full().child(col)

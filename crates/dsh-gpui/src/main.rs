@@ -3587,14 +3587,14 @@ impl AppView {
                         })
                         .child({
                             let t_add_ws = this.clone();
-                            icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, _, cx| {
-                                // rfd 同步对话框在 GPUI 主线程派发里跑模态
-                                // NSOpenPanel 会 panic_cannot_unwind abort；
-                                // 改异步 API（completion 回调式）
+                            icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, window, cx| {
+                                // 异步目录拾取：Task 丢弃即取消，必须 detach；
+                                // set_parent 挂到点击所在窗口（rfd 缺省取
+                                // windows().firstObject()，GPUI 下可能挂错窗）
                                 let t = t_add_ws.clone();
-                                let _ = cx.spawn(async move |cx| {
-                                    eprintln!("[ws-pick] await folder dialog...");
-                                    let picked = rfd::AsyncFileDialog::new().pick_folder().await;
+                                let dialog = rfd::AsyncFileDialog::new().set_parent(window);
+                                cx.spawn(async move |cx| {
+                                    let picked = dialog.pick_folder().await;
                                     eprintln!("[ws-pick] resolved: {:?}", picked.as_ref().map(|f| f.path().to_string_lossy().to_string()));
                                     if let Some(folder) = picked {
                                         let p = folder.path().to_string_lossy().to_string();
@@ -3604,7 +3604,8 @@ impl AppView {
                                             }
                                         });
                                     }
-                                });
+                                })
+                                .detach();
                             })
                         }),
                 )
@@ -4365,7 +4366,7 @@ impl AppView {
                                             // 可能挂到不可见窗口导致面板永不出现）
                                             let t = t_add.clone();
                                             let dialog = rfd::AsyncFileDialog::new().set_parent(window);
-                                            let _ = cx.spawn(async move |cx| {
+                                            cx.spawn(async move |cx| {
                                                 let picked = dialog.pick_folder().await;
                                                 if let Some(folder) = picked {
                                                     let p = folder.path().to_string_lossy().to_string();
@@ -4375,7 +4376,8 @@ impl AppView {
                                                         }
                                                     });
                                                 }
-                                            });
+                                            })
+                                            .detach();
                                         })
                                         .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
                                         .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),

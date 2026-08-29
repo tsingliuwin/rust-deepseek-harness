@@ -1147,7 +1147,9 @@ impl AppView {
             pending_clear: false,
             _input_subscription: subscription,
             _search_subscription: search_subscription,
-            chat_list: ListState::new(0, ListAlignment::Bottom, px(100.0)),
+            // Top 对齐（web 同语义）：内容自顶排布，短会话首条消息在顶部；
+            // 溢出后的吸底由 sync_chat_list 的 scroll_to_reveal_item 承担
+            chat_list: ListState::new(0, ListAlignment::Top, px(100.0)),
             chat_items: 0,
             list_bottom: Rc::new(Cell::new(true)),
             last_drag_tick: Instant::now(),

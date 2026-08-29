@@ -3996,34 +3996,6 @@ impl AppView {
                                         .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
                                         .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),
                                 );
-                        let t_add = hero_this.clone();
-                        menu = menu
-                            .child(div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2))
-                            .child(
-                                div()
-                                    .id("hero-ws-add")
-                                    .h(px(32.0))
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .px(px(10.0))
-                                    .rounded(px(6.0))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::t().hover))
-                                    .on_click(move |_, _, cx| {
-                                        t_add.update(cx, |v, cx| {
-                                            v.hero_ws_menu = false;
-                                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                                let p = path.to_string_lossy().to_string();
-                                                if !v.workspaces.iter().any(|w| w.path == p) {
-                                                    v.create_workspace(p, cx);
-                                                }
-                                            }
-                                        });
-                                    })
-                                    .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
-                                    .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),
-                            );
                         stack
                             .child(
                                 div()

@@ -1488,9 +1488,7 @@ open: false,
         if self.running {
             return;
         }
-        let id = self.alloc_session_id();
         let ws = self.current_workspace.clone();
-        // 会话挂在当前工作区的目录（web 布局），无工作区时挂进程 cwd
         let cwd = ws
             .as_ref()
             .and_then(|wid| self.workspaces.iter().find(|w| &w.id == wid).map(|w| w.path.clone()))
@@ -1499,6 +1497,15 @@ open: false,
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default()
             });
+        // web connectWorkspace 语义：目标工作区已有空白会话则复用之，
+        // 绝不每次点击都新建（否则空会话灌满列表）
+        if let Some(blank) = self.blank_session_in(&cwd) {
+            if self.current_session_id() != blank {
+                self.switch_session(blank, cx);
+            }
+            return;
+        }
+        let id = self.alloc_session_id();
         let _ = self.recorder.create(&id, &cwd, "standard");
         self.current_cwd = cwd.clone();
         self.sync_fs_sandbox();
@@ -1523,6 +1530,29 @@ open: false,
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd) });
         cx.notify();
     }
+    /// 目标目录下已知的空白会话（web summary.blank 的等价判定：
+    /// 当前会话直接查内存；其余按 meta.cwd 过滤后加载验证）。
+    fn blank_session_in(&self, cwd: &str) -> Option<SessionId> {
+        // 当前会话：内存即真
+        let current = self.current_session_id();
+        if self.is_empty_session()
+            && self.sessions.iter().any(|s| s.id == current && s.cwd.as_deref() == Some(cwd))
+        {
+            return Some(current);
+        }
+        for meta in &self.sessions {
+            if meta.id == current || meta.cwd.as_deref() != Some(cwd) {
+                continue;
+            }
+            if let Ok((session, _)) = self.recorder.load(&meta.id, Some(cwd))
+                && session.entries().is_empty()
+            {
+                return Some(meta.id.clone());
+            }
+        }
+        None
+    }
+
     /// hero 选择工作区时重绑空会话（web New Session 草稿语义：选工作区
     /// 决定会话落点）。仅当当前会话为空时重绑——新建一份挂到所选工作区
     /// 的会话，删除旧的 header-only 文件，同步 cwd/沙箱/工具工作目录。
@@ -1536,22 +1566,52 @@ open: false,
             .and_then(|wid| self.workspaces.iter().find(|w| &w.id == wid))
             .map(|w| w.path.clone())
             .unwrap_or_else(|| self.current_cwd.clone());
+        // web connectWorkspace：目标工作区已有空白会话 → 直接切过去
+        if let Some(blank) = self.blank_session_in(&ws_path) {
+            // 旧的空会话若未挂任何工作区（启动空白的遗留），清理掉
+            let old_id = self.current_session_id();
+            let old_cwd = self.current_cwd.clone();
+            if self.is_empty_session()
+                && !self.workspaces.iter().any(|w| w.session_ids.iter().any(|sid| sid == old_id.as_str()))
+                && let Ok((old_session, _)) = self.recorder.load(&old_id, Some(old_cwd.as_str()))
+                && old_session.entries().is_empty()
+            {
+                let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
+                self.sessions.retain(|s| s.id != old_id);
+            }
+            self.current_cwd = ws_path;
+            self.sync_fs_sandbox();
+            self.switch_session(blank, cx);
+            return;
+        }
         let old_id = self.current_session_id();
         let old_cwd = self.current_cwd.clone();
         let new_id = self.alloc_session_id();
         let _ = self.recorder.create(&new_id, &ws_path, "standard");
-        // 旧的空会话文件（header-only）不再保留，避免跨桶残留
-        let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
-        self.sessions.retain(|s| s.id != old_id);
+        // 旧空白会话挂在别的目录（通常是无工作区的启动空白）且无内容：
+        // 留着会成为列表里的孤儿空行，删除（有内容则绝不动）
+        if old_cwd != ws_path
+            && let Ok((old_session, _)) = self.recorder.load(&old_id, Some(old_cwd.as_str()))
+            && old_session.entries().is_empty()
+        {
+            let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
+            self.sessions.retain(|s| s.id != old_id);
+        }
         self.current_cwd = ws_path.clone();
         self.agent.set_session(Session::new(new_id.clone()));
+        self.entries.clear();
+        self.running = false;
+        self.turn_started_at = None;
+        self.selected_tool = None;
         self.sessions.insert(
             0,
             SessionMeta { id: new_id.clone(), title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(ws_path) },
         );
+        self.chat_reset_pending = true;
         let ws = self.current_workspace.clone();
         self.assign_session_to_workspace(&new_id, ws.as_deref());
         self.sync_fs_sandbox();
+        self.sync_chat_list(true);
         cx.notify();
     }
 

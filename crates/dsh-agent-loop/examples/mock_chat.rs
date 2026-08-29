@@ -103,6 +103,7 @@ async fn main() {
             max_tokens: None,
             system_prompt: Some("You are a concise assistant.".into()),
             compaction: Default::default(),
+            workdir: Default::default(),
         },
         llm,
         tools,

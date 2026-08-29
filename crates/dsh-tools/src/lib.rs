@@ -33,6 +33,42 @@ impl ToolExecutionInput {
     }
 }
 
+/// 会话工作目录（web `session.header.cwd` 的共享句柄）：宿主在切换
+/// 工作区/会话时更新，工具据此取执行目录与相对路径基准。None = 未设置，
+/// 工具回退进程 cwd（与 web 的 `header.cwd ?? process.cwd()` 同语义）。
+#[derive(Clone, Debug, Default)]
+pub struct Workdir(Arc<std::sync::RwLock<Option<std::path::PathBuf>>>);
+
+impl Workdir {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_value(path: impl Into<std::path::PathBuf>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(Some(path.into()))))
+    }
+
+    pub fn set(&self, path: impl Into<std::path::PathBuf>) {
+        *self.0.write().unwrap() = Some(path.into());
+    }
+
+    pub fn get(&self) -> Option<std::path::PathBuf> {
+        self.0.read().unwrap().clone()
+    }
+
+    /// 相对路径按工作目录展开；绝对路径原样返回。
+    pub fn resolve(&self, path: &std::path::Path) -> std::path::PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match self.get() {
+                Some(wd) => wd.join(path),
+                None => path.to_path_buf(),
+            }
+        }
+    }
+}
+
 /// The result of one tool invocation.
 #[derive(Clone, Debug)]
 pub struct ToolExecutionResult {

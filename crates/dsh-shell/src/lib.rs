@@ -23,11 +23,17 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub struct ShellTool {
     default_timeout_ms: u64,
     max_timeout_ms: u64,
+    /// 会话工作目录（web session.header.cwd；None = 进程 cwd）
+    workdir: dsh_tools::Workdir,
 }
 
 impl Default for ShellTool {
     fn default() -> Self {
-        Self { default_timeout_ms: DEFAULT_TIMEOUT_MS, max_timeout_ms: MAX_TIMEOUT_MS }
+        Self {
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_timeout_ms: MAX_TIMEOUT_MS,
+            workdir: dsh_tools::Workdir::new(),
+        }
     }
 }
 
@@ -36,7 +42,14 @@ impl ShellTool {
         Self {
             default_timeout_ms: default_timeout_ms.max(1),
             max_timeout_ms: max_timeout_ms.max(default_timeout_ms.max(1)),
+            workdir: dsh_tools::Workdir::new(),
         }
+    }
+
+    /// 注入会话工作目录（命令在此目录下执行）。
+    pub fn with_workdir(mut self, workdir: dsh_tools::Workdir) -> Self {
+        self.workdir = workdir;
+        self
     }
 }
 
@@ -68,11 +81,11 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(self.default_timeout_ms)
             .clamp(1, self.max_timeout_ms);
-        run(&command, timeout_ms).await
+        run(&command, timeout_ms, &self.workdir).await
     }
 }
 
-async fn run(command: &str, timeout_ms: u64) -> ToolExecutionResult {
+async fn run(command: &str, timeout_ms: u64, workdir: &dsh_tools::Workdir) -> ToolExecutionResult {
     use tokio::io::AsyncReadExt;
 
     #[cfg(target_os = "windows")]
@@ -87,7 +100,10 @@ async fn run(command: &str, timeout_ms: u64) -> ToolExecutionResult {
         c.args(["-c", command]);
         c
     };
-    cmd.kill_on_drop(true).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .current_dir(workdir.get().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()));
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return ToolExecutionResult::error(format!("spawn failed: {e}")),
@@ -175,6 +191,24 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(text.contains("timed out after 100ms"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn runs_in_injected_workdir() {
+        let dir = std::env::temp_dir().join(format!("dsh-shell-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ShellTool::default().with_workdir(dsh_tools::Workdir::with_value(dir.clone()));
+        let result = tool.execute(&input(r#"{"command": "basename \"$PWD\""}"#)).await;
+        let text = result
+            .content
+            .iter()
+            .find_map(|b| match b {
+                dsh_llm::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains(&format!("dsh-shell-wd-{}", std::process::id())), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

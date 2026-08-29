@@ -899,6 +899,8 @@ struct AppView {
     subagent: Arc<dsh_subagent::SubagentTool>,
     /// fs 沙箱句柄（工作区切换时同步写根）
     fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
+    /// 会话工作目录句柄（工具执行基准 + 模型可见上下文）
+    workdir: dsh_tools::Workdir,
     sessions: Vec<SessionMeta>,
     /// 工作区列表（与 web 共享 storages/workspace.json）
     workspaces: Vec<WorkspaceInfo>,
@@ -1048,6 +1050,7 @@ impl AppView {
         deps: AppDeps,
         subagent: Arc<dsh_subagent::SubagentTool>,
         fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
+        workdir: dsh_tools::Workdir,
         sessions: Vec<SessionMeta>,
         input: Entity<InputState>,
         #[allow(dead_code)] // 被 DeepSeek 卡引用
@@ -1097,6 +1100,7 @@ impl AppView {
             llm: deps.llm,
             subagent,
             fs_sandbox,
+            workdir,
             sessions,
             entries: Vec::new(),
             input,
@@ -1362,6 +1366,7 @@ open: false,
         if let Some(c) = cwd {
             self.current_cwd = c;
         }
+        self.sync_fs_sandbox();
         self.agent.set_session(session);
         self.rebuild_from_session();
         self.stats_turns = 0;
@@ -1387,6 +1392,7 @@ open: false,
             });
         let _ = self.recorder.create(&id, &cwd, "standard");
         self.current_cwd = cwd.clone();
+        self.sync_fs_sandbox();
         self.agent.set_session(Session::new(id.clone()));
         self.entries.clear();
         self.running = false;
@@ -1786,16 +1792,20 @@ open: false,
         self.persist_settings();
     }
 
-    /// fs 沙箱根同步：写限定在当前工作区（无工作区时进程 cwd）。
+    /// 工作区同步：fs 沙箱写根 + 会话工作目录（工具执行基准 + 模型可见
+    /// 上下文）。基准是当前会话的 cwd（current_cwd），而非 hero 选择的
+    /// 工作区——两者在新会话/切换会话时对齐。
     fn sync_fs_sandbox(&self) {
-        let root = self
-            .current_workspace
-            .as_ref()
-            .and_then(|id| self.workspaces.iter().find(|w| &w.id == id))
-            .map(|w| w.path.clone())
-            .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))
-            .unwrap_or_default();
-        self.fs_sandbox.set_roots(vec![std::path::PathBuf::from(root)]);
+        let root = if self.current_cwd.is_empty() {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            self.current_cwd.clone()
+        };
+        self.fs_sandbox.set_roots(vec![std::path::PathBuf::from(root.clone())]);
+        self.workdir.set(root);
     }
 
     /// 宿主路由切换：主 agent 与子 agent 工具同步。
@@ -4397,13 +4407,16 @@ fn main() {
     };
 
     let tools = Arc::new(ToolRegistry::new());
+    // 会话工作目录（web session.header.cwd）：工具执行基准 + 模型可见上下文，
+    // 随工作区/会话切换经 AppView 同步
+    let workdir = dsh_tools::Workdir::new();
     // fs 沙箱：写限定在当前工作区根之下（随工作区切换经 AppView 同步）
     let fs_sandbox = Arc::new(dsh_fs::WorkspaceContainment::new(Vec::new()));
-    let _fs = tools.register(Arc::new(FsTool::new(fs_sandbox.clone()))).unwrap();
-    let _shell = tools.register(Arc::new(ShellTool::default())).unwrap();
+    let _fs = tools.register(Arc::new(FsTool::new(fs_sandbox.clone()).with_workdir(workdir.clone()))).unwrap();
+    let _shell = tools.register(Arc::new(ShellTool::default().with_workdir(workdir.clone()))).unwrap();
     let _web = tools.register(Arc::new(WebTool::new())).unwrap();
-    let _grep = tools.register(Arc::new(dsh_search::GrepTool)).unwrap();
-    let _glob = tools.register(Arc::new(dsh_search::GlobTool)).unwrap();
+    let _grep = tools.register(Arc::new(dsh_search::GrepTool::default().with_workdir(workdir.clone()))).unwrap();
+    let _glob = tools.register(Arc::new(dsh_search::GlobTool::default().with_workdir(workdir.clone()))).unwrap();
     let prompt = Arc::new(SystemPrompt::new());
     // web_search：DeepSeek 搜索 provider（env key 优先，回退存储 key；
     // 无 key 不注册——工具缺席与 web provider 未配置同语义）
@@ -4425,7 +4438,8 @@ fn main() {
         provider.clone(),
         model.clone(),
     )
-    .with_system_prompt(Some("You are a focused subagent. Complete the delegated task and report the result concisely.".into()));
+    .with_system_prompt(Some("You are a focused subagent. Complete the delegated task and report the result concisely.".into()))
+    .with_workdir(workdir.clone());
     let _subagent = tools.register(subagent_tool.clone()).unwrap();
     // web tool:grep section：引导模型用 grep 工具而非 shell grep
     let _grep_section = prompt.add_section(dsh_system_prompt::PromptSection {
@@ -4513,6 +4527,7 @@ fn main() {
             max_tokens: None,
             system_prompt: Some("You are DeepSeek Harness (Rust), a helpful coding agent.".into()),
             compaction: dsh_compaction::CompactionConfig::default(),
+            workdir: workdir.clone(),
         },
         Arc::clone(&llm),
         tools,
@@ -4660,6 +4675,7 @@ fn main() {
                         deps,
                         subagent_tool.clone(),
                         fs_sandbox.clone(),
+                        workdir.clone(),
                         sessions_meta.clone(),
                         input.clone(),
                         api_input,

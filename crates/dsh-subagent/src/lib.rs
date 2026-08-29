@@ -27,6 +27,8 @@ pub struct SubagentTool {
     /// 子 agent 路由（默认继承父路由；宿主在切换模型时经
     /// [`Self::set_route`] 同步更新）。
     route: Arc<std::sync::RwLock<(String, String)>>,
+    /// 会话工作目录（子 agent 与父共享同一句柄 → 自动继承）
+    workdir: dsh_tools::Workdir,
     max_tokens: Option<u32>,
     system_prompt: Option<String>,
     /// 全局活着的子 agent 深度（跨嵌套共享）。
@@ -50,6 +52,7 @@ impl SubagentTool {
             tools,
             prompt,
             route: Arc::new(std::sync::RwLock::new((provider.into(), model.into()))),
+            workdir: dsh_tools::Workdir::new(),
             max_tokens: None,
             system_prompt: None,
             depth: Arc::new(AtomicU32::new(0)),
@@ -90,6 +93,15 @@ impl SubagentTool {
     /// 宿主路由切换时同步子 agent 路由。
     pub fn set_route(&self, provider: impl Into<String>, model: impl Into<String>) {
         *self.route.write().unwrap() = (provider.into(), model.into());
+    }
+
+    /// 注入会话工作目录句柄（Workdir 是共享句柄：宿主更新同一对象，
+    /// 子 agent 自动跟随）。
+    pub fn with_workdir(mut self: Arc<Self>, workdir: dsh_tools::Workdir) -> Arc<Self> {
+        if let Some(tool) = Arc::get_mut(&mut self) {
+            tool.workdir = workdir;
+        }
+        self
     }
 }
 
@@ -159,6 +171,7 @@ prompt as a complete brief. This call waits for the subagent and returns its fin
             max_tokens: self.max_tokens,
             system_prompt: self.system_prompt.clone(),
             compaction: Default::default(),
+            workdir: self.workdir.clone(),
         };
         let child = ReactLoopAgent::new(
             dsh_llm::types::SessionId::new(uuid::Uuid::new_v4().to_string()),

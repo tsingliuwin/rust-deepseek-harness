@@ -42,6 +42,9 @@ pub struct AgentOptions {
     pub system_prompt: Option<String>,
     /// 上下文压缩配置（threshold_tokens = 0 禁用；默认 60k/6 条）。
     pub compaction: dsh_compaction::CompactionConfig,
+    /// 会话工作目录（web session.header.cwd → 模型可见的运行时上下文 +
+    /// 工具执行基准；宿主切换工作区时更新同一句柄）。
+    pub workdir: dsh_tools::Workdir,
 }
 
 /// A live event emitted to UI/observers as the loop progresses.
@@ -259,6 +262,17 @@ impl ReactLoopAgent {
         let sections = self.prompt.render();
         if !sections.is_empty() {
             parts.push(sections);
+        }
+        // 运行时上下文：会话工作目录（web sandbox:policy 快照的同一措辞——
+        // 模型据此知道自己在哪个工作区工作）
+        {
+            let o = self.options.read().unwrap();
+            if let Some(ws) = o.workdir.get() {
+                parts.push(format!(
+                    "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"{}\". Some platform temporary areas may also be writable.",
+                    ws.display()
+                ));
+            }
         }
         PromptAssembly {
             system: parts.join("\n\n"),

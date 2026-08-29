@@ -118,13 +118,21 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
 }
 
 /// `fs` 工具：所有操作经注入的策略检查后落到 `std::fs`。
+/// 相对路径按会话工作目录展开（web session.header.cwd 语义）。
 pub struct FsTool {
     policy: Arc<dyn FsPolicy>,
+    workdir: dsh_tools::Workdir,
 }
 
 impl FsTool {
     pub fn new(policy: Arc<dyn FsPolicy>) -> Self {
-        Self { policy }
+        Self { policy, workdir: dsh_tools::Workdir::new() }
+    }
+
+    /// 注入会话工作目录（相对路径的解析基准）。
+    pub fn with_workdir(mut self, workdir: dsh_tools::Workdir) -> Self {
+        self.workdir = workdir;
+        self
     }
 }
 
@@ -155,7 +163,8 @@ impl Tool for FsTool {
     async fn execute(&self, input: &ToolExecutionInput) -> ToolExecutionResult {
         let op = input.arguments.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let path = input.arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let path = Path::new(path);
+        let path = self.workdir.resolve(Path::new(path));
+        let path = path.as_path();
         if path.as_os_str().is_empty() {
             return ToolExecutionResult::error("path must be a non-empty string");
         }

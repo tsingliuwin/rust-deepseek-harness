@@ -79,6 +79,7 @@ async fn main() {
             max_tokens: None,
             system_prompt: None,
             compaction: Default::default(),
+            workdir: Default::default(),
         },
         llm,
         Arc::new(ToolRegistry::new()),

@@ -41,7 +41,23 @@ pub struct GrepMatch {
     pub line: String,
 }
 
-pub struct GrepTool;
+pub struct GrepTool {
+    /// 会话工作目录（path 缺省时的搜索根）
+    workdir: dsh_tools::Workdir,
+}
+
+impl Default for GrepTool {
+    fn default() -> Self {
+        Self { workdir: dsh_tools::Workdir::new() }
+    }
+}
+
+impl GrepTool {
+    pub fn with_workdir(mut self, workdir: dsh_tools::Workdir) -> Self {
+        self.workdir = workdir;
+        self
+    }
+}
 
 impl GrepTool {
     /// 按文件分组（首次出现顺序）为模型可见正文：每组 = 路径行 + 逐匹配
@@ -111,7 +127,8 @@ Use read on a matched file for surrounding context."
         let pattern = input.arguments.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let path = input.arguments.get("path").and_then(|v| v.as_str()).map(str::to_string);
         let include = input.arguments.get("include").and_then(|v| v.as_str()).map(str::to_string);
-        tokio::task::spawn_blocking(move || run(&pattern, path, include))
+        let workdir = self.workdir.clone();
+        tokio::task::spawn_blocking(move || run(&pattern, path, include, &workdir))
             .await
             .unwrap_or_else(|e| ToolExecutionResult::error(format!("grep failed: {e}")))
     }
@@ -119,7 +136,7 @@ Use read on a matched file for surrounding context."
 
 /// 进程内 ripgrep：ignore walk（尊重 .gitignore、跳隐藏）+ glob 过滤 +
 /// 逐行正则匹配。文件参数（非目录）退化为单文件搜索。
-fn run(pattern: &str, path: Option<String>, include: Option<String>) -> ToolExecutionResult {
+fn run(pattern: &str, path: Option<String>, include: Option<String>, workdir: &dsh_tools::Workdir) -> ToolExecutionResult {
     if pattern.is_empty() {
         return ToolExecutionResult::error("pattern must be a non-empty string");
     }
@@ -141,10 +158,8 @@ fn run(pattern: &str, path: Option<String>, include: Option<String>) -> ToolExec
     };
     let root: PathBuf = match &path {
         Some(p) => PathBuf::from(shell_expand(p)),
-        None => match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(e) => return ToolExecutionResult::error(format!("grep failed: {e}")),
-        },
+        // web：session cwd 优先，进程 cwd 兜底
+        None => workdir.get().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
     };
     if !root.exists() {
         return ToolExecutionResult::error(format!("grep failed: no such file or directory: {}", root.display()));
@@ -250,7 +265,23 @@ fn shell_expand(p: &str) -> String {
 /// `rg --files --glob --sort=modified --no-ignore --hidden` 语义——包含
 /// 隐藏与被忽略文件、剔除 VCS 元数据目录、只返回文件从不返回目录）。
 /// 无分隔符的模式按任意深度的 basename 匹配（web 模式描述）。
-pub struct GlobTool;
+pub struct GlobTool {
+    /// 会话工作目录（path 缺省时的搜索根）
+    workdir: dsh_tools::Workdir,
+}
+
+impl Default for GlobTool {
+    fn default() -> Self {
+        Self { workdir: dsh_tools::Workdir::new() }
+    }
+}
+
+impl GlobTool {
+    pub fn with_workdir(mut self, workdir: dsh_tools::Workdir) -> Self {
+        self.workdir = workdir;
+        self
+    }
+}
 
 impl GlobTool {
     /// 路径页格式（web formatGlobPage 的不可保存恢复分支）：正文 + 截断脚注。
@@ -299,7 +330,8 @@ This tool does not enumerate directory entries."
     async fn execute(&self, input: &ToolExecutionInput) -> ToolExecutionResult {
         let pattern = input.arguments.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let path = input.arguments.get("path").and_then(|v| v.as_str()).map(str::to_string);
-        tokio::task::spawn_blocking(move || run_glob(&pattern, path))
+        let workdir = self.workdir.clone();
+        tokio::task::spawn_blocking(move || run_glob(&pattern, path, &workdir))
             .await
             .unwrap_or_else(|e| ToolExecutionResult::error(format!("glob failed: {e}")))
     }
@@ -307,7 +339,7 @@ This tool does not enumerate directory entries."
 
 /// glob 执行：ignore walk 关闭全部忽略规则（--no-ignore --hidden）、
 /// 剪除 VCS 目录、glob 匹配、修改时间升序、100 条内联上限。
-fn run_glob(pattern: &str, path: Option<String>) -> ToolExecutionResult {
+fn run_glob(pattern: &str, path: Option<String>, workdir: &dsh_tools::Workdir) -> ToolExecutionResult {
     if pattern.trim().is_empty() {
         return ToolExecutionResult::error("pattern must be a non-empty string");
     }
@@ -317,10 +349,7 @@ fn run_glob(pattern: &str, path: Option<String>) -> ToolExecutionResult {
     };
     let root: PathBuf = match &path {
         Some(p) => PathBuf::from(shell_expand(p)),
-        None => match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(e) => return ToolExecutionResult::error(format!("glob failed: {e}")),
-        },
+        None => workdir.get().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
     };
     if !root.is_dir() {
         return ToolExecutionResult::error(format!("glob failed: not a directory: {}", root.display()));
@@ -435,6 +464,32 @@ mod tests {
         assert!(!text.contains(".hidden"), "{text}");
         assert!(text.contains("src/a.rs\nLine 1: fn alpha() {}"), "{text}");
         assert!(text.contains("src/b.txt\nLine 1: alpha here"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// workdir 缺省根：path 未给时搜会话工作目录而非进程 cwd。
+    #[tokio::test]
+    async fn grep_defaults_to_injected_workdir() {
+        let dir = std::env::temp_dir().join(format!("dsh-grep-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("needle.txt"), "findme\n").unwrap();
+        let tool = GrepTool::default().with_workdir(dsh_tools::Workdir::with_value(dir.clone()));
+        let result = tool
+            .execute(&dsh_tools::ToolExecutionInput::with_raw_arguments(
+                dsh_llm::CallId("t".into()),
+                "grep".into(),
+                r#"{"pattern": "findme"}"#.into(),
+            ))
+            .await;
+        let text = result
+            .content
+            .iter()
+            .find_map(|b| match b {
+                dsh_llm::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains("needle.txt"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

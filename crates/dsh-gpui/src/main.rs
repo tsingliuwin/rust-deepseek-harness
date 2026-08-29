@@ -1405,6 +1405,38 @@ open: false,
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd) });
         cx.notify();
     }
+    /// hero 选择工作区时重绑空会话（web New Session 草稿语义：选工作区
+    /// 决定会话落点）。仅当当前会话为空时重绑——新建一份挂到所选工作区
+    /// 的会话，删除旧的 header-only 文件，同步 cwd/沙箱/工具工作目录。
+    fn rebind_empty_session_to_workspace(&mut self, cx: &mut Context<Self>) {
+        if !self.is_empty_session() {
+            return;
+        }
+        let ws_path = self
+            .current_workspace
+            .as_ref()
+            .and_then(|wid| self.workspaces.iter().find(|w| &w.id == wid))
+            .map(|w| w.path.clone())
+            .unwrap_or_else(|| self.current_cwd.clone());
+        let old_id = self.current_session_id();
+        let old_cwd = self.current_cwd.clone();
+        let new_id = self.alloc_session_id();
+        let _ = self.recorder.create(&new_id, &ws_path, "standard");
+        // 旧的空会话文件（header-only）不再保留，避免跨桶残留
+        let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
+        self.sessions.retain(|s| s.id != old_id);
+        self.current_cwd = ws_path.clone();
+        self.agent.set_session(Session::new(new_id.clone()));
+        self.sessions.insert(
+            0,
+            SessionMeta { id: new_id.clone(), title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(ws_path) },
+        );
+        let ws = self.current_workspace.clone();
+        self.assign_session_to_workspace(&new_id, ws.as_deref());
+        self.sync_fs_sandbox();
+        cx.notify();
+    }
+
     /// 虚拟列表条目总数：消息 + 流式状态行 + 统计行。
     fn chat_item_count(&self) -> usize {
         self.entries.len()
@@ -3959,6 +3991,7 @@ impl AppView {
                                             let id = id.clone();
                                             t.update(cx, |v, cx| {
                                                 v.current_workspace = Some(id);
+                                                v.rebind_empty_session_to_workspace(cx);
                                                 v.sync_fs_sandbox();
                                                 v.hero_ws_menu = false;
                                                 cx.notify();

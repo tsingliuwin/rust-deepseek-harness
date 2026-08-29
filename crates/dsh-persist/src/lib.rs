@@ -12,7 +12,7 @@ use dsh_llm::{
 };
 use dsh_session::{Session, SessionEvent};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,11 +62,34 @@ pub struct SessionRecorder {
     /// 会话 id → 已解析的会话文件（规范桶锚定；避免 cwd 口径漂移时
     /// 在错误桶里重建/写入副本）。
     resolved: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
+    /// 会话 id → 已写到的最大 seq（增量帧追加的 O(1) 序号源；首触时
+    /// 由整档解码初始化，单写者约束下可靠）。
+    seqs: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl SessionRecorder {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, resolved: std::sync::Mutex::new(Default::default()) }
+        Self { root, resolved: std::sync::Mutex::new(Default::default()), seqs: std::sync::Mutex::new(Default::default()) }
+    }
+
+    /// 事件行以独立的 zstd 帧追加到文件尾（zstd 多帧连接是标准格式，
+    /// 流式解码跨帧读取）——落盘 O(事件)，替代整档解压+重写。
+    fn append_frame(&self, file: &Path, line: &str) -> io::Result<()> {
+        use std::io::Write;
+        let frame = zstd::stream::encode_all(line.as_bytes(), 0)?;
+        let mut f = fs::OpenOptions::new().create(true).append(true).open(file)?;
+        f.write_all(&frame)
+    }
+
+    /// 下一个 seq：缓存优先；首触或缓存缺失时整档解码初始化。
+    fn next_seq(&self, id: &SessionId, file: &Path) -> u64 {
+        let mut cache = self.seqs.lock().unwrap();
+        if let Some(seq) = cache.get(id.as_str()) {
+            return *seq + 1;
+        }
+        let (_, last) = self.read_lines(file);
+        cache.insert(id.as_str().to_string(), last);
+        last + 1
     }
 
     /// 规范桶解析：hint 命中优先，其次全桶扫描取最近修改。
@@ -135,9 +158,12 @@ impl SessionRecorder {
             "delegationDepth": 0,
             "agentPreset": agent_preset,
         });
-        let mut buf = Vec::new();
-        writeln!(buf, "{}", header)?;
-        self.write_compressed(&file, &buf)?;
+        let mut buf = String::new();
+        buf.push_str(&header.to_string());
+        buf.push('\n');
+        self.append_frame(&file, &buf)?;
+        self.resolved.lock().unwrap().insert(id.as_str().to_string(), file.clone());
+        self.seqs.lock().unwrap().insert(id.as_str().to_string(), 0);
         // projcache 身份行：web 侧栏冷启动先读投影（identity 足够定位）
         self.touch_projcache(id, cwd, 0, None);
         Ok(())
@@ -205,35 +231,30 @@ impl SessionRecorder {
                 self.session_file(id, cwd)
             }
         };
-        let (mut lines, last_seq) = self.read_lines(&file);
-        if lines.is_empty() && file.exists() && fs::metadata(&file).map(|m| m.len() > 0).unwrap_or(false) {
-            // 文件存在却解不出内容：拒绝覆盖（可能是不认识的编码/半写状态）
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("session log unreadable, refusing to overwrite: {}", file.display()),
-            ));
+        // 已存在但解不出内容（非空文件）：拒绝追加（可能是不认识的编码/半写状态）
+        if !self.resolved.lock().unwrap().contains_key(id.as_str())
+            && file.exists()
+            && fs::metadata(&file).map(|m| m.len() > 0).unwrap_or(false)
+        {
+            let probe = self.read_lines(&file);
+            if probe.0.is_empty() {
+                self.resolved.lock().unwrap().insert(id.as_str().to_string(), file.to_path_buf());
+            }
         }
-        if lines.is_empty() {
-            // 空文件（仅 header 或零字节）：补 header
-            self.create(id, cwd, "standard")?;
-            lines = self.read_lines(&file).0;
-        }
-        let seq = last_seq + 1;
+        let seq = self.next_seq(id, &file);
         if let SessionEvent::SessionTitle { title } = event {
             self.touch_projcache(id, cwd, seq, Some(title));
         }
         let row = event_to_web_line(event, seq, now_ms());
-        let mut buf = String::new();
-        for l in &lines {
-            buf.push_str(l);
-            buf.push('\n');
+        match row {
+            Some(row) => {
+                self.append_frame(&file, &format!("{}\n", row))?;
+                self.seqs.lock().unwrap().insert(id.as_str().to_string(), seq);
+                Ok(())
+            }
+            // 不落盘的辅助事件：也不消耗 seq（与整档重写语义一致）
+            None => Ok(()),
         }
-        if let Some(row) = row {
-            buf.push_str(&row.to_string());
-            buf.push('\n');
-        }
-        let bytes = buf.into_bytes();
-        self.write_compressed(&file, &bytes)
     }
 
     /// 会话标题（`session/title` 事件的最新值）。
@@ -359,6 +380,8 @@ impl SessionRecorder {
 
     /// 删除会话（web 布局整目录；散文件兜底）。
     pub fn delete(&self, id: &SessionId, cwd: Option<&str>) -> io::Result<()> {
+        self.resolved.lock().unwrap().remove(id.as_str());
+        self.seqs.lock().unwrap().remove(id.as_str());
         if let Some(cwd) = cwd {
             let dir = self.project_dir(cwd).join(id.as_str());
             if dir.exists() {
@@ -410,16 +433,6 @@ impl SessionRecorder {
         (lines, last_seq)
     }
 
-    fn write_compressed(&self, file: &Path, bytes: &[u8]) -> io::Result<()> {
-        let tmp = file.with_extension("zstd.tmp");
-        {
-            let mut out = File::create(&tmp)?;
-            let mut enc = zstd::stream::Encoder::new(&mut out, 3)?;
-            enc.write_all(bytes)?;
-            enc.finish()?;
-        }
-        fs::rename(&tmp, file)
-    }
 }
 
 fn read_decompressed(file: &Path) -> io::Result<Vec<u8>> {
@@ -723,6 +736,11 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         SessionEvent::SessionTitle { title } => Some(row(
             "session/title",
             serde_json::json!({"title": title, "messageSeqs": [], "source": {"kind": "fallback"}}),
+        )),
+        // 流式 chunk（web assistant/chunk：载荷即 StreamChunk 的 serde 形状）
+        SessionEvent::AssistantChunk { turn, step, chunk } => Some(row(
+            "assistant/chunk",
+            serde_json::json!({"chunk": serde_json::to_value(chunk).unwrap_or(serde_json::Value::Null), "turn": turn, "step": step}),
         )),
         _ => None,
     }

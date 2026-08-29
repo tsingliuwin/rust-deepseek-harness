@@ -1261,6 +1261,9 @@ impl AppView {
 
     /// 删除会话：清 JSONL + 列表 + 工作区归属。
     fn delete_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        if self.running && self.current_session_id() == *id {
+            return;
+        }
         let cwd_hint = self.sessions.iter().find(|s| &s.id == id).and_then(|s| s.cwd.clone());
         let _ = self.recorder.delete(id, cwd_hint.as_deref());
         self.sessions.retain(|s| &s.id != id);
@@ -1353,7 +1356,13 @@ open: false,
     }
 
     /// Switch the agent to a persisted session and rebuild the transcript.
+    /// 运行中禁止切换：单 agent 架构下轮次输出随 agent 的当前会话走，
+    /// 切换会把旧对话的流式输出写进新会话（web 为每会话独立 agent，
+    /// 此处是与 web 的已文档化偏差）。
     fn switch_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
         let cwd_hint = self
             .sessions
             .iter()
@@ -1379,6 +1388,9 @@ open: false,
 
     /// Create a fresh session and make it current.
     fn new_session(&mut self, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
         let id = self.alloc_session_id();
         let ws = self.current_workspace.clone();
         // 会话挂在当前工作区的目录（web 布局），无工作区时挂进程 cwd
@@ -1409,7 +1421,7 @@ open: false,
     /// 决定会话落点）。仅当当前会话为空时重绑——新建一份挂到所选工作区
     /// 的会话，删除旧的 header-only 文件，同步 cwd/沙箱/工具工作目录。
     fn rebind_empty_session_to_workspace(&mut self, cx: &mut Context<Self>) {
-        if !self.is_empty_session() {
+        if self.running || !self.is_empty_session() {
             return;
         }
         let ws_path = self

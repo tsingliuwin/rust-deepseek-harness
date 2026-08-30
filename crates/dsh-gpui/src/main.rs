@@ -960,6 +960,12 @@ struct AppView {
     current_cwd: String,
     /// 侧栏弹出的行菜单（会话 … / 工作区 … 均用 Option<MenuTarget>）
     sidebar_menu: Option<(String, String, f32)>,
+    /// 视图选项触发按钮 / 侧栏列的窗口 bounds（每帧 prepaint 捕获；
+    /// 菜单锚定 = 按钮下方 4px、右缘对齐，web Menu portal align=end）
+    sb_anchor_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
+    sb_col_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
+    /// 侧栏搜索药丸的窗口 bounds（点外收起判定用）
+    sb_search_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
     /// 工作区重命名中的目标 id（弹出小对话框）
     renaming_workspace: Option<String>,
     /// hero「选择工作区」菜单开合
@@ -1231,6 +1237,9 @@ impl AppView {
             archived: load_archived_ids().into_iter().collect(),
             current_cwd: String::new(),
             sidebar_menu: None,
+            sb_anchor_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            sb_col_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            sb_search_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
             renaming_workspace: None,
             hero_ws_menu: false,
             search_open: false,
@@ -3043,6 +3052,7 @@ impl Render for AppView {
 
         let this = cx.entity();
         let drag_target = this.clone();
+        let sb_col_bounds = self.sb_col_bounds.clone();
 
         let mut root = div()
             .size_full()
@@ -3050,6 +3060,10 @@ impl Render for AppView {
             .relative()
             .bg(theme::t().bg_base)
             .text_color(theme::t().text)
+            // 侧栏列 bounds（首子元素）每帧捕获：视图菜单锚定换算用
+            .on_children_prepainted(move |children, _, _| {
+                *sb_col_bounds.borrow_mut() = children.first().cloned();
+            })
             // Zed redistributable_columns 模式：拖拽期间 move 事件全窗捕获，
             // 指针越过 8px 把手也照常跟手（捕获阶段，一处分发）。
             .on_drag_move::<ColumnDrag>(move |ev, window, cx| {
@@ -3542,7 +3556,7 @@ impl AppView {
                                     .text_size(px(theme::FONT_ROW))
                                     .line_height(px(20.0))
                                     .text_color(theme::t().text_3)
-                                    .child("会话"),
+                                    .child("工作区"),
                             )
                             .child({
                                 let t = this.clone();
@@ -3555,57 +3569,142 @@ impl AppView {
                             })
                         })
                         .when(self.search_open, |hdr| {
+                            // web .searchExpanded：动作簇（视图选项 / 添加
+                            // 工作区）整体让位，药丸独占头行。展开动效对齐
+                            // web 的 180ms ease-in-out：药丸从 28px 圆钮长到
+                            // 整行，输入与清除钮同步淡入（gpui 无 CSS 过渡，
+                            // 用 with_animation 补）
+                            let t = this.clone();
+                            let search_bounds = self.sb_search_bounds.clone();
+                            let pill_full = (width - 28.0).max(120.0);
                             hdr.child(
                                 div()
-                                    .id("sb-search-input")
                                     .flex_1()
-                                    .h(px(30.0))
-                                    .rounded(px(10.0))
-                                    .border_1()
-                                    .border_color(theme::t().border_l2)
-                                    .child(Input::new(&self.search_input).appearance(false).w_full()),
+                                    .min_w_0()
+                                    .on_children_prepainted(move |children, _, _| {
+                                        *search_bounds.borrow_mut() = children.first().cloned();
+                                    })
+                                    .child(
+                                        div()
+                                            .id("sb-search-pill")
+                                            .h(px(30.0))
+                                            .flex()
+                                            .items_center()
+                                            .overflow_hidden()
+                                            .pr(px(4.0))
+                                            .rounded(px(10.0))
+                                            .border_1()
+                                            .border_color(theme::t().border_l2)
+                                            .child(
+                                                div()
+                                                    .w(px(28.0))
+                                                    .h(px(30.0))
+                                                    .flex_none()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        Icon::new(IconName::Search)
+                                                            .size(px(11.0))
+                                                            .text_color(theme::t().caption),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .child(
+                                                        Input::new(&self.search_input)
+                                                            .appearance(false)
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .text_size(px(theme::FONT_TAB)),
+                                                    )
+                                                    .child({
+                                                        div()
+                                                            .id("sb-search-clear")
+                                                            .w(px(24.0))
+                                                            .h(px(24.0))
+                                                            .flex_none()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .rounded_full()
+                                                            .cursor_pointer()
+                                                            .text_color(theme::t().text_2)
+                                                            .hover(|s| s.bg(theme::t().hover))
+                                                            .on_click(move |_, window, cx| {
+                                                                t.update(cx, |v, cx| {
+                                                                    v.search_open = false;
+                                                                    v.search_query.clear();
+                                                                    v.search_input.update(cx, |s, cx| {
+                                                                        s.set_value("", window, cx);
+                                                                    });
+                                                                    cx.notify();
+                                                                });
+                                                            })
+                                                            .child(Icon::new(IconName::Close).size(px(14.0)))
+                                                    })
+                                                    .with_animation(
+                                                        "sb-search-fade",
+                                                        Animation::new(Duration::from_millis(
+                                                            120,
+                                                        )),
+                                                        |el, delta| el.opacity(delta),
+                                                    ),
+                                            )
+                                            .with_animation(
+                                                "sb-search-expand",
+                                                Animation::new(Duration::from_millis(180))
+                                                    .with_easing(ease_in_out),
+                                                move |pill, delta| {
+                                                    pill.w(px(28.0 + (pill_full - 28.0) * delta))
+                                                },
+                                            ),
+                                    ),
                             )
-                            .child({
+                        })
+                        .when(!self.search_open, |hdr| {
+                            // web .headerActions：搜索展开时整簇隐藏
+                            hdr.child({
                                 let t = this.clone();
-                                icon_btn("sb-search-close", IconName::Close, theme::t().text_2, "关闭搜索", move |_, _, cx| {
-                                    t.update(cx, |v, cx| {
-                                        v.search_open = false;
-                                        v.search_query.clear();
-                                        cx.notify();
-                                    });
-                                })
-                            })
-                        })
-                        .child({
-                            let t = this.clone();
-                            icon_btn("sb-view", IconName::Ellipsis, theme::t().text_2, "视图选项", move |_, _, cx| {
-                                t.update(cx, |v, cx| {
-                                    v.sidebar_menu = Some(("view".into(), String::new(), 96.0));
-                                    cx.notify();
-                                });
-                            })
-                        })
-                        .child({
-                            let t_add_ws = this.clone();
-                            icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, window, cx| {
-                                // 异步目录拾取：Task 丢弃即取消，必须 detach；
-                                // set_parent 挂到点击所在窗口（rfd 缺省取
-                                // windows().firstObject()，GPUI 下可能挂错窗）
-                                let t = t_add_ws.clone();
-                                let dialog = rfd::AsyncFileDialog::new().set_parent(window);
-                                cx.spawn(async move |cx| {
-                                    let picked = dialog.pick_folder().await;
-                                    eprintln!("[ws-pick] resolved: {:?}", picked.as_ref().map(|f| f.path().to_string_lossy().to_string()));
-                                    if let Some(folder) = picked {
-                                        let p = folder.path().to_string_lossy().to_string();
-                                        let _ = t.update(cx, |v, cx| {
-                                            if !v.workspaces.iter().any(|w| w.path == p) {
-                                                v.create_workspace(p, cx);
-                                            }
+                                let anchor_bounds = self.sb_anchor_bounds.clone();
+                                // 包一层捕获按钮窗口 bounds（菜单锚定基准）
+                                div()
+                                    .on_children_prepainted(move |children, _, _| {
+                                        *anchor_bounds.borrow_mut() = children.first().cloned();
+                                    })
+                                    .child(icon_btn("sb-view", IconName::Ellipsis, theme::t().text_2, "视图选项", move |_, _, cx| {
+                                        t.update(cx, |v, cx| {
+                                            v.sidebar_menu = Some(("view".into(), String::new(), 96.0));
+                                            cx.notify();
                                         });
-                                    }
+                                    }))
+                            })
+                            .child({
+                                let t_add_ws = this.clone();
+                                icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, window, cx| {
+                                    // 异步目录拾取：Task 丢弃即取消，必须 detach；
+                                    // set_parent 挂到点击所在窗口（rfd 缺省取
+                                    // windows().firstObject()，GPUI 下可能挂错窗）
+                                    let t = t_add_ws.clone();
+                                    let dialog = rfd::AsyncFileDialog::new().set_parent(window);
+                                    cx.spawn(async move |cx| {
+                                        let picked = dialog.pick_folder().await;
+                                        eprintln!("[ws-pick] resolved: {:?}", picked.as_ref().map(|f| f.path().to_string_lossy().to_string()));
+                                        if let Some(folder) = picked {
+                                            let p = folder.path().to_string_lossy().to_string();
+                                            let _ = t.update(cx, |v, cx| {
+                                                if !v.workspaces.iter().any(|w| w.path == p) {
+                                                    v.create_workspace(p, cx);
+                                                }
+                                            });
+                                        }
+                                    })
+                                    .detach();
                                 })
-                                .detach();
                             })
                         }),
                 )
@@ -3648,19 +3747,73 @@ impl AppView {
                         ),
                 )
                 .when_some(self.sidebar_menu.clone(), |col, (kind, target, y)| {
+                    // 点外关闭（同 hero 面板）：定位壳铺满侧栏来承接菜单
+                    // （taffy 绝对定位以直接父容器为基准），菜单 bounds 经
+                    // prepaint 捕获；canvas 在 paint 阶段注册窗口级 mousedown，
+                    // Bubble 相且落点在菜单外才收起。
+                    let menu_bounds = Arc::new(std::sync::Mutex::new(None::<Bounds<Pixels>>));
+                    let t_dismiss = this.clone();
+                    // 视图菜单锚定触发按钮（web portal align=end：按钮下方
+                    // 4px、右缘对齐按钮右缘）；行菜单（ws/session）保持
+                    // 旧的全宽位。卡规格：min 218 / max 360、r12、
+                    // inverted 发丝边、specific-menu 底（web .list）
+                    let anchor = if kind == "view" {
+                        match (
+                            self.sb_anchor_bounds.borrow().clone(),
+                            self.sb_col_bounds.borrow().clone(),
+                        ) {
+                            (Some(a), Some(c)) => {
+                                // web place() 的视口夹取：x = 按钮右缘 - 菜单宽，
+                                // 两侧留 12px。菜单实际宽即 min-width 218（内容
+                                // 不超）；侧栏过窄时左缘夹在 12px，右缘溢进中栏
+                                // 而不是被窗口裁掉
+                                let btn_right = f32::from(a.origin.x + a.size.width - c.origin.x);
+                                let menu_w = 218.0;
+                                let upper = (self.viewport - menu_w - 12.0).max(12.0);
+                                Some((
+                                    f32::from(a.origin.y + a.size.height - c.origin.y) + 4.0,
+                                    (btn_right - menu_w).clamp(12.0, upper),
+                                ))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     col.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .on_children_prepainted({
+                                let mb = menu_bounds.clone();
+                                move |children, _, _| {
+                                    *mb.lock().unwrap() = children.first().cloned();
+                                }
+                            })
+                            .child(
                         div()
                             .id("sb-menu")
                             .absolute()
-                            .top(px(y))
-                            .left(px(8.0))
-                            .right(px(8.0))
+                            // 不透明卡面：遮住后方元素的 hover/点击
+                            .occlude()
+                            .map(|d| {
+                                if let Some((top, left)) = anchor {
+                                    d.top(px(top)).left(px(left))
+                                } else {
+                                    d.top(px(y)).left(px(8.0)).right(px(8.0))
+                                }
+                            })
+                            .min_w(px(218.0))
+                            .max_w(px(360.0))
                             .v_flex()
                             .p(px(4.0))
-                            .rounded(px(8.0))
+                            .rounded(px(12.0))
                             .border_1()
-                            .border_color(theme::t().border_l2)
-                            .bg(theme::t().surface)
+                            .border_color(theme::t().border_inverted)
+                            .bg(theme::t().menu)
                             .shadow_lg()
                             .children(if kind == "view" {
                                 // 视图选项（web ViewOptionsMenu：分组 label + 单选 + 分隔 + 排序）
@@ -3750,6 +3903,64 @@ impl AppView {
                                     }).into_any_element(),
                                 ]
                             }),
+                        ),
+                    )
+                    .child(
+                        // canvas 必须脱流（同 hero：gap 型 v_flex 会多一条间隙）
+                        div().absolute().child(canvas(
+                            move |_, _, _| {},
+                            move |_, _, window, _| {
+                                let bounds = menu_bounds
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .unwrap_or_default();
+                                window.on_mouse_event(
+                                    move |event: &MouseDownEvent, phase: DispatchPhase, _, cx| {
+                                        if phase == DispatchPhase::Bubble
+                                            && !bounds.contains(&event.position)
+                                        {
+                                            t_dismiss.update(cx, |v, cx| {
+                                                if v.sidebar_menu.is_some() {
+                                                    v.sidebar_menu = None;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }
+                                    },
+                                );
+                            },
+                        )),
+                    )
+                })
+                .when(self.search_open, |col| {
+                    // web WorkspaceBrowser 外点收起：点搜索药丸之外先失焦，
+                    // 查询为空才收起；非空保持展开（结果仍可见）
+                    let search_bounds = self.sb_search_bounds.clone();
+                    let t = this.clone();
+                    col.child(
+                        div().absolute().child(canvas(
+                            move |_, _, _| {},
+                            move |_, _, window, _| {
+                                let bounds = search_bounds.borrow().clone().unwrap_or_default();
+                                window.on_mouse_event(
+                                    move |event: &MouseDownEvent, phase: DispatchPhase, _, cx| {
+                                        if phase == DispatchPhase::Bubble
+                                            && !bounds.contains(&event.position)
+                                        {
+                                            t.update(cx, |v, cx| {
+                                                if v.search_open
+                                                    && v.search_query.trim().is_empty()
+                                                {
+                                                    v.search_open = false;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }
+                                    },
+                                );
+                            },
+                        )),
                     )
                 })
                 .child(
@@ -4221,8 +4432,8 @@ impl AppView {
                                         .rounded_full()
                                         .border_1()
                                         .border_color(theme::t().hover)
-                                        .bg(gpui::rgb(0x283142))
-                                        .text_color(theme::t().text)
+                                        .bg(theme::t().business_tertiary)
+                                        .text_color(theme::t().text_bluish)
                                         .font_family(theme_mono())
                                         .text_size(px(theme::FONT_CAPTION))
                                         .line_height(px(theme::FONT_CAPTION_LEADING))
@@ -4302,6 +4513,9 @@ impl AppView {
                         let mut menu = div()
                             .id("hero-ws-menu")
                             .absolute()
+                            // 不透明卡面：遮住后方元素的 hover/点击，鼠标在
+                            // 菜单上移动时不再波及下方的输入卡与 chip
+                            .occlude()
                             .top(px(76.0))
                             .left(px(20.0))
                             .w(px(220.0))
@@ -4344,8 +4558,12 @@ impl AppView {
                                 );
                             }
                             let t_add = hero_this.clone();
+                            // 分隔线只在有工作区列表时出现（web pinAdd）：
+                            // 空列表时菜单里只剩「添加工作区」，不留孤线
+                            if !self.workspaces.is_empty() {
+                                menu = menu.child(div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2));
+                            }
                             menu = menu
-                                .child(div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2))
                                 .child(
                                     div()
                                         .id("hero-ws-add")
@@ -4382,6 +4600,13 @@ impl AppView {
                                         .child(Icon::new(IconName::Plus).size(px(14.0)).text_color(theme::t().text_2))
                                         .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).text_color(theme::t().text).child("添加工作区")),
                                 );
+                        // 点击外部关闭分两层：栈内遮罩只盖中栏这一列；侧栏、
+                        // 空白边距等点不到它，另经 canvas（paint 阶段）注册
+                        // 窗口级 mousedown——落点在菜单 bounds 外即收起。
+                        // 只认 Bubble 相：窗口级监听在元素 handler 之后到，
+                        // chip 的 toggle 先翻成 false，这里 if 守卫后不回弹。
+                        let menu_bounds = Arc::new(std::sync::Mutex::new(None::<Bounds<Pixels>>));
+                        let t_dismiss = hero_this.clone();
                         stack
                             .child(
                                 div()
@@ -4398,7 +4623,58 @@ impl AppView {
                                         });
                                     }),
                             )
-                            .child(menu)
+                            .child(
+                                // 铺满栈的定位壳：taffy 绝对定位以直接父容器为
+                                // 基准，菜单的 top/left 原本锚在栈上——包装层
+                                // 若走文档流会另起 0×0 盒把菜单拽到输入卡下方
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .on_children_prepainted({
+                                        let mb = menu_bounds.clone();
+                                        move |children, _, _| {
+                                            *mb.lock().unwrap() = children.first().cloned();
+                                        }
+                                    })
+                                    .child(menu),
+                            )
+                            .child(
+                                // canvas 必须脱流：栈是 gap_3 的 v_flex，文档流里
+                                // 的 0 高子元素也会多出一条 gap，面板一开整栈
+                                // 增高、垂直居中后内容上移
+                                div()
+                                    .absolute()
+                                    .child(canvas(
+                                        move |_, _, _| {},
+                                        move |_, _, window, _| {
+                                            let bounds = menu_bounds
+                                                .lock()
+                                                .unwrap()
+                                                .clone()
+                                                .unwrap_or_default();
+                                            window.on_mouse_event(
+                                                move |event: &MouseDownEvent,
+                                                      phase: DispatchPhase,
+                                                      _,
+                                                      cx| {
+                                                    if phase == DispatchPhase::Bubble
+                                                        && !bounds.contains(&event.position)
+                                                    {
+                                                        t_dismiss.update(cx, |v, cx| {
+                                                            if v.hero_ws_menu {
+                                                                v.hero_ws_menu = false;
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    }
+                                                },
+                                            );
+                                        },
+                                    )),
+                            )
                     }),
             )
     }
@@ -4670,20 +4946,20 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
 fn sb_menu_label(text: &'static str) -> Div {
     div()
         .px(px(10.0))
-        .pt_2()
-        .pb_1()
-        .text_size(px(11.0))
-        .line_height(px(14.0))
-        .text_color(theme::t().caption)
+        .py_1()
+        .text_size(px(12.0))
+        .line_height(px(16.0))
+        .text_color(theme::t().text_3)
         .child(text)
 }
 
-/// 视图菜单分隔线。
+/// 视图菜单分隔线（web .separator：h1、margin 4px 2px、l1 发丝线）。
 fn sb_menu_divider() -> Div {
-    div().my_1().h(px(1.0)).w_full().bg(theme::t().border_l2)
+    div().my_1().mx_0p5().h(px(1.0)).bg(theme::t().border_l1)
 }
 
-/// 视图菜单可勾选行（web Menu selected：右侧勾、选中项 primary）。
+/// 视图菜单可勾选行（web Menu .item dense：min 34、r10；选中无底色，
+/// 尾部勾与正文同色——勾是标记不是高亮）。
 fn sb_menu_check_row(
     id: &'static str,
     label: &'static str,
@@ -4692,20 +4968,21 @@ fn sb_menu_check_row(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(32.0))
+        .h(px(34.0))
         .flex()
         .items_center()
         .px(px(10.0))
-        .rounded(px(6.0))
+        .rounded(px(10.0))
         .text_size(px(theme::FONT_ROW))
         .line_height(px(22.0))
         .text_color(theme::t().text)
-        .map(|d| if selected { d.bg(theme::t().hover) } else { d })
-        .when(!selected, |d| d.hover(|s| s.bg(theme::t().hover)))
+        .hover(|s| s.bg(theme::t().hover))
         .cursor_pointer()
         .on_click(on_click)
         .child(div().flex_1().child(label))
-        .when(selected, |d| d.child(Icon::new(IconName::Check).size(px(14.0)).text_color(theme::t().accent)))
+        .when(selected, |d| {
+            d.child(Icon::new(IconName::Check).size(px(16.0)).text_color(theme::t().text))
+        })
 }
 
 /// 行菜单条目（web Menu entry：h32、hover 浅底、危险项红色）。
@@ -4737,6 +5014,7 @@ fn action_btn_lite(
         .child(label)
 }
 
+/// 行菜单条目（web Menu .item：h34、r10、hover 浅底、危险项红色）。
 fn sb_menu_row(
     id: &'static str,
     label: &'static str,
@@ -4745,11 +5023,11 @@ fn sb_menu_row(
 ) -> Stateful<Div> {
     div()
         .id(id)
-        .h(px(32.0))
+        .h(px(34.0))
         .flex()
         .items_center()
         .px(px(10.0))
-        .rounded(px(6.0))
+        .rounded(px(10.0))
         .text_size(px(theme::FONT_ROW))
         .line_height(px(22.0))
         .text_color(if danger { theme::t().error } else { theme::t().text })
@@ -4905,7 +5183,13 @@ fn main() {
         })
         .collect();
     let startup_workspaces = load_workspaces();
-    let (initial_session, initial_cwd, is_fresh) = if let Some(first) = entries.first() {
+    // 启动会话只在未归档集合里挑最近一条：归档（web 全局 archivedSessionIds）
+    // 对侧栏不可见，启动也不应把最近一条归档会话顶到前台。
+    let archived_ids: std::collections::HashSet<String> =
+        load_archived_ids().into_iter().collect();
+    let (initial_session, initial_cwd, is_fresh) = if let Some(first) =
+        entries.iter().find(|e| !archived_ids.contains(e.id.as_str()))
+    {
         let (session, cwd) = recorder
             .load(&first.id, first.cwd.as_deref())
             .unwrap_or_else(|_| (Session::new(first.id.clone()), first.cwd.clone()));

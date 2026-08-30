@@ -64,6 +64,14 @@ pub struct Tokens {
     pub error: Rgba,
     /// `--dsw-alias-state-success-primary`。
     pub green: Rgba,
+    /// `--dsw-alias-state-business-tertiary`（hero 预览版 badge 底）。
+    pub business_tertiary: Rgba,
+    /// `--dsw-alias-label-primary-bluish`（hero 预览版 badge 字）。
+    pub text_bluish: Rgba,
+    /// `--dsw-specific-menu`（下拉菜单卡底，亮=00 白 / 暗=bluish-800）。
+    pub menu: Rgba,
+    /// `--dsw-alias-border-inverted`（菜单卡描边，亮=透明 / 暗=白 6%）。
+    pub border_inverted: Hsla,
     /// markdown 代码块底。
     pub code_bg: Rgba,
     /// 代码块横幅底。
@@ -102,6 +110,10 @@ pub const DARK: Tokens = Tokens {
     accent_hover: rgb_const(0x4176e6),   // deepseek-500
     error: rgb_const(0xf25a5a),          // red-400
     green: rgb_const(0x22c55e),          // green-500
+    business_tertiary: rgb_const(0x34415b), // deepseek-800
+    text_bluish: rgb_const(0xf9fafb),    // neutral-bluish-50
+    menu: rgb_const(0x353638),           // neutral-bluish-800 (bg-layer-3)
+    border_inverted: hsla_const(0.0, 0.0, 1.0, 0.06),
     code_bg: rgb_const(0x1b1b1c),        // bluish-900
     code_banner: rgb_const(0x2c2c2e),    // bluish-850
     border_l1: hsla_const(0.0, 0.0, 1.0, 0.06),
@@ -131,6 +143,10 @@ pub const LIGHT: Tokens = Tokens {
     accent_hover: rgb_const(0x679efe),   // deepseek-400
     error: rgb_const(0xec1313),          // red-600
     green: rgb_const(0x22c55e),          // green-500
+    business_tertiary: rgb_const(0xe4edfd), // deepseek-100
+    text_bluish: rgb_const(0x0e3074),    // blue-900
+    menu: rgb_const(0xffffff),           // neutral-bluish-00 (bg-layer-3)
+    border_inverted: hsla_const(0.0, 0.0, 0.0, 0.0),
     code_bg: rgb_const(0xf9fafb),        // bluish-50
     code_banner: rgb_const(0xf9fafb),    // bluish-50
     border_l1: hsla_const(0.0, 0.0, 0.0, 0.04),

@@ -19,12 +19,22 @@ pub(crate) const DETAILS_MIN: f32 = 300.0;
 pub(crate) const DETAILS_MAX: f32 = 520.0;
 pub(crate) const DETAILS_DEFAULT: f32 = 360.0;
 
-/// 会话内容列宽（ConversationRoot --dsh-chat-content-width）。
-pub(crate) const CHAT_CONTENT_WIDTH: f32 = 748.0;
+/// 会话内容列宽（web ConversationRoot --dsh-chat-content-width）：
+/// clamp(680px, 中栏宽 × 0.64, 920px)——随中栏实时宽度自适应（收起
+/// 侧栏即变宽），上限 920 保行长可读性，下限 680。
+pub(crate) fn chat_content_width(column_w: f32) -> f32 {
+    (column_w * 0.64).clamp(680.0, 920.0)
+}
+
 /// 输入卡上限 = 内容列 + 两侧 clearance 16px。
-pub(crate) const COMPOSER_CARD_WIDTH: f32 = CHAT_CONTENT_WIDTH + 32.0;
-/// 用户气泡宽度上限（MessageItem .userStack）。
-pub(crate) const USER_BUBBLE_MAX: f32 = 525.0;
+pub(crate) fn composer_card_width(column_w: f32) -> f32 {
+    chat_content_width(column_w) + 32.0
+}
+
+/// 用户气泡宽度上限（web MessageItem：min(W×0.702, 82%)，0.702 < 0.82 恒成立）。
+pub(crate) fn user_bubble_max(column_w: f32) -> f32 {
+    chat_content_width(column_w) * 0.702
+}
 
 /// columns.ts 的「让步链」。
 pub(crate) fn compute_columns(viewport: f32, sidebar_pref: f32, details_pref: f32) -> (f32, f32, f32) {

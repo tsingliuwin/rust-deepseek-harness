@@ -17,6 +17,7 @@ use crate::widgets::*;
 
 use async_stream::stream;
 use async_trait::async_trait;
+use dsh_agent_loop::InboxTarget;
 use dsh_agent_loop::{AgentEvent, AgentOptions, ReactLoopAgent};
 use dsh_cordis::EventBus;
 use dsh_fs::FsTool;
@@ -978,6 +979,8 @@ struct AppView {
     renaming_session: Option<String>,
     /// hero「选择工作区」菜单开合
     hero_ws_menu: bool,
+    /// composer 模型菜单开合（模型牌点击弹出）
+    model_menu: bool,
     /// 搜索会话：展开 + 词条
     search_open: bool,
     search_query: String,
@@ -1087,6 +1090,8 @@ fn context_info(
 ) -> ContextInfo {
     let label = match kind {
         "session-reference" => non_empty(reference_labels.join(", ")).or_else(|| Some(kind.to_string())),
+        // @ 文件引用：显示文件名
+        "file-reference" => non_empty(reference_labels.join(", ")),
         "agent-instructions" => non_empty(changes_paths.join(", ")).or_else(|| Some(kind.to_string())),
         "plugin" => plugin.clone().filter(|p| !p.is_empty()).or_else(|| Some(kind.to_string())),
         "skill-invocation" => name.clone().filter(|n| !n.is_empty()).or_else(|| Some(kind.to_string())),
@@ -1218,8 +1223,7 @@ impl AppView {
                         cx.notify();
                         return;
                     }
-                    chat.push_user(text.clone());
-                    chat.agent.followup(text);
+                    chat.dispatch_user_text(&text, cx);
                     chat.pending_clear = true;
                     cx.notify();
                 }
@@ -1258,6 +1262,7 @@ impl AppView {
             renaming_workspace: None,
             renaming_session: None,
             hero_ws_menu: false,
+            model_menu: false,
             search_open: false,
             search_query: String::new(),
             search_input: search_input.clone(),
@@ -1621,7 +1626,12 @@ open: false,
         self.agent.set_session(session);
         self.rebuild_from_session();
         self.tab = CenterTab::Conversation;
-        // 虚拟列表长度同步（切换后条目数变了；不 reset 则仍按旧长度渲染）
+        // 折叠状态属于会话本身：跨会话残留会让新会话按旧轮次开合
+        self.turn_expanded.clear();
+        self.turn_open = None;
+        // 虚拟列表必须 reset：条目整体换血（splice 保留旧测高与滚动锚，
+        // scroll_to_reveal 按陈旧高度算偏移会落进空白区——切后看不到内容）
+        self.chat_reset_pending = true;
         self.sync_chat_list(true);
         cx.notify();
     }
@@ -1831,9 +1841,8 @@ open: false,
 
     /// 虚拟列表条目总数：消息 + 流式状态行 + 统计行。
     fn chat_item_count(&self) -> usize {
-        self.entries.len()
-            + usize::from(self.running)
-            + usize::from(self.stats_turns > 0 && !self.running)
+        // 统计行不在滚动流里（web：composer.dock 槽，输入卡上方）
+        self.entries.len() + usize::from(self.running)
     }
 
     /// 同步列表长度并按需滚底（流式期间沿用贴底语义）。
@@ -2055,6 +2064,86 @@ open: false,
     }
 
     /// 发送按钮路径：读输入框 → 追加 → 清空（window 由 on_click 闭包提供）。
+    /// @ 文件引用（web 上下文注入的桌面形态）：解析消息里的 @path，
+    /// 每个存在的文件生成一条上下文注入——入 agent 收件箱（本轮模型
+    /// 可见、随 turn 落盘带 Context source），UI 出注入行；用户消息原文。
+    fn resolve_file_references(&self, text: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let bases = [
+            std::path::PathBuf::from(self.current_cwd.clone()),
+            std::env::current_dir().unwrap_or_default(),
+        ];
+        for token in text.split_whitespace() {
+            let Some(raw) = token.strip_prefix('@') else { continue };
+            let raw = raw.trim_matches(|c: char| "(),、。;；'\"！？".contains(c));
+            if raw.is_empty() { continue; }
+            let cand = std::path::Path::new(raw);
+            let file = if cand.is_absolute() {
+                cand.to_path_buf()
+            } else {
+                match bases.iter().map(|b| b.join(cand)).find(|p| p.is_file()) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            };
+            if !file.is_file() { continue; }
+            let path = file.to_string_lossy().to_string();
+            if out.iter().any(|(p, _)| *p == path) { continue; }
+            let Ok(mut content) = std::fs::read_to_string(&file) else { continue };
+            if content.chars().count() > 120_000 {
+                content = content.chars().take(120_000).collect::<String>()
+                    + "\n…（内容过长已截断）";
+            }
+            out.push((path, content));
+        }
+        out
+    }
+
+    /// 发送统一入口（发送按钮与回车共用）：先派生 @ 引用的上下文注入，
+    /// 再走普通用户消息。
+    fn dispatch_user_text(&mut self, text: &str, _cx: &mut Context<Self>) {
+        for (path, content) in self.resolve_file_references(text) {
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            let summary = format!("引用文件 {name}");
+            let mut msg = Message::user(vec![ContentBlock::text(format!(
+                "引用文件：{path}\n{content}"
+            ))]);
+            msg.source = MessageSource::Context {
+                context_kind: "file-reference".into(),
+                plugin: None,
+                form: None,
+                summary: Some(summary.clone()),
+                changes_paths: vec![path.clone()],
+                reference_labels: vec![name],
+                name: None,
+            };
+            self.agent.send(msg, InboxTarget::NextTurn);
+            let info = context_info(
+                "file-reference",
+                &None,
+                &None,
+                &Some(summary),
+                std::slice::from_ref(&path),
+                std::slice::from_ref(&path),
+                &None,
+            );
+            self.entries.push(ChatEntry {
+                role: Role::Context,
+                blocks: vec![MsgBlock::Text(format!("引用文件 {path}"))],
+                done: true,
+                elapsed: None,
+                turn: self.ui_turn,
+                context: Some(info),
+                open: false,
+            });
+        }
+        self.push_user(text.to_string());
+        self.agent.followup(text);
+    }
+
     fn send_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace_locked() {
             // web inert 态：消息控件锁定，发送动作改为引导选择工作区
@@ -2074,8 +2163,7 @@ open: false,
                 EnterBehavior::Interrupt => self.agent.cancel(),
             }
         }
-        self.push_user(text.clone());
-        self.agent.followup(text);
+        self.dispatch_user_text(&text, cx);
         self.input.update(cx, |state, cx| state.set_value("", window, cx));
         cx.notify();
     }
@@ -2292,6 +2380,16 @@ open: false,
         self.subagent.set_route(provider, model);
     }
 
+    /// composer 模型菜单选择：切路由并持久化 agent-default-model。
+    fn switch_model(&mut self, provider: String, model: String, cx: &mut Context<Self>) {
+        self.set_route(&provider, &model);
+        self.active_provider = provider;
+        self.desired_model = model;
+        self.model_menu = false;
+        self.persist_settings();
+        cx.notify();
+    }
+
     /// 删除自定义提供方（若激活中则回退 deepseek）。
     fn remove_provider(&mut self, id: &str) {
         self.settings.providers.retain(|p| p.id != id);
@@ -2316,7 +2414,7 @@ open: false,
 
     // --- 渲染 ---------------------------------------------------------------
 
-    fn block_element(&self, block: &MsgBlock, ei: usize, bi: usize, this: &Entity<AppView>) -> AnyElement {
+    fn block_element(&self, block: &MsgBlock, ei: usize, bi: usize, this: &Entity<AppView>, content_w: f32) -> AnyElement {
         match block {
             MsgBlock::Text(t) => div()
                 .w_full()
@@ -2346,7 +2444,6 @@ open: false,
                     .gap_1p5()
                     .cursor_pointer()
                     .rounded(px(6.0))
-                    .hover(|s| s.bg(theme::t().hover))
                     .on_click(move |_, _, cx| {
                         t.update(cx, |v, cx| {
                             if let Some(MsgBlock::Reasoning { open: o, .. }) =
@@ -2384,7 +2481,7 @@ open: false,
                     );
                 if let Some(ms) = sweep_ms {
                     // web .row::after 运行扫光（行容器 relative + overflow_hidden）
-                    header = header.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
+                    header = header.child(row_sweep(ms, content_w));
                 }
                 let mut wrapper = div().w_full().v_flex().child(header);
                 if open {
@@ -2446,8 +2543,10 @@ open: false,
                         }
                     }
                 }
+                let row_group: SharedString = format!("toolrow-{}-{}", ei, bi).into();
                 let mut header = div()
                     .id(("tool-row", (ei * 1000 + bi) as u64))
+                    .group(row_group.clone())
                     .relative()
                     .overflow_hidden()
                     .flex()
@@ -2456,7 +2555,6 @@ open: false,
                     .gap_1p5()
                     .cursor_pointer()
                     .rounded(px(6.0))
-                    .hover(|s| s.bg(theme::t().hover))
                     .on_click(move |_, _, cx| {
                         t.update(cx, |v, cx| {
                             if let Some(MsgBlock::Tool(tool)) =
@@ -2475,17 +2573,59 @@ open: false,
                             cx.notify();
                         });
                     })
-                    .child(
-                        Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
-                            .size(px(12.0))
-                            .text_color(theme::t().text_2),
-                    )
-                    .when(tool.error && tool.result.is_some(), |r| {
-                        // web ToolRow leadingFor：终态 error 用状态点替换工具图标
-                        r.child(state_dot(theme::t().error))
-                    })
-                    .when(!(tool.error && tool.result.is_some()), |r| {
-                        r.child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
+                    .child({
+                        // web DisclosureRow leading：16px 槽双层图标——静止为
+                        // 工具图标（错误终态为状态点），行 hover 淡入向下
+                        // 箭头；展开态常驻向下箭头
+                        if open {
+                            div()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
+                        } else {
+                            let idle: AnyElement = if tool.error && tool.result.is_some() {
+                                // web ToolRow leadingFor：终态 error 用状态点替换工具图标
+                                state_dot(theme::t().error).into_any_element()
+                            } else {
+                                Icon::new(icon).size(px(14.0)).text_color(theme::t().text_3).into_any_element()
+                            };
+                            div()
+                                .relative()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_none()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(idle)
+                                        .group_hover(row_group.clone(), |s| s.opacity(0.0)),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
+                                        .opacity(0.0)
+                                        .group_hover(row_group, |s| s.opacity(1.0)),
+                                )
+                        }
                     })
                     .child(
                         div()
@@ -2535,7 +2675,7 @@ open: false,
                 }
                 if let Some(ms) = sweep_ms {
                     // web .row::after 运行扫光（行容器 relative + overflow_hidden）
-                    header = header.child(row_sweep(ms, CHAT_CONTENT_WIDTH));
+                    header = header.child(row_sweep(ms, content_w));
                 }
                 // hover 显现 Inspect pill 的悬停域：标题行 + 展开体整体
                 let group: SharedString = format!("tool-blk-{ei}-{bi}").into();
@@ -2775,7 +2915,7 @@ open: false,
         }
     }
 
-    fn render_entry(&self, entry: &ChatEntry, ei: usize, this: &Entity<AppView>) -> Div {
+    fn render_entry(&self, entry: &ChatEntry, ei: usize, this: &Entity<AppView>, content_w: f32) -> Div {
         match entry.role {
             Role::User => {
                 let text = entry
@@ -2799,7 +2939,7 @@ open: false,
                     .group(group)
                     .child(
                         div()
-                            .max_w(px(USER_BUBBLE_MAX))
+                            .max_w(px(layout::user_bubble_max(content_w)))
                             .rounded(px(22.0))
                             .bg(theme::t().surface)
                             .px_4()
@@ -2843,7 +2983,7 @@ open: false,
                     .gap(px(16.0))
                     .group(group);
                 for (bi, block) in entry.blocks.iter().enumerate() {
-                    col = col.child(self.block_element(block, ei, bi, this));
+                    col = col.child(self.block_element(block, ei, bi, this, content_w));
                 }
                 if entry.done && let Some(elapsed) = entry.elapsed {
                     col = col.child(render_entry_footer(elapsed, this, ei));
@@ -2902,15 +3042,16 @@ open: false,
                         _ => String::new(),
                     })
                     .unwrap_or_default();
+                let row_group: SharedString = format!("ctxrow-{}", ei).into();
                 let mut header = div()
                     .id(("ctx-row", ei as u64))
+                    .group(row_group.clone())
                     .flex()
                     .items_center()
                     .h(px(24.0))
                     .gap_1p5()
                     .cursor_pointer()
                     .rounded(px(6.0))
-                    .hover(|s| s.bg(theme::t().hover))
                     .on_click(move |_, _, cx| {
                         t.update(cx, |v, cx| {
                             if let Some(e) = v.entries.get_mut(ei) {
@@ -2919,19 +3060,60 @@ open: false,
                             cx.notify();
                         });
                     })
-                    .child(
-                        Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
-                            .size(px(12.0))
-                            .text_color(theme::t().text_2),
-                    )
-                    .child(
-                        gpui::svg()
-                            .path("icons/context-injection.svg")
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .flex_none()
-                            .text_color(theme::t().text_2),
-                    )
+                    .child({
+                        // web DisclosureRow leading（同 tool row）：静止为
+                        // 注入图标，行 hover 淡入向下箭头；展开态常驻箭头
+                        if open {
+                            div()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
+                        } else {
+                            div()
+                                .relative()
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_none()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            gpui::svg()
+                                                .path("icons/context-injection.svg")
+                                                .w(px(14.0))
+                                                .h(px(14.0))
+                                                .flex_none()
+                                                .text_color(theme::t().text_3),
+                                        )
+                                        .group_hover(row_group.clone(), |s| s.opacity(0.0)),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
+                                        .opacity(0.0)
+                                        .group_hover(row_group, |s| s.opacity(1.0)),
+                                )
+                        }
+                    })
                     .child(
                         div()
                             .text_size(px(theme::FONT_ROW))
@@ -3041,7 +3223,7 @@ open: false,
 
     /// 轨迹 tab：全量工具调用台账。滚动容器在本方法内（track_scroll 接
     /// Inspect pill 的 scroll_to_item；行必须是其直接子节点才能按行号跳转）。
-    fn render_trajectory(&self, this: &Entity<AppView>) -> Stateful<Div> {
+    fn render_trajectory(&self, this: &Entity<AppView>, width: f32) -> Stateful<Div> {
         let mut rows: Vec<AnyElement> = Vec::new();
         for (ei, entry) in self.entries.iter().enumerate() {
             for (bi, block) in entry.blocks.iter().enumerate() {
@@ -3115,7 +3297,7 @@ open: false,
             .overflow_y_scroll()
             .track_scroll(&self.traj_scroll)
             .w_full()
-            .max_w(px(CHAT_CONTENT_WIDTH))
+            .max_w(px(layout::chat_content_width(width)))
             .mx_auto()
             .v_flex()
             .py_4();
@@ -4272,14 +4454,16 @@ impl AppView {
             center = center.child(self.render_hero(this, has_text, width));
         } else {
             let body = match self.tab {
-                CenterTab::Conversation => self.render_chat(&this).into_any_element(),
-                CenterTab::Trajectory => self.render_trajectory(&this).into_any_element(),
+                CenterTab::Conversation => self.render_chat(&this, width).into_any_element(),
+                CenterTab::Trajectory => self.render_trajectory(&this, width).into_any_element(),
             };
             let show_jump = !self.chat_near_bottom();
             let t_jump = this.clone();
             // 虚拟列表（gpui list，可变高）：内容在 ChatEntry 之外补两行
             // （流式状态 / 统计），render_item 按序号派发。
             let list_this = this.clone();
+            // web --dsh-chat-content-width：内容列随中栏宽度自适应
+            let content_w = layout::chat_content_width(width);
             let chat_list_state = self.chat_list.clone();
             let chat_list_el = gpui::list(chat_list_state, move |ix, _window, cx| {
                 let entry = list_this.read_with(cx, |v, _| v.entries.get(ix).cloned());
@@ -4329,7 +4513,7 @@ impl AppView {
                                             );
                                             if expanded {
                                                 return control
-                                                    .child(v.render_entry(&e, ix, &this))
+                                                    .child(v.render_entry(&e, ix, &this, content_w))
                                                     .into_any_element();
                                             }
                                             return control.into_any_element();
@@ -4342,11 +4526,11 @@ impl AppView {
                                     if ix == f.answer && !expanded {
                                         let mut answer = e.clone();
                                         answer.blocks.retain(|b| !matches!(b, MsgBlock::Reasoning { .. }));
-                                        return v.render_entry(&answer, ix, &this).pb_4().into_any_element();
+                                        return v.render_entry(&answer, ix, &this, content_w).pb_4().into_any_element();
                                     }
                                 }
                                 // gpui list 无 gap 概念：条目间距用 pb 模拟（web 列 gap 16px）
-                                v.render_entry(&e, ix, &this).pb_4().into_any_element()
+                                v.render_entry(&e, ix, &this, content_w).pb_4().into_any_element()
                             })
                             .into_any_element()
                     }
@@ -4357,23 +4541,8 @@ impl AppView {
                                 if ix == v.entries.len() && v.running {
                                     v.render_status_line().into_any_element()
                                 } else {
-                                    // 统计行（web StatsLine）：流内居中
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .max_w_full()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .text_ellipsis()
-                                                .text_size(px(theme::FONT_CAPTION))
-                                                .line_height(px(20.0))
-                                                .text_color(theme::t().text_3)
-                                                .child(v.stats_line()),
-                                        )
-                                        .into_any_element()
+                                    // 统计行已移至输入卡上方（web composer.dock 槽）
+                                    div().into_any_element()
                                 }
                             })
                             .into_any_element()
@@ -4381,7 +4550,10 @@ impl AppView {
                 }
             })
             .size_full()
-            .with_sizing_behavior(ListSizingBehavior::Auto);
+            .with_sizing_behavior(ListSizingBehavior::Auto)
+            // 内容列随中栏宽度自适应、居中（web ChatView .column）
+            .max_w(px(content_w))
+            .mx_auto();
             center = center
                 .child(
                     // chat tab 用虚拟列表；轨迹保持普通流
@@ -4431,7 +4603,7 @@ impl AppView {
                             )
                         }),
                 )
-                .child(self.render_composer_area(t, has_text));
+                .child(self.render_composer_area(t, has_text, width));
         }
         center
     }
@@ -4591,47 +4763,59 @@ impl AppView {
     }
 
     /// 消息流（748px 内容列 + 16px 项间距，ChatView .column）。
-    fn render_chat(&self, this: &Entity<AppView>) -> Div {
+    fn render_chat(&self, this: &Entity<AppView>, width: f32) -> Div {
         let mut col = div()
             .w_full()
-            .max_w(px(CHAT_CONTENT_WIDTH))
+            .max_w(px(layout::chat_content_width(width)))
             .mx_auto()
             .v_flex()
             .gap_4()
             .py_4()
             .children(
-                self.entries.iter().enumerate().map(|(i, e)| self.render_entry(e, i, this)),
+                self.entries.iter().enumerate().map(|(i, e)| self.render_entry(e, i, this, layout::chat_content_width(width))),
             );
         if self.running {
             col = col.child(self.render_status_line());
         }
-        if self.stats_turns > 0 && !self.running {
-            // web StatsLine：流内居中，12/20 tertiary，nowrap ellipsis
-            col = col.child(
-                div().w_full().flex().justify_center().child(
-                    div()
-                        .max_w_full()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .line_height(px(20.0))
-                        .text_color(theme::t().text_3)
-                        .child(self.stats_line()),
-                ),
-            );
-        }
+        // 统计行移至 composer 区（web composer.dock 槽），不在滚动流内
         div().w_full().child(col)
     }
 
-    /// 底部 composer 区：输入卡（统计行已移入消息流 StatsLine 位）。
-    fn render_composer_area(&self, this: Entity<AppView>, has_text: bool) -> Div {
-        div()
+    /// 底部 composer 区：输入卡 + 统计行（web composer.dock 槽，卡下 footer）。
+    fn render_composer_area(&self, this: Entity<AppView>, has_text: bool, width: f32) -> Div {
+        let content_w = layout::chat_content_width(width);
+        let card_w = layout::composer_card_width(width);
+        let mut area = div()
             .flex_none()
             .v_flex()
             .bg(theme::t().bg_base)
             .pb_2()
-            .child(self.composer_card(this, has_text))
+            .child(self.composer_card(this, has_text, card_w));
+        // web StatsLine：输入卡下方常驻 footer。占位恒在（固定行高），
+        // 避免首条统计出现时输入卡上移；steps>0 只决定有无文本，
+        // 文本居中（.root text-align: center）
+        area = area.child(
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .h(px(24.0))
+                .pt(px(4.0))
+                .child(
+                    div()
+                        .max_w(px(content_w))
+                        .w_full()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_center()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(20.0))
+                        .text_color(theme::t().text_3)
+                        .when(self.stats_steps > 0, |d| d.child(self.stats_line())),
+                ),
+        );
+        area
     }
 
     /// 空会话 hero：标题 + 工作区行 + 居中输入卡（HeroShell）。
@@ -4639,7 +4823,7 @@ impl AppView {
         let hero_this = this.clone();
         // web ConversationRoot .heroGlow：资产 1051×468 对设计卡 776，宽随卡缩放，
         // 中心锚在卡面（底边上方 92px），translate(-50%, 50%) 使椭圆中心落在锚上。
-        let stack_w = (center_w - 48.0).min(COMPOSER_CARD_WIDTH);
+        let stack_w = (center_w - 48.0).min(layout::composer_card_width(center_w));
         let glow_w = stack_w * (1051.0 / 776.0);
         let glow_h = glow_w * (468.0 / 1051.0);
         div()
@@ -4655,7 +4839,7 @@ impl AppView {
                 div()
                     .relative()
                     .w_full()
-                    .max_w(px(COMPOSER_CARD_WIDTH))
+                    .max_w(px(layout::composer_card_width(center_w)))
                     .v_flex()
                     .gap_3()
                     .pb(px(32.0))
@@ -4764,7 +4948,7 @@ impl AppView {
                                     ),
                             ),
                     )
-                    .child(self.composer_card(this, has_text))
+                    .child(self.composer_card(this, has_text, layout::composer_card_width(center_w)))
                     // 下拉面板挂在栈层级（输入卡之后渲染 → 绘制在其上，
                     // 对齐 web .workspaceRow z-index:10 的效果）；遮罩提供
                     // 点击外部关闭
@@ -4941,8 +5125,70 @@ impl AppView {
 
     /// 输入卡（web InputBar .card）：r22、白 6% 描边、850 表面、
     /// 文本在上（16/24），控件行在下（+ / 模式 | 模型 / 发送）。
-    fn composer_card(&self, this: Entity<AppView>, has_text: bool) -> Stateful<Div> {
+    fn composer_card(&self, this: Entity<AppView>, has_text: bool, card_w: f32) -> Stateful<Div> {
         let running = self.running;
+        let t_model_menu = this.clone();
+
+        // 模型菜单（模型牌弹出）：各提供方分组 + 模型行，当前项带勾
+        let mut model_menu_el: Option<AnyElement> = None;
+        if self.model_menu {
+            let mut menu = div()
+                .id("model-menu")
+                .absolute()
+                .right(px(8.0))
+                .bottom(px(56.0))
+                .w(px(260.0))
+                .max_h(px(320.0))
+                .overflow_y_scroll()
+                .occlude()
+                .v_flex()
+                .p(px(4.0))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(theme::t().border_inverted)
+                .bg(theme::t().menu)
+                .shadow_lg();
+            for p in &self.settings.providers {
+                if p.models.is_empty() { continue; }
+                menu = menu.child(
+                    div()
+                        .px(px(10.0))
+                        .py_1()
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
+                        .text_color(theme::t().text_3)
+                        .child(p.name.clone()),
+                );
+                for m in &p.models {
+                    let selected = self.active_provider == p.id && self.desired_model == m.id;
+                    let t = this.clone();
+                    let pid = p.id.clone();
+                    let mid = m.id.clone();
+                    menu = menu.child(
+                        div()
+                            .id(SharedString::from(format!("model-{}-{}", p.id, m.id)))
+                            .h(px(34.0))
+                            .flex()
+                            .items_center()
+                            .px(px(10.0))
+                            .rounded(px(10.0))
+                            .text_size(px(theme::FONT_ROW))
+                            .line_height(px(22.0))
+                            .text_color(theme::t().text)
+                            .hover(|s| s.bg(theme::t().hover))
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                t.update(cx, |v, cx| v.switch_model(pid.clone(), mid.clone(), cx));
+                            })
+                            .child(div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().text_ellipsis().child(m.id.clone()))
+                            .when(selected, |d| {
+                                d.child(Icon::new(IconName::Check).size(px(16.0)).text_color(theme::t().text))
+                            }),
+                    );
+                }
+            }
+            model_menu_el = Some(menu.into_any_element());
+        }
 
         let left = div()
             .flex()
@@ -4983,6 +5229,15 @@ impl AppView {
                     .h(px(28.0))
                     .px_2()
                     .rounded(px(8.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::t().hover))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        t_model_menu.update(cx, |v, cx| {
+                            v.model_menu = !v.model_menu;
+                            cx.notify();
+                        });
+                    })
                     .child(
                         div()
                             .text_size(px(theme::FONT_TAB))
@@ -5040,8 +5295,9 @@ impl AppView {
         let t_card = this.clone();
         div()
             .id("composer-card")
+            .relative()
             .w_full()
-            .max_w(px(COMPOSER_CARD_WIDTH))
+            .max_w(px(card_w))
             .mx_auto()
             .flex_none()
             .v_flex()
@@ -5058,10 +5314,12 @@ impl AppView {
                 })
             })
             .child(if self.workspace_locked() {
-                // web：inert 态编辑器不挂载，占位文案即引导
+                // web：inert 态编辑器不挂载，占位文案即引导。高度必须
+                // 等于 Input 单行外壳（input_py 8×2 + 行高 20 = 36），
+                // 否则选定工作区切换编辑器时垂直居中的 hero 会位移
                 div().pl_4().pr_3().pt_1().child(
                     div()
-                        .h(px(24.0))
+                        .h(px(36.0))
                         .flex()
                         .items_center()
                         .text_size(px(theme::FONT_ROW))
@@ -5085,6 +5343,7 @@ impl AppView {
                     .child(left)
                     .child(right),
             )
+            .children(model_menu_el)
     }
 
     /// 右侧详情面板（DetailsPanel）。
@@ -5622,7 +5881,13 @@ fn main() {
     if effective_startup != "mock"
         && let Some(p) = user_settings.providers.iter().find(|p| p.id == effective_startup)
     {
-        let model = p.models.first().map(|m| m.id.clone()).unwrap_or(initial_model.clone());
+        // 尊重 agent-default-model/DSH_MODEL 指定的模型（initial_model）；
+        // 仅当该提供方不提供此模型时才回退列表首个
+        let model = if p.models.iter().any(|m| m.id == initial_model) {
+            initial_model.clone()
+        } else {
+            p.models.first().map(|m| m.id.clone()).unwrap_or(initial_model.clone())
+        };
         agent.set_provider_and_model(p.id.clone(), model.clone());
         subagent_tool.set_route(&p.id, &model);
     }

@@ -14,9 +14,10 @@
 use dsh_agent::{
     AgentErrorOccurred, AgentErrorPayload, AgentInboxClaimed, AgentInboxDiscarded,
     AgentInboxInserted, AgentPreStep, AgentRequest, AgentRequestError, AgentRequestPayload,
-    AgentStatus, AgentStatusChanged, AgentTurnStopping, Inbox, InboxClaimedPayload, InboxTarget,
+    AgentStatus, AgentStatusChanged, AgentTurnStopping, Inbox, InboxClaimedPayload,
     PreStepDecision, PreStepInput, RequestErrorAction, RequestErrorPayload, TurnStoppingPayload,
 };
+pub use dsh_agent::InboxTarget;
 use dsh_cordis::EventBus;
 use dsh_llm::{
     AbortSignal, BlockAssembler, CallId, ContentBlock, FinishReason, GenerateOptions, LlmCallConfig,

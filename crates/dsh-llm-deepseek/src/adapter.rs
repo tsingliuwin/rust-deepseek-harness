@@ -208,7 +208,6 @@ impl DeepSeekAdapter {
             let mut bytes = bytes;
             let mut buffer: Vec<u8> = Vec::new();
             let mut ctx = StreamCtx::default();
-
             loop {
                 // Drain every complete SSE event buffered so far.
                 while let Some(event) = take_event(&mut buffer) {
@@ -237,7 +236,7 @@ impl DeepSeekAdapter {
                             request_id: None,
                         });
                         return;
-                    }
+                    },
                     None => {
                         // EOF: finalize a trailing event that lacked a blank line.
                         if !buffer.is_empty() {
@@ -344,11 +343,17 @@ impl StreamCtx {
         let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
             return;
         };
-        for choice in choices {
-            let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
+            for choice in choices {
+                let delta = choice.get("delta").cloned().unwrap_or(Value::Null);
 
-            if let Some(r) = delta.get("reasoning_content").and_then(|x| x.as_str())
-                && !r.is_empty() {
+                // DeepSeek 官方用 reasoning_content；部分 OpenAI 兼容端点
+                // （如 sensenova）用 reasoning——两者都接受
+                let reasoning_delta = delta
+                    .get("reasoning_content")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| delta.get("reasoning").and_then(|x| x.as_str()))
+                    .unwrap_or_default();
+                if !reasoning_delta.is_empty() {
                     self.any_content = true;
                     if !self.reasoning_started {
                         out.push(StreamChunk::BlockStart {
@@ -357,7 +362,7 @@ impl StreamCtx {
                         });
                         self.reasoning_started = true;
                     }
-                    out.push(StreamChunk::ReasoningDelta { index: 0, text: r.to_string() });
+                    out.push(StreamChunk::ReasoningDelta { index: 0, text: reasoning_delta.to_string() });
                 }
 
             if let Some(c) = delta.get("content").and_then(|x| x.as_str())

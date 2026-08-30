@@ -508,6 +508,8 @@ pub(crate) fn terminal_card(
         .pl(px(30.0))
         .max_h(px(150.0))
         .overflow_y_scroll()
+        // 内部滚动 occlude：滚轮命中链到此为止，外层对话不跟滚
+        .occlude()
         .child(prompt);
     if !running
         && let Some(text) = output
@@ -573,6 +575,8 @@ pub(crate) fn terminal_card(
                 .pl(px(30.0))
                 .max_h(px(224.0))
                 .overflow_y_scroll()
+                // 内部滚动 occlude（同上）
+                .occlude()
                 .overflow_x_scroll()
                 .font_family(theme_mono())
                 .text_size(px(12.0))
@@ -1221,6 +1225,8 @@ pub(crate) fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div 
                 .min_w_0()
                 .max_h(px(150.0))
                 .overflow_y_scroll()
+                // 内部滚动 occlude（同上）
+                .occlude()
                 .font_family(theme_mono())
                 .text_size(px(12.0))
                 .line_height(px(18.0))

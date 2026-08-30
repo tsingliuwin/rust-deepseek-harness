@@ -228,6 +228,7 @@ pub(crate) fn session_row(
     title: String,
     time_label: String,
     active: bool,
+    blank: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
@@ -261,7 +262,9 @@ pub(crate) fn session_row(
                 .text_color(theme::t().text)
                 .child(title),
         )
-        .when(!time_label.is_empty(), |d| {
+        // 空白会话行（web row.blank）：时间与 … 菜单都不渲染——
+        // 行动词对不存在的内容无意义
+        .when(!time_label.is_empty() && !blank, |d| {
             d.child(
                 div()
                     .id(SharedString::from(format!("session-time-{index}")))
@@ -272,26 +275,28 @@ pub(crate) fn session_row(
                     .child(time_label),
             )
         })
-        .child(
-            // hover 显现的「…」（web 会话行 hover 切换：time 让位给菜单钮）
-            div()
-                .id(SharedString::from(format!("session-more-{index}")))
-                .size(px(16.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.0))
-                .opacity(0.0)
-                .group_hover(group_more, |s| s.opacity(1.0))
-                .hover(|st| st.bg(theme::t().active))
-                .cursor_pointer()
-                // 「…」不是行本身：阻断冒泡，避免同时触发行点击（切换会话）
-                .on_click(move |click, window, cx| {
-                    cx.stop_propagation();
-                    on_more(click, window, cx);
-                })
-                .child(Icon::new(IconName::Ellipsis).size(px(14.0)).text_color(theme::t().text_3)),
-        )
+        .when(!blank, |d| {
+            d.child(
+                // hover 显现的「…」（web 会话行 hover 切换：time 让位给菜单钮）
+                div()
+                    .id(SharedString::from(format!("session-more-{index}")))
+                    .size(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .opacity(0.0)
+                    .group_hover(group_more, |s| s.opacity(1.0))
+                    .hover(|st| st.bg(theme::t().active))
+                    .cursor_pointer()
+                    // 「…」不是行本身：阻断冒泡，避免同时触发行点击（切换会话）
+                    .on_click(move |click, window, cx| {
+                        cx.stop_propagation();
+                        on_more(click, window, cx);
+                    })
+                    .child(Icon::new(IconName::Ellipsis).size(px(14.0)).text_color(theme::t().text_3)),
+            )
+        })
 }
 /// 行内 2×2 分隔点（web .sep）。
 pub(crate) fn dot_sep() -> Div {

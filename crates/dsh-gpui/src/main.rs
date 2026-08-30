@@ -113,6 +113,9 @@ struct SessionMeta {
     time_label: String,
     /// 会话的 project cwd（web 布局目录归组依据）。
     cwd: Option<String>,
+    /// 空白会话（未开始过一轮）：web 隐藏行尾时间与 … 菜单
+    /// （对不存在的内容行重命名/分叉/归档无意义）。
+    blank: bool,
 }
 
 /// 详情面板当前选中的工具调用。
@@ -971,6 +974,8 @@ struct AppView {
     sb_row_bounds: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Bounds<Pixels>>>>,
     /// 工作区重命名中的目标 id（弹出小对话框）
     renaming_workspace: Option<String>,
+    /// 会话重命名中的目标 id（弹出小对话框；web Rows 菜单 rename）
+    renaming_session: Option<String>,
     /// hero「选择工作区」菜单开合
     hero_ws_menu: bool,
     /// 搜索会话：展开 + 词条
@@ -1207,6 +1212,12 @@ impl AppView {
                 let text: String = input.read_with(cx, |s, _| s.value().to_string());
                 let text = text.trim().to_string();
                 if !text.is_empty() {
+                    if chat.workspace_locked() {
+                        // web inert 态：回车不发送，引导选择工作区
+                        chat.hero_ws_menu = true;
+                        cx.notify();
+                        return;
+                    }
                     chat.push_user(text.clone());
                     chat.agent.followup(text);
                     chat.pending_clear = true;
@@ -1245,6 +1256,7 @@ impl AppView {
             sb_search_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
             sb_row_bounds: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             renaming_workspace: None,
+            renaming_session: None,
             hero_ws_menu: false,
             search_open: false,
             search_query: String::new(),
@@ -1412,6 +1424,75 @@ impl AppView {
             // 仅列表隐藏
         }
         cx.notify();
+    }
+
+    /// 会话重命名（web Rows 菜单 rename → session.rename）：
+    /// 更新列表元数据并落 SessionTitle 事件（读侧 latest-wins）。
+    fn rename_session(&mut self, id: &str, title: String, cx: &mut Context<Self>) {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return;
+        }
+        let cwd = self
+            .sessions
+            .iter_mut()
+            .find(|m| m.id.as_str() == id)
+            .map(|m| {
+                m.title = title.clone();
+                m.cwd.clone()
+            })
+            .unwrap_or(None);
+        if let Some(cwd) = cwd {
+            let _ = self.recorder.append(
+                &SessionId::new(id.to_string()),
+                &cwd,
+                &SessionEvent::SessionTitle { title },
+            );
+        }
+        cx.notify();
+    }
+
+    /// 会话分叉（web Rows 菜单 fork → sessions.fork increaseTitle）：
+    /// 复制整条日志为新会话，子标题按 `标题 (N)` 自增，然后切过去。
+    fn fork_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
+        if self.running {
+            return;
+        }
+        let Some(meta) = self.sessions.iter().find(|m| &m.id == id) else {
+            return;
+        };
+        let Some(cwd) = meta.cwd.clone() else {
+            return;
+        };
+        let Ok((source, _)) = self.recorder.load(id, Some(cwd.as_str())) else {
+            return;
+        };
+        let child_id = self.alloc_session_id();
+        let _ = self.recorder.create(&child_id, &cwd, "standard");
+        for entry in source.entries() {
+            let _ = self.recorder.append(&child_id, &cwd, &entry.event);
+        }
+        let child_title = increased_fork_title(
+            &self
+                .sessions
+                .iter()
+                .find(|m| &m.id == id)
+                .map(|m| m.title.clone())
+                .unwrap_or_else(|| "新会话".into()),
+        );
+        let _ = self.recorder.append(
+            &child_id,
+            &cwd,
+            &SessionEvent::SessionTitle { title: child_title.clone() },
+        );
+        self.sessions.push(SessionMeta {
+            id: child_id.clone(),
+            title: child_title,
+            time_label: "刚刚".into(),
+            cwd: Some(cwd),
+            blank: source.entries().is_empty(),
+        });
+        self.switch_session(child_id, cx);
     }
 
     /// Rebuild the transcript from the agent's session log (restore/switch).
@@ -1591,7 +1672,7 @@ open: false,
         self.tool_starts.clear();
         self.tab = CenterTab::Conversation;
         self.assign_session_to_workspace(&id, ws.as_deref());
-        self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd) });
+        self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd), blank: true });
         cx.notify();
     }
     /// 新会话的目标工作区（web startSession 链）：显式选择 ?? 当前会话
@@ -1697,6 +1778,9 @@ open: false,
                 && old_session.entries().is_empty()
             {
                 let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
+                // 磁盘删除必须同步摘除名册条目：web 无删除动作故名册永不
+                // 悬空，Rust 有真实删除就得自己保持同一不变量
+                self.assign_session_to_workspace(&old_id, None);
                 self.sessions.retain(|s| s.id != old_id);
             }
             self.current_cwd = ws_path;
@@ -1715,6 +1799,8 @@ open: false,
             && old_session.entries().is_empty()
         {
             let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
+            // 同上：删除即摘名册，杜绝悬空 sessionIds
+            self.assign_session_to_workspace(&old_id, None);
             self.sessions.retain(|s| s.id != old_id);
         }
         self.current_cwd = ws_path.clone();
@@ -1725,7 +1811,7 @@ open: false,
         self.selected_tool = None;
         self.sessions.insert(
             0,
-            SessionMeta { id: new_id.clone(), title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(ws_path) },
+            SessionMeta { id: new_id.clone(), title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(ws_path), blank: true },
         );
         self.chat_reset_pending = true;
         let ws = self.current_workspace.clone();
@@ -1786,6 +1872,12 @@ open: false,
         self.entries.is_empty()
     }
 
+    /// web InputBar 的 inert 态：空会话且未绑定工作区 → 编辑器不挂载、
+    /// 消息控件锁定，卡面整体充当「选择工作区」触发器
+    fn workspace_locked(&self) -> bool {
+        self.is_empty_session() && self.current_workspace.is_none()
+    }
+
     fn push_user(&mut self, text: String) {
         // 会话标题：首条用户消息后自动生成（截断到 30 字符）
         let current = self.current_session_id();
@@ -1794,6 +1886,7 @@ open: false,
             && !text.is_empty()
         {
             meta.title = text.chars().take(30).collect();
+            meta.blank = false;
             // 标题落盘（web session/title 事件 + session_projcache 投影行），
             // 否则 web 端看到的本会话永远无标题
             let title = meta.title.clone();
@@ -1955,6 +2048,12 @@ open: false,
 
     /// 发送按钮路径：读输入框 → 追加 → 清空（window 由 on_click 闭包提供）。
     fn send_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_locked() {
+            // web inert 态：消息控件锁定，发送动作改为引导选择工作区
+            self.hero_ws_menu = true;
+            cx.notify();
+            return;
+        }
         let text: String =
             self.input.read_with(cx, |s, _| s.value().to_string()).trim().to_string();
         if text.is_empty() {
@@ -3165,6 +3264,54 @@ impl Render for AppView {
                     ),
             );
         }
+        if let Some(sess_id) = self.renaming_session.clone() {
+            let t_cancel = this.clone();
+            let t_save = this.clone();
+            let id = sess_id.clone();
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .top_0()
+                    .left_0()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.3))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(360.0))
+                            .v_flex()
+                            .gap_3()
+                            .p_4()
+                            .rounded(px(16.0))
+                            .bg(theme::t().surface)
+                            .border_1()
+                            .border_color(theme::t().border_l2)
+                            .shadow_lg()
+                            .child(div().text_size(px(theme::FONT_ROW)).line_height(px(22.0)).font_weight(FontWeight::MEDIUM).text_color(theme::t().text).child("重命名会话"))
+                            .child(Input::new(&self.rename_input).w_full())
+                            .child(
+                                div().flex().justify_end().gap_2()
+                                    .child({
+                                        let t = t_cancel.clone();
+                                        action_btn_lite("sess-rename-cancel", "取消", false, move |_, _, cx| {
+                                            t.update(cx, |v, cx| { v.renaming_session = None; cx.notify(); });
+                                        })
+                                    })
+                                    .child(action_btn_lite("sess-rename-save", "保存", true, move |_, window, cx| {
+                                        let title = t_save.read_with(cx, |v, _| v.rename_input.read_with(cx, |s, _| s.value().trim().to_string()));
+                                        t_save.update(cx, |v, cx| {
+                                            v.rename_session(&id, title.clone(), cx);
+                                            v.renaming_session = None;
+                                            v.rename_input.update(cx, |s, cx| s.set_value("", window, cx));
+                                            cx.notify();
+                                        });
+                                    })),
+                            ),
+                    ),
+            );
+        }
         if self.settings_open {
             root = root.child(settings::render_settings(self, this, window, cx));
         }
@@ -3280,7 +3427,7 @@ impl AppView {
                     let active = meta.id == current_id;
                     all_rows.push(anchored_row(
                         key,
-                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
                             let id = id.clone();
                             t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
                         }, move |click, _, cx| {
@@ -3462,7 +3609,7 @@ impl AppView {
                                 let slot = row_bounds.clone();
                                 all_rows.push(anchored_row(
                                     key,
-                                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
                                         let id = id.clone();
                                         t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
                                     }, move |click, _, cx| {
@@ -3507,7 +3654,7 @@ impl AppView {
                     let slot = row_bounds.clone();
                     all_rows.push(anchored_row(
                         key,
-                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
+                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
                             let id = id.clone();
                             t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
                         }, move |click, _, cx| {
@@ -3961,12 +4108,43 @@ impl AppView {
                                     }).into_any_element(),
                                 ]
                             } else {
+                                // web Rows 会话菜单三项：rename / fork / archive
                                 let t1 = this.clone();
                                 let id1 = target.clone();
+                                let t2 = this.clone();
+                                let id2 = target.clone();
+                                let t3 = this.clone();
+                                let id3 = target.clone();
+                                let title = self
+                                    .sessions
+                                    .iter()
+                                    .find(|m| m.id.as_str() == target)
+                                    .map(|m| m.title.clone())
+                                    .unwrap_or_default();
                                 vec![
-                                    sb_menu_row("sess-archive", "归档会话", true, move |_, _, cx| {
+                                    sb_menu_row("sess-rename", "重命名", false, move |_, window, cx| {
                                         let id = id1.clone();
                                         t1.update(cx, |v, cx| {
+                                            v.sidebar_menu = None;
+                                            v.renaming_session = Some(id);
+                                            v.rename_input.update(cx, |s, cx| {
+                                                s.set_value(&title, window, cx);
+                                            });
+                                            cx.notify();
+                                        });
+                                    }).into_any_element(),
+                                    sb_menu_row("sess-fork", "分叉会话", false, move |_, _, cx| {
+                                        let id = id2.clone();
+                                        t2.update(cx, |v, cx| {
+                                            v.sidebar_menu = None;
+                                            let sid = dsh_llm::SessionId::new(id);
+                                            v.fork_session(&sid, cx);
+                                        });
+                                    }).into_any_element(),
+                                    // web：归档不触碰日志，不作破坏性标红
+                                    sb_menu_row("sess-archive", "归档会话", false, move |_, _, cx| {
+                                        let id = id3.clone();
+                                        t3.update(cx, |v, cx| {
                                             v.sidebar_menu = None;
                                             let sid = dsh_llm::SessionId::new(id);
                                             v.archive_session(&sid, cx);
@@ -4755,7 +4933,7 @@ impl AppView {
 
     /// 输入卡（web InputBar .card）：r22、白 6% 描边、850 表面、
     /// 文本在上（16/24），控件行在下（+ / 模式 | 模型 / 发送）。
-    fn composer_card(&self, this: Entity<AppView>, has_text: bool) -> Div {
+    fn composer_card(&self, this: Entity<AppView>, has_text: bool) -> Stateful<Div> {
         let running = self.running;
 
         let left = div()
@@ -4851,7 +5029,9 @@ impl AppView {
         };
         right = right.child(trailing);
 
+        let t_card = this.clone();
         div()
+            .id("composer-card")
             .w_full()
             .max_w(px(COMPOSER_CARD_WIDTH))
             .mx_auto()
@@ -4863,7 +5043,27 @@ impl AppView {
             .border_1()
             .border_color(theme::t().border_l1)
             .bg(theme::t().surface)
-            .child(div().pl_4().pr_3().pt_1().child(Input::new(&self.input).appearance(false).w_full()))
+            // web workspaceTrigger：未选工作区时卡面即选择器触发器
+            .when(self.workspace_locked(), |d| {
+                d.cursor_pointer().on_click(move |_, _, cx| {
+                    t_card.update(cx, |v, cx| { v.hero_ws_menu = true; cx.notify(); });
+                })
+            })
+            .child(if self.workspace_locked() {
+                // web：inert 态编辑器不挂载，占位文案即引导
+                div().pl_4().pr_3().pt_1().child(
+                    div()
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(24.0))
+                        .text_color(theme::t().caption)
+                        .child("选择工作区"),
+                )
+            } else {
+                div().pl_4().pr_3().pt_1().child(Input::new(&self.input).appearance(false).w_full())
+            })
             .child(
                 div()
                     .flex()
@@ -5017,6 +5217,21 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
 
 
 /// 视图菜单分组 label（web Menu label：caption 色小字）。
+/// web increasedForkTitle：`标题 (N)` / `标题（N）` 后缀自增，无后缀补 ` (1)`。
+fn increased_fork_title(title: &str) -> String {
+    for (open, close) in [(" (", ")"), ("（", "）")] {
+        if let Some(start) = title.rfind(open) {
+            let inner = &title[start + open.len()..];
+            if let Some(num) = inner.strip_suffix(close)
+                && let Ok(n) = num.parse::<u64>()
+            {
+                return format!("{}{}{}{}", &title[..start], open, n + 1, close);
+            }
+        }
+    }
+    format!("{title} (1)")
+}
+
 /// 点击事件在窗口坐标系里的纵锚点：鼠标取落点、键盘取元素底缘。
 /// 行菜单定位存它再换算列内 top，免疫列表滚动与行高估算误差。
 fn click_anchor_y(click: &ClickEvent) -> f32 {
@@ -5257,11 +5472,16 @@ fn main() {
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| web_titles.get(e.id.as_str()).cloned())
                 .unwrap_or_else(|| "新会话".into());
+            let blank = recorder
+                .load(&e.id, e.cwd.as_deref())
+                .map(|(s, _)| s.entries().is_empty())
+                .unwrap_or(false);
             SessionMeta {
                 id: e.id.clone(),
                 title,
                 time_label: rel(e.modified),
                 cwd: e.cwd.clone(),
+                blank,
             }
         })
         .collect();
@@ -5289,6 +5509,7 @@ fn main() {
             title: "新会话".into(),
             time_label: String::new(),
             cwd: Some(cwd.clone()),
+            blank: true,
         });
         (Session::new(id), cwd, true)
     } else {

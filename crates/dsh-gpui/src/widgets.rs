@@ -285,7 +285,11 @@ pub(crate) fn session_row(
                 .group_hover(group_more, |s| s.opacity(1.0))
                 .hover(|st| st.bg(theme::t().active))
                 .cursor_pointer()
-                .on_click(on_more)
+                // 「…」不是行本身：阻断冒泡，避免同时触发行点击（切换会话）
+                .on_click(move |click, window, cx| {
+                    cx.stop_propagation();
+                    on_more(click, window, cx);
+                })
                 .child(Icon::new(IconName::Ellipsis).size(px(14.0)).text_color(theme::t().text_3)),
         )
 }

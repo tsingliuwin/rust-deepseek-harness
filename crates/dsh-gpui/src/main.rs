@@ -33,7 +33,7 @@ use dsh_tools::ToolRegistry;
 use dsh_web::WebTool;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::{Icon, IconName, Root, StyledExt};
+use gpui_component::{Icon, IconName, Root, StyledExt, TitleBar};
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -966,6 +966,9 @@ struct AppView {
     sb_col_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
     /// 侧栏搜索药丸的窗口 bounds（点外收起判定用）
     sb_search_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
+    /// 侧栏各行的窗口 bounds（键 sbrow-{row_index}，每帧重建）：
+    /// 行菜单锚定行底，位置不随点击落点漂移
+    sb_row_bounds: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Bounds<Pixels>>>>,
     /// 工作区重命名中的目标 id（弹出小对话框）
     renaming_workspace: Option<String>,
     /// hero「选择工作区」菜单开合
@@ -1240,6 +1243,7 @@ impl AppView {
             sb_anchor_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
             sb_col_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
             sb_search_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            sb_row_bounds: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
             renaming_workspace: None,
             hero_ws_menu: false,
             search_open: false,
@@ -1278,7 +1282,8 @@ impl AppView {
             last_drag_tick: Instant::now(),
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT,
-            details_open: true,
+            // web ui-layout init：details 0 = 启动收起，布局不持久化
+            details_open: false,
             details_width: DETAILS_DEFAULT,
             viewport: 1280.0,
             running: false,
@@ -3055,7 +3060,12 @@ impl Render for AppView {
         let sb_col_bounds = self.sb_col_bounds.clone();
 
         let mut root = div()
-            .size_full()
+            .w_full()
+            // 标题栏以下的剩余空间精确填充（basis 0）：此前用 h_full(100%)
+            // 当基尺寸再靠 shrink 扣除标题栏，列表内容超长时收缩失效，
+            // 整个内容区下移 34px——底部设置被裁出窗口、中栏整体下移
+            .flex_1()
+            .min_h_0()
             .h_flex()
             .relative()
             .bg(theme::t().bg_base)
@@ -3158,7 +3168,13 @@ impl Render for AppView {
         if self.settings_open {
             root = root.child(settings::render_settings(self, this, window, cx));
         }
-        root
+        // 顶栏（TitleBar）与主背景同色且无边线：窗口顶部与内容视觉一体；
+        // macOS 左侧 80px 让位红绿灯，整条可拖动窗口（gpui-component 自带）
+        div()
+            .size_full()
+            .v_flex()
+            .child(TitleBar::new().border_color(gpui::hsla(0.0, 0.0, 0.0, 0.0)))
+            .child(root)
     }
 }
 
@@ -3226,6 +3242,23 @@ impl AppView {
             let t_pick = this.clone();
             let mut all_rows: Vec<AnyElement> = Vec::new();
             let mut row_index = 0usize;
+            // 行 bounds 表每帧重建（prepaint 填、点击回调读）：行菜单锚定
+            // 行底，位置不随点击落点漂移、免疫滚动
+            let row_bounds = self.sb_row_bounds.clone();
+            row_bounds.borrow_mut().clear();
+            let shell_bounds = row_bounds.clone();
+            let anchored_row = move |key: String, row: AnyElement| -> AnyElement {
+                let kb = key;
+                let sb = shell_bounds.clone();
+                div()
+                    .on_children_prepainted(move |children, _, _| {
+                        if let Some(b) = children.first().cloned() {
+                            sb.borrow_mut().insert(kb.clone(), b);
+                        }
+                    })
+                    .child(row)
+                    .into_any_element()
+            };
             let search_active = !self.search_query.is_empty();
             if search_active {
                 // web searchTree：匹配会话平铺（工作区行常规渲染跳过）
@@ -3241,21 +3274,27 @@ impl AppView {
                     let id = meta.id.clone();
                     let t_m = this.clone();
                     let id_m = meta.id.as_str().to_string();
-                    let y_m = (row_index as f32) * 37.0 + 176.0;
+                    let key = format!("sbrow-{row_index}");
+                    let kb = key.clone();
+                    let slot = row_bounds.clone();
                     let active = meta.id == current_id;
-                    all_rows.push(
+                    all_rows.push(anchored_row(
+                        key,
                         session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
                             let id = id.clone();
                             t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                        }, move |_, _, cx| {
+                        }, move |click, _, cx| {
                             let id = id_m.clone();
+                            let y = slot.borrow().get(kb.as_str())
+                                .map(|b| f32::from(b.origin.y + b.size.height))
+                                .unwrap_or_else(|| click_anchor_y(click));
                             t_m.update(cx, |v, cx| {
-                                v.sidebar_menu = Some(("session".into(), id, y_m));
+                                v.sidebar_menu = Some(("session".into(), id, y));
                                 cx.notify();
                             });
                         })
                         .into_any_element(),
-                    );
+                    ));
                     row_index += 1;
                 }
             }
@@ -3275,7 +3314,8 @@ impl AppView {
                     let group: SharedString = format!("ws-{wid}").into();
                     let g2 = group.clone();
                     let _g3 = group.clone();
-                    all_rows.push(
+                    all_rows.push(anchored_row(
+                        format!("sbrow-{row_index}"),
                         div()
                             .id(SharedString::from(format!("ws-row-{wid}")))
                             .group(group)
@@ -3329,7 +3369,10 @@ impl AppView {
                                             .justify_center()
                                             .cursor_pointer()
                                             .hover(|s| s.bg(theme::t().active))
+                                            // 行内按钮阻断冒泡：点 ＋ 不应同时
+                                            // 折叠/展开工作区
                                             .on_click(move |_, _, cx| {
+                                                cx.stop_propagation();
                                                 let id = w.clone();
                                                 t_plus.update(cx, |v, cx| {
                                                     v.current_workspace = Some(id.clone());
@@ -3343,7 +3386,9 @@ impl AppView {
                                     })
                                     .child({
                                         let w = wid.clone();
-                                        let y = (row_index as f32) * 37.0 + 130.0;
+                                        let key = format!("sbrow-{row_index}");
+                                        let kb = key.clone();
+                                        let slot = row_bounds.clone();
                                         div()
                                             .id(SharedString::from(format!("ws-more-{w}")))
                                             .size(px(16.0))
@@ -3353,8 +3398,14 @@ impl AppView {
                                             .justify_center()
                                             .cursor_pointer()
                                             .hover(|s| s.bg(theme::t().active))
-                                            .on_click(move |_, _, cx| {
+                                            .on_click(move |click, _, cx| {
+                                                // 行内按钮阻断冒泡：点 … 只开菜单，
+                                                // 不同时触发工作区折叠/展开
+                                                cx.stop_propagation();
                                                 let w = w.clone();
+                                                let y = slot.borrow().get(kb.as_str())
+                                                    .map(|b| f32::from(b.origin.y + b.size.height))
+                                                    .unwrap_or_else(|| click_anchor_y(click));
                                                 t_more.update(cx, |v, cx| {
                                                     v.sidebar_menu = Some(("ws".into(), w, y));
                                                     cx.notify();
@@ -3367,7 +3418,7 @@ impl AppView {
                                 .size(px(12.0))
                                 .text_color(theme::t().caption))
                             .into_any_element(),
-                    );
+                    ));
                     row_index += 1;
                 }
                 // --- 该组会话行 ---
@@ -3406,20 +3457,26 @@ impl AppView {
                             {
                                 let t_m = this.clone();
                                 let id_m = meta.id.as_str().to_string();
-                                let y_m = (row_index as f32) * 37.0 + 130.0;
-                                all_rows.push(
+                                let key = format!("sbrow-{row_index}");
+                                let kb = key.clone();
+                                let slot = row_bounds.clone();
+                                all_rows.push(anchored_row(
+                                    key,
                                     session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
                                         let id = id.clone();
                                         t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                                    }, move |_, _, cx| {
+                                    }, move |click, _, cx| {
                                         let id = id_m.clone();
+                                        let y = slot.borrow().get(kb.as_str())
+                                            .map(|b| f32::from(b.origin.y + b.size.height))
+                                            .unwrap_or_else(|| click_anchor_y(click));
                                         t_m.update(cx, |v, cx| {
-                                            v.sidebar_menu = Some(("session".into(), id, y_m));
+                                            v.sidebar_menu = Some(("session".into(), id, y));
                                             cx.notify();
                                         });
                                     })
                                     .into_any_element(),
-                                );
+                                ));
                             }
                             row_index += 1;
                         }
@@ -3445,20 +3502,26 @@ impl AppView {
                 {
                     let t_m = this.clone();
                     let id_m = meta.id.as_str().to_string();
-                    let y_m = (row_index as f32) * 37.0 + 130.0;
-                    all_rows.push(
+                    let key = format!("sbrow-{row_index}");
+                    let kb = key.clone();
+                    let slot = row_bounds.clone();
+                    all_rows.push(anchored_row(
+                        key,
                         session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, move |_, _, cx| {
                             let id = id.clone();
                             t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                        }, move |_, _, cx| {
+                        }, move |click, _, cx| {
                             let id = id_m.clone();
+                            let y = slot.borrow().get(kb.as_str())
+                                .map(|b| f32::from(b.origin.y + b.size.height))
+                                .unwrap_or_else(|| click_anchor_y(click));
                             t_m.update(cx, |v, cx| {
-                                v.sidebar_menu = Some(("session".into(), id, y_m));
+                                v.sidebar_menu = Some(("session".into(), id, y));
                                 cx.notify();
                             });
                         })
                         .into_any_element(),
-                    );
+                    ));
                 }
                 row_index += 1;
             }
@@ -3803,7 +3866,15 @@ impl AppView {
                                 if let Some((top, left)) = anchor {
                                     d.top(px(top)).left(px(left))
                                 } else {
-                                    d.top(px(y)).left(px(8.0)).right(px(8.0))
+                                    // 行菜单（ws/session）：y 是触发行的窗口
+                                    // 底缘（prepaint 捕获的行 bounds），换算成
+                                    // 列内 top 再留 4px 间隙——位置恒定，免疫
+                                    // 列表滚动与点击落点漂移
+                                    let top = match self.sb_col_bounds.borrow().clone() {
+                                        Some(c) => y - f32::from(c.origin.y) + 4.0,
+                                        None => y,
+                                    };
+                                    d.top(px(top)).left(px(8.0)).right(px(8.0))
                                 }
                             })
                             .min_w(px(218.0))
@@ -3917,7 +3988,10 @@ impl AppView {
                                     .unwrap_or_default();
                                 window.on_mouse_event(
                                     move |event: &MouseDownEvent, phase: DispatchPhase, _, cx| {
-                                        if phase == DispatchPhase::Bubble
+                                        // Capture 相：先于元素回调关闭旧菜单——
+                                        // 点另一行的 … 时新菜单随后被元素回调
+                                        // 打开，一次点击即完成「移动」
+                                        if phase == DispatchPhase::Capture
                                             && !bounds.contains(&event.position)
                                         {
                                             t_dismiss.update(cx, |v, cx| {
@@ -4943,6 +5017,15 @@ fn render_entry_footer(elapsed: Duration, this: &Entity<AppView>, ei: usize) -> 
 
 
 /// 视图菜单分组 label（web Menu label：caption 色小字）。
+/// 点击事件在窗口坐标系里的纵锚点：鼠标取落点、键盘取元素底缘。
+/// 行菜单定位存它再换算列内 top，免疫列表滚动与行高估算误差。
+fn click_anchor_y(click: &ClickEvent) -> f32 {
+    match click {
+        ClickEvent::Mouse(m) => f32::from(m.up.position.y),
+        ClickEvent::Keyboard(k) => f32::from(k.bounds.origin.y + k.bounds.size.height),
+    }
+}
+
 fn sb_menu_label(text: &'static str) -> Div {
     div()
         .px(px(10.0))
@@ -5315,6 +5398,9 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // 透明标题栏 + 红绿灯定位于自绘 TitleBar 内（theme.title_bar
+                // 已是 bg_base，顶部与主背景同色）
+                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
                 ..Default::default()
             },
             |window, cx| {

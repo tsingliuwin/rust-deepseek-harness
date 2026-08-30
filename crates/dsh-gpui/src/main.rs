@@ -1490,7 +1490,7 @@ impl AppView {
             title: child_title,
             time_label: "刚刚".into(),
             cwd: Some(cwd),
-            blank: source.entries().is_empty(),
+            blank: session_is_blank(&source),
         });
         self.switch_session(child_id, cx);
     }
@@ -1730,9 +1730,17 @@ open: false,
     /// 目标目录下已知的空白会话（web summary.blank 的等价判定：
     /// 当前会话直接查内存；其余按 meta.cwd 过滤后加载验证）。
     fn blank_session_in(&self, cwd: &str) -> Option<SessionId> {
-        // 当前会话：内存即真
+        // 当前会话：内存即真（web blank = 无 turn/start）
         let current = self.current_session_id();
-        if self.is_empty_session()
+        let cur_blank = !self
+            .agent
+            .session()
+            .lock()
+            .unwrap()
+            .entries()
+            .iter()
+            .any(|e| matches!(e.event, SessionEvent::TurnStart { .. }));
+        if cur_blank
             && self.sessions.iter().any(|s| s.id == current && s.cwd.as_deref() == Some(cwd))
         {
             return Some(current);
@@ -1746,7 +1754,7 @@ open: false,
                 continue;
             }
             if let Ok((session, _)) = self.recorder.load(&meta.id, Some(cwd))
-                && session.entries().is_empty()
+                && session_is_blank(&session)
             {
                 return Some(meta.id.clone());
             }
@@ -1775,7 +1783,7 @@ open: false,
             if self.is_empty_session()
                 && !self.workspaces.iter().any(|w| w.session_ids.iter().any(|sid| sid == old_id.as_str()))
                 && let Ok((old_session, _)) = self.recorder.load(&old_id, Some(old_cwd.as_str()))
-                && old_session.entries().is_empty()
+                && session_is_blank(&old_session)
             {
                 let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
                 // 磁盘删除必须同步摘除名册条目：web 无删除动作故名册永不
@@ -1796,7 +1804,7 @@ open: false,
         // 留着会成为列表里的孤儿空行，删除（有内容则绝不动）
         if old_cwd != ws_path
             && let Ok((old_session, _)) = self.recorder.load(&old_id, Some(old_cwd.as_str()))
-            && old_session.entries().is_empty()
+            && session_is_blank(&old_session)
         {
             let _ = self.recorder.delete(&old_id, Some(old_cwd.as_str()));
             // 同上：删除即摘名册，杜绝悬空 sessionIds
@@ -5232,6 +5240,16 @@ fn increased_fork_title(title: &str) -> String {
     format!("{title} (1)")
 }
 
+/// web blank 语义（session-controller list.ts）：日志里从未发生过
+/// turn/start 才算空白——web host 建的会话会先落 permission/preset、
+/// sandbox/mode 等设置事件，按「日志为空」判会漏认，跨端重复新建。
+fn session_is_blank(session: &Session) -> bool {
+    !session
+        .entries()
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::TurnStart { .. }))
+}
+
 /// 点击事件在窗口坐标系里的纵锚点：鼠标取落点、键盘取元素底缘。
 /// 行菜单定位存它再换算列内 top，免疫列表滚动与行高估算误差。
 fn click_anchor_y(click: &ClickEvent) -> f32 {
@@ -5474,7 +5492,7 @@ fn main() {
                 .unwrap_or_else(|| "新会话".into());
             let blank = recorder
                 .load(&e.id, e.cwd.as_deref())
-                .map(|(s, _)| s.entries().is_empty())
+                .map(|(s, _)| session_is_blank(&s))
                 .unwrap_or(false);
             SessionMeta {
                 id: e.id.clone(),

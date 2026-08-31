@@ -40,5 +40,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 reqwest = { version = "0.12", default-features = false, features = ["default-tls", "stream", "json", "gzip", "brotli", "deflate"] }
 gpui = "0.2.2"
 gpui-component = "0.5.1"
+gpui-component-assets = "0.5.1"
 encoding_rs = "0.8"
 codepage = "0.1"

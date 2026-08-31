@@ -11,18 +11,22 @@
 #![windows_subsystem = "windows"]
 
 mod assets;
+mod chat;
 pub(crate) mod layout;
 mod settings;
+mod sidebar;
 mod theme;
 pub(crate) mod widgets;
 
+use crate::chat::ChatView;
 use crate::layout::*;
+use crate::sidebar::SidebarView;
 use crate::widgets::*;
 
 use async_stream::stream;
 use async_trait::async_trait;
 use dsh_agent_loop::InboxTarget;
-use dsh_agent_loop::{AgentEvent, AgentOptions, ReactLoopAgent};
+use dsh_agent_loop::{AgentOptions, ReactLoopAgent};
 use dsh_cordis::EventBus;
 use dsh_fs::FsTool;
 use dsh_llm::{
@@ -31,7 +35,7 @@ use dsh_llm::{
 };
 use dsh_llm_deepseek::DeepSeekAdapter;
 use dsh_persist::SessionRecorder;
-use dsh_session::{Session, SessionEvent, TurnEndReason};
+use dsh_session::{Session, SessionEvent};
 use dsh_shell::ShellTool;
 use dsh_system_prompt::SystemPrompt;
 use dsh_tools::ToolRegistry;
@@ -39,10 +43,7 @@ use dsh_web::WebTool;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{Icon, IconName, Root, StyledExt, TitleBar};
-use gpui_component::button::ButtonVariants;
 use gpui_component::input::{Input, InputEvent, InputState};
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -140,6 +141,16 @@ struct ToolDetail {
 enum CenterTab {
     Conversation,
     Trajectory,
+}
+
+/// ChatView 的渲染期快照（AppView render 一次读取，嵌套渲染函数不再
+/// 逐个再进子实体）。
+struct ChatSnap {
+    empty: bool,
+    running: bool,
+    tab: CenterTab,
+    stats: String,
+    stats_steps: u64,
 }
 
 
@@ -1153,25 +1164,15 @@ struct AppView {
     sessions: Vec<SessionMeta>,
     /// 工作区列表（与 web 共享 storages/workspace.json）
     workspaces: Vec<WorkspaceInfo>,
-    /// 折叠的工作区 id 集合（默认全部展开）
-    collapsed_workspaces: std::collections::HashSet<String>,
     /// 当前工作区（hero「选择工作区」；新建会话归属）
     current_workspace: Option<String>,
     /// 已归档会话（web 全局 archivedSessionIds；从所有分组视图隐藏）
     archived: std::collections::HashSet<String>,
     /// 当前会话的 project cwd（写入 web 布局用）
     current_cwd: String,
-    /// 侧栏弹出的行菜单（会话 … / 工作区 … 均用 Option<MenuTarget>）
-    sidebar_menu: Option<(String, String, f32)>,
-    /// 视图选项触发按钮 / 侧栏列的窗口 bounds（每帧 prepaint 捕获；
-    /// 菜单锚定 = 按钮下方 4px、右缘对齐，web Menu portal align=end）
-    sb_anchor_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
+    /// 侧栏列的窗口 bounds（与 SidebarView 共享的 Rc：root 的
+    /// on_children_prepainted 捕获首子元素，侧栏菜单锚定换算消费）
     sb_col_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
-    /// 侧栏搜索药丸的窗口 bounds（点外收起判定用）
-    sb_search_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
-    /// 侧栏各行的窗口 bounds（键 sbrow-{row_index}，每帧重建）：
-    /// 行菜单锚定行底，位置不随点击落点漂移
-    sb_row_bounds: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Bounds<Pixels>>>>,
     /// 工作区重命名中的目标 id（弹出小对话框）
     renaming_workspace: Option<String>,
     /// 会话重命名中的目标 id（弹出小对话框；web Rows 菜单 rename）
@@ -1180,15 +1181,7 @@ struct AppView {
     hero_ws_menu: bool,
     /// composer 模型菜单开合（模型牌点击弹出）
     model_menu: bool,
-    /// 搜索会话：展开 + 词条
-    search_open: bool,
-    search_query: String,
-    search_input: Entity<InputState>,
-    /// 视图选项：单列表 / 按工作区；排序 手动 / 最近更新
-    group_flat: bool,
-    order_manual: bool,
     rename_input: Entity<InputState>,
-    entries: Vec<ChatEntry>,
     input: Entity<InputState>,
     #[allow(dead_code)] // 被 DeepSeek 卡引用
     api_input: Entity<InputState>,
@@ -1228,15 +1221,14 @@ struct AppView {
     edit_base: Entity<InputState>,
     pending_clear: bool,
     _input_subscription: Subscription,
-    _search_subscription: Subscription,
-    /// 消息流虚拟列表（可变高、Bottom 对齐聊天模式）
-    chat_list: ListState,
-    /// 列表条目总数（消息 + 状态行 + 统计行）
-    chat_items: usize,
-    /// 列表当前是否贴底（scroll handler 维护）
-    list_bottom: Rc<Cell<bool>>,
-    /// 下一次 sync 强制 reset（会话切换/重建：内容整体替换）
-    chat_reset_pending: bool,
+    /// 对话/轨迹主体（独立 entity：流式 delta 的失效只打它；侧栏/详情经
+    /// AnyView 的 element_state 缓存复用上帧结果，不再随流式逐帧重建）
+    chat: Entity<ChatView>,
+    /// 会话/工作区列表（独立 entity：菜单、搜索、折叠等侧栏交互只在
+    /// 侧栏内失效，聊天区/composer 不再随每个键入重建）
+    sidebar: Entity<SidebarView>,
+    /// 中栏列宽（render 时写入；ChatView 读取计算内容列宽）
+    center_width: f32,
     // 布局状态
     last_drag_tick: Instant,
     sidebar_collapsed: bool,
@@ -1244,47 +1236,8 @@ struct AppView {
     details_open: bool,
     details_width: f32,
     viewport: f32,
-    // 会话运行态
-    running: bool,
-    turn_started_at: Option<Instant>,
-    stats_turns: u64,
-    stats_tools: u64,
-    stats_steps: u64,
-    stats_input_tokens: u64,
-    stats_output_tokens: u64,
-    stats_cache_read: u64,
-    stats_cache_write: u64,
-    /// 本轮工具调用计时（call_id → 起始时刻）
-    tool_starts: std::collections::HashMap<String, std::time::Instant>,
-    /// 流式文本渲染节流快照（(ei, bi, 时刻, 展示文本)）。gpui-component
-    /// TextView 的后台解析是"每条更新重置 200ms 防抖计时器"——连续 delta
-    /// 下计时器永不触发、解析一次不跑，正文冻结到流结束后一股脑出现。
-    /// 喂 TextView 的文本以 >200ms 间隔节流，防抖必然触发、渐进渲染。
-    stream_text_shown: std::cell::RefCell<Option<(usize, usize, std::time::Instant, String)>>,
-    /// 流式文本增长改了条目高度但没知会虚拟列表 → 按陈旧行高排布、行重叠；
-    /// 渲染路径置位（渲染中不能改列表），由 tick 消费后统一失效重测。
-    heights_dirty: std::cell::Cell<bool>,
-    /// 本轮累计工具耗时（LLM 时间 = 轮用时 − 工具时间）
-    turn_tool_time: std::time::Duration,
-    /// 本轮 token 累计（TurnEnded 冻结进消息 footer 的统计快照）
-    turn_usage: TurnUsage,
-    /// 本轮首个 token 时刻（TTFT 数据源）
-    turn_first_token: Option<Instant>,
-    /// 会话级累计 LLM / 工具耗时（TurnEnded 结转；不持久化——重载会话
-    /// 该组整体省略，web StatsLine 同语义：无数据的组整段丢弃）
-    session_llm_time: std::time::Duration,
-    session_tool_time: std::time::Duration,
-    // 中栏 tab + 详情选中
-    tab: CenterTab,
+    // 详情选中
     selected_tool: Option<ToolDetail>,
-    /// 轨迹 tab 滚动句柄（Inspect pill 跳转 scroll_to_item）
-    traj_scroll: ScrollHandle,
-    /// 当前（或最近）轮次号（web turn-process 的分组键）
-    ui_turn: u64,
-    /// 仍打开的轮次（TurnStarted→TurnEnded；打开的轮次不折叠）
-    turn_open: Option<u64>,
-    /// 手动展开过的轮次（compact 默认折叠；web 的页内存 manual overrides）
-    turn_expanded: std::collections::HashSet<u64>,
 }
 
 /// web contextProvenance/contextForm 投影：标题（注入/召回）+ 生产者
@@ -1327,63 +1280,6 @@ fn non_empty(s: String) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
 }
 
-/// 时长格式（web formatDuration 风格：<60s 一位小数秒，否则 分+秒）。
-fn fmt_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs_f64();
-    if secs < 60.0 {
-        format!("{secs:.1}s")
-    } else {
-        format!("{}m{}s", secs as u64 / 60, (secs as u64) % 60)
-    }
-}
-
-/// web StatsLine 文本：组按「 | 」连接，无数据的组整段丢弃——
-/// 计数（轮·步）、耗时（LLM/工具调用）、token（缓存命中 + 输入/输出）。
-fn stats_line_text(
-    turns: u64,
-    steps: u64,
-    llm: std::time::Duration,
-    tool: std::time::Duration,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read: u64,
-) -> String {
-    let mut groups: Vec<String> = Vec::new();
-    if steps > 0 {
-        groups.push(format!("{turns} 轮 · {steps} 步"));
-        let mut durations: Vec<String> = Vec::new();
-        if llm.as_secs_f64() > 0.0 {
-            durations.push(format!("LLM {}", fmt_duration(llm)));
-        }
-        if tool.as_secs_f64() > 0.0 {
-            durations.push(format!("工具调用 {}", fmt_duration(tool)));
-        }
-        if !durations.is_empty() {
-            groups.push(durations.join(" · "));
-        }
-    }
-    if input_tokens > 0 || output_tokens > 0 {
-        // 计费输入 = 总输入 − 缓存读（web billedInputTokens）
-        let billed = input_tokens.saturating_sub(cache_read);
-        if cache_read > 0 {
-            let pct = cache_read as f64 / (cache_read + billed) as f64 * 100.0;
-            groups.push(format!("缓存命中 {pct:.0}%"));
-        }
-        groups.push(format!("输入 {billed} tok · 输出 {output_tokens} tok"));
-    }
-    groups.join(" | ")
-}
-
-/// 单轮折叠派生（web turn-process 节点数据的对应物）。
-#[derive(Clone, Copy)]
-struct TurnFold {
-    first_process: usize,
-    answer: usize,
-    tools: usize,
-    messages: usize,
-    subagents: usize,
-}
-
 impl AppView {
     fn new(
         agent: Arc<ReactLoopAgent>,
@@ -1416,19 +1312,13 @@ impl AppView {
         edit_base: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search_subscription = cx.subscribe(&search_input, |chat, st, event, cx| {
-            if matches!(event, InputEvent::Change) {
-                let q = st.read_with(cx, |s, _| s.value().to_string());
-                chat.search_query = q.trim().to_string();
-                cx.notify();
-            }
-        });
+        let this = cx.entity();
         let subscription = cx.subscribe(&input, |chat, input, event, cx| {
             if matches!(event, InputEvent::PressEnter { secondary: false }) {
                 let text: String = input.read_with(cx, |s, _| s.value().to_string());
                 let text = text.trim().to_string();
                 if !text.is_empty() {
-                    if chat.workspace_locked() {
+                    if chat.workspace_locked(cx) {
                         // web inert 态：回车不发送，引导选择工作区
                         chat.hero_ws_menu = true;
                         cx.notify();
@@ -1440,6 +1330,20 @@ impl AppView {
                 }
             }
         });
+        // 对话主体 entity：流式 delta 的失效域（见 chat.rs 模块注释）
+        let chat = cx.new(|cx| {
+            ChatView::new(
+                Arc::clone(&agent),
+                this.clone(),
+                format!("{}/{}", active_provider, desired_model),
+                settings.transcript_view,
+                cx,
+            )
+        });
+        // 侧栏 entity：交互态自有；数据快照经 refresh_sidebar 推送。
+        // sb_col_bounds 与 AppView 共享（root prepaint 捕获列 bounds）。
+        let sb_col_bounds = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let sidebar = cx.new(|cx| SidebarView::new(this.clone(), search_input, sb_col_bounds.clone(), cx));
         let mut view = Self {
             agent,
             recorder: deps.recorder,
@@ -1452,7 +1356,6 @@ impl AppView {
             workdir,
             persist_cwd,
             sessions,
-            entries: Vec::new(),
             input,
             api_input,
             desired_model,
@@ -1464,24 +1367,14 @@ impl AppView {
             env_key_locked,
             deepseek_key,
             workspaces,
-            collapsed_workspaces: Default::default(),
             current_workspace: None,
             archived: load_archived_ids().into_iter().collect(),
             current_cwd: String::new(),
-            sidebar_menu: None,
-            sb_anchor_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            sb_col_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            sb_search_bounds: std::rc::Rc::new(std::cell::RefCell::new(None)),
-            sb_row_bounds: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            sb_col_bounds,
             renaming_workspace: None,
             renaming_session: None,
             hero_ws_menu: false,
             model_menu: false,
-            search_open: false,
-            search_query: String::new(),
-            search_input: search_input.clone(),
-            group_flat: false,
-            order_manual: false,
             rename_input,
             adding: AddingMode::None,
             adopt_pick: 0,
@@ -1503,13 +1396,9 @@ impl AppView {
             edit_base,
             pending_clear: false,
             _input_subscription: subscription,
-            _search_subscription: search_subscription,
-            // Top 对齐（web 同语义）：内容自顶排布，短会话首条消息在顶部；
-            // 溢出后的吸底由 sync_chat_list 的 scroll_to_reveal_item 承担
-            chat_list: ListState::new(0, ListAlignment::Top, px(100.0)),
-            chat_items: 0,
-            list_bottom: Rc::new(Cell::new(true)),
-            chat_reset_pending: false,
+            chat,
+            sidebar,
+            center_width: 1024.0,
             last_drag_tick: Instant::now(),
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT,
@@ -1517,55 +1406,33 @@ impl AppView {
             details_open: false,
             details_width: DETAILS_DEFAULT,
             viewport: 1280.0,
-            running: false,
-            turn_started_at: None,
-            turn_usage: TurnUsage::default(),
-            turn_first_token: None,
-            stats_turns: 0,
-            stats_tools: 0,
-            stats_steps: 0,
-            stats_input_tokens: 0,
-            stats_output_tokens: 0,
-            stats_cache_read: 0,
-            stats_cache_write: 0,
-            tool_starts: Default::default(),
-            turn_tool_time: std::time::Duration::ZERO,
-            stream_text_shown: std::cell::RefCell::new(None),
-            heights_dirty: std::cell::Cell::new(false),
-            session_llm_time: std::time::Duration::ZERO,
-            session_tool_time: std::time::Duration::ZERO,
-            tab: CenterTab::Conversation,
             selected_tool: None,
-            traj_scroll: ScrollHandle::new(),
-            ui_turn: 0,
-            turn_open: None,
-            turn_expanded: Default::default(),
         };
-        view.rebuild_from_session();
-        // 虚拟列表长度同步（构造时 rebuild 填充了 entries，列表需知道条数）
-        {
-            let n = view.chat_item_count();
-            view.chat_items = n;
-            view.chat_list.reset(n);
-            if n > 0 {
-                view.chat_list.scroll_to_reveal_item(n - 1);
-            }
-        }
-        // 贴底状态跟踪：滚动事件更新可见范围是否含末尾
-        {
-            let list = view.chat_list.clone();
-            let bottom = Rc::clone(&view.list_bottom);
-            let _ = &list;
-            list.set_scroll_handler(move |ev, _window, _cx| {
-                let _ = &bottom;
-                // visible_range.end 是后半开区间：末项可见 ⟺ end > last
-                // 这里只记录"是否滚到底部附近"，由 Viewer 用 chat_items 修正
-                let end = ev.visible_range.end;
-                let count = ev.count;
-                bottom.set(end >= count);
-            });
-        }
+        // 历史回放 + 列表初始同步（ChatView 内部完成）
+        view.chat.update(cx, |c, cx| {
+            c.rebuild_from_session();
+            cx.notify();
+        });
+        // 侧栏初始数据快照
+        view.refresh_sidebar(cx);
         view
+    }
+
+    /// 把会话/工作区/归档/选中/布局快照推进侧栏视图（数据变更点的统一
+    /// 收口；只应在宿主事件处理路径调用，不得在 render 或 sidebar 自身
+    /// update 闭包内调用）。
+    fn refresh_sidebar(&mut self, cx: &mut Context<Self>) {
+        let sessions = self.sessions.clone();
+        let workspaces = self.workspaces.clone();
+        let archived = self.archived.clone();
+        let current = self.current_session_id();
+        let current_ws = self.current_workspace.clone();
+        let collapsed = self.sidebar_collapsed;
+        let width = self.sidebar_width;
+        self.sidebar.update(cx, |s, cx| {
+            s.refresh(sessions, workspaces, archived, current, current_ws, collapsed, width);
+            cx.notify();
+        });
     }
 
     /// 会话属于哪个工作区（预留：后续会话移动用）。
@@ -1611,6 +1478,7 @@ impl AppView {
         self.current_workspace = Some(id);
         self.sync_fs_sandbox();
         save_workspaces(&self.workspaces);
+        self.refresh_sidebar(cx);
         cx.notify();
     }
 
@@ -1637,7 +1505,7 @@ impl AppView {
     /// 隐藏；日志保留、workspace 归属不动（web：archiving never touches
     /// workspace accounting，unarchive 时原位恢复）。单向，无取消 UI。
     fn archive_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
-        if self.running && self.current_session_id() == *id {
+        if self.running(cx) && self.current_session_id() == *id {
             return;
         }
         archive_session_doc(id.as_str());
@@ -1646,6 +1514,7 @@ impl AppView {
             // 归档当前会话：留在原地（web 同——归档不影响打开的视图），
             // 仅列表隐藏
         }
+        self.refresh_sidebar(cx);
         cx.notify();
     }
 
@@ -1672,13 +1541,14 @@ impl AppView {
                 &SessionEvent::SessionTitle { title },
             );
         }
+        self.refresh_sidebar(cx);
         cx.notify();
     }
 
     /// 会话分叉（web Rows 菜单 fork → sessions.fork increaseTitle）：
     /// 复制整条日志为新会话，子标题按 `标题 (N)` 自增，然后切过去。
     fn fork_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
-        if self.running {
+        if self.running(cx) {
             return;
         }
         let Some(meta) = self.sessions.iter().find(|m| &m.id == id) else {
@@ -1718,170 +1588,12 @@ impl AppView {
         self.switch_session(child_id, cx);
     }
 
-    /// Rebuild the transcript from the agent's session log (restore/switch).
-    fn rebuild_from_session(&mut self) {
-        self.entries.clear();
-        self.running = false;
-        self.turn_started_at = None;
-        self.selected_tool = None;
-        self.stats_turns = 0;
-        self.stats_tools = 0;
-        self.stats_steps = 0;
-        self.stats_input_tokens = 0;
-        self.stats_output_tokens = 0;
-        self.stats_cache_read = 0;
-        self.stats_cache_write = 0;
-        self.session_llm_time = std::time::Duration::ZERO;
-        self.session_tool_time = std::time::Duration::ZERO;
-        self.turn_tool_time = std::time::Duration::ZERO;
-        self.tool_starts.clear();
-        let session = self.agent.session();
-        let session = session.lock().unwrap();
-        let mut cur_turn = 0u64;
-        for entry in session.entries() {
-            match &entry.event {
-                SessionEvent::TurnStart { turn } => {
-                    cur_turn = *turn;
-                    self.stats_turns += 1;
-                }
-                SessionEvent::TurnEnd { reason: TurnEndReason::Error { failure }, .. } => {
-                    // 失败轮次在历史里也要可见（实时路径由 AgentEvent::Error
-                    // 入列；回放此前只有用户气泡、轮次看起来凭空蒸发）
-                    self.entries.push(ChatEntry {
-                        role: Role::Error,
-                        blocks: vec![MsgBlock::Text(format!("[{}] {}", failure.code, failure.message))],
-                        done: true,
-                        elapsed: None, usage: None, ended_at_ms: None,
-                        turn: cur_turn,
-                        context: None,
-                        open: false,
-                    });
-                }
-                SessionEvent::AssistantMessage { usage, message, .. } => {
-                    self.stats_steps += 1;
-                    if let Some(u) = usage {
-                        self.stats_input_tokens += u.input_tokens;
-                        self.stats_output_tokens += u.output_tokens;
-                        if let Some(cr) = u.cache_read_tokens { self.stats_cache_read += cr; }
-                        if let Some(cw) = u.cache_write_tokens { self.stats_cache_write += cw; }
-                    }
-                    // 回放助手内容（文本/推理/工具调用行）。实时路径由 chunk 流
-                    // 增量入列，历史回放唯一来源就是这条完整消息——曾缺失此
-                    // 分支导致打开历史会话只剩用户气泡、轨迹无工具记录。
-                    let mut blocks: Vec<MsgBlock> = Vec::new();
-                    for b in &message.content {
-                        match b {
-                            ContentBlock::Text { text } => {
-                                if !text.is_empty() {
-                                    blocks.push(MsgBlock::Text(text.clone()));
-                                }
-                            }
-                            ContentBlock::Reasoning { text } => {
-                                blocks.push(MsgBlock::Reasoning { text: text.clone(), open: false });
-                            }
-                            ContentBlock::ToolCall { id, name, arguments } => {
-                                self.stats_tools += 1;
-                                blocks.push(MsgBlock::Tool(ToolBlock {
-                                    id: id.0.clone(),
-                                    name: name.clone(),
-                                    arguments: arguments.clone(),
-                                    result: None,
-                                    error: false,
-                                    open: false,
-                                    expanded: false,
-                                    collapsed_groups: Vec::new(),
-                                }));
-                            }
-                            _ => {}
-                        }
-                    }
-                    if !blocks.is_empty() {
-                        self.entries.push(ChatEntry {
-                            role: Role::Assistant,
-                            blocks,
-                            done: true,
-                            elapsed: None,
-                            usage: None,
-                            ended_at_ms: None,
-                            turn: cur_turn,
-                            context: None,
-                            open: false,
-                        });
-                    }
-                }
-                SessionEvent::ToolCall { .. } => { self.stats_tools += 1; }
-                SessionEvent::UserMessage(m) => {
-                    let text: String = m
-                        .content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
-                    if text.is_empty() {
-                        continue;
-                    }
-                    // 生产者注入的上下文 → ContextInjectionRow（非用户气泡）
-                    if let MessageSource::Context { context_kind, plugin, form, summary, changes_paths, reference_labels, name } =
-                        &m.source
-                    {
-                        let info = context_info(context_kind, plugin, form, summary, changes_paths, reference_labels, name);
-                        self.entries.push(ChatEntry {
-                            role: Role::Context,
-                            blocks: vec![MsgBlock::Text(text)],
-                            done: true,
-                            elapsed: None, usage: None, ended_at_ms: None,
-                            turn: cur_turn,
-                            context: Some(info),
-                            open: false,
-                        });
-                        continue;
-                    }
-                    self.entries.push(ChatEntry {
-                        role: Role::User,
-                        blocks: vec![MsgBlock::Text(text)],
-                        done: true,
-                        elapsed: None, usage: None, ended_at_ms: None,
-                        turn: cur_turn,
-                        context: None,
-                        open: false,
-                    });
-                }
-                SessionEvent::ToolResult { message, .. } => {
-                    if let Some(ContentBlock::ToolResult { tool_call_id, content, is_error }) =
-                        message.content.first()
-                    {
-                        let result_text: String = content
-                            .iter()
-                            .filter_map(|b| match b {
-                                ContentBlock::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
-                            .collect();
-                        attach_tool_result(self.entries.last_mut(), &tool_call_id.0, &result_text, is_error.unwrap_or(false));
-                    }
-                }
-                SessionEvent::Compaction { .. } => {
-                    self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: cur_turn, context: None,
-open: false,
-});
-                }
-                _ => {}
-            }
-        }
-        self.ui_turn = cur_turn;
-        self.turn_open = None; // 回放态全部视为已关闭（可折叠判定成立）
-        self.chat_reset_pending = true;
-        self.sync_chat_list(true);
-    }
-
     /// Switch the agent to a persisted session and rebuild the transcript.
     /// 运行中禁止切换：单 agent 架构下轮次输出随 agent 的当前会话走，
     /// 切换会把旧对话的流式输出写进新会话（web 为每会话独立 agent，
     /// 此处是与 web 的已文档化偏差）。
     fn switch_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if self.running {
+        if self.running(cx) {
             return;
         }
         let cwd_hint = self
@@ -1894,25 +1606,31 @@ open: false,
             .load(&id, cwd_hint.as_deref())
             .unwrap_or_else(|_| (Session::new(id.clone()), cwd_hint));
         if let Some(c) = cwd {
-            self.current_cwd = c;
+            self.current_cwd = c.clone();
+            // display_path 相对化基准同步进 ChatView
+            self.chat.update(cx, |ch, _| ch.cwd = c);
         }
         self.sync_fs_sandbox();
         self.agent.set_session(session);
-        self.rebuild_from_session();
-        self.tab = CenterTab::Conversation;
-        // 折叠状态属于会话本身：跨会话残留会让新会话按旧轮次开合
-        self.turn_expanded.clear();
-        self.turn_open = None;
-        // 虚拟列表必须 reset：条目整体换血（splice 保留旧测高与滚动锚，
-        // scroll_to_reveal 按陈旧高度算偏移会落进空白区——切后看不到内容）
-        self.chat_reset_pending = true;
-        self.sync_chat_list(true);
+        self.selected_tool = None;
+        // 回放 + 折叠态/列表重置都在 ChatView 内完成（含虚拟列表 reset：
+        // 条目整体换血，splice 会保留旧测高，scroll_to_reveal 按陈旧高度
+        // 算偏移会落进空白区——切后看不到内容）
+        self.chat.update(cx, |c, cx| {
+            c.rebuild_from_session();
+            c.tab = CenterTab::Conversation;
+            // 折叠状态属于会话本身：跨会话残留会让新会话按旧轮次开合
+            c.turn_expanded.clear();
+            c.turn_open = None;
+            cx.notify();
+        });
+        self.refresh_sidebar(cx);
         cx.notify();
     }
 
     /// Create a fresh session and make it current.
     fn new_session(&mut self, cx: &mut Context<Self>) {
-        if self.running {
+        if self.running(cx) {
             return;
         }
         // web startSession：目标 = 显式选择 ?? 当前会话所属 ?? 最近工作区；
@@ -1939,24 +1657,14 @@ open: false,
         self.current_cwd = cwd.clone();
         self.sync_fs_sandbox();
         self.agent.set_session(Session::new(id.clone()));
-        self.entries.clear();
-        self.running = false;
-        self.turn_started_at = None;
         self.selected_tool = None;
-        self.stats_turns = 0;
-        self.stats_tools = 0;
-        self.stats_steps = 0;
-        self.stats_input_tokens = 0;
-        self.stats_output_tokens = 0;
-        self.stats_cache_read = 0;
-        self.stats_cache_write = 0;
-        self.session_llm_time = std::time::Duration::ZERO;
-        self.session_tool_time = std::time::Duration::ZERO;
-        self.turn_tool_time = std::time::Duration::ZERO;
-        self.tool_starts.clear();
-        self.tab = CenterTab::Conversation;
+        self.chat.update(cx, |c, cx| {
+            c.reset_empty();
+            cx.notify();
+        });
         self.assign_session_to_workspace(&id, ws.as_deref());
         self.sessions.insert(0, SessionMeta { id, title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(cwd), blank: true });
+        self.refresh_sidebar(cx);
         cx.notify();
     }
     /// 新会话的目标工作区（web startSession 链）：显式选择 ?? 当前会话
@@ -1987,27 +1695,20 @@ open: false,
     /// 不落盘、不进列表；工作目录 = 进程 cwd（工具仍有执行基准）。
     fn enter_blank_draft(&mut self, cx: &mut Context<Self>) {
         self.agent.set_session(Session::new(self.alloc_session_id()));
-        self.entries.clear();
-        self.running = false;
-        self.turn_started_at = None;
         self.selected_tool = None;
-        self.stats_turns = 0;
-        self.stats_tools = 0;
-        self.stats_steps = 0;
-        self.stats_input_tokens = 0;
-        self.stats_output_tokens = 0;
-        self.stats_cache_read = 0;
-        self.stats_cache_write = 0;
-        self.session_llm_time = std::time::Duration::ZERO;
-        self.session_tool_time = std::time::Duration::ZERO;
-        self.turn_tool_time = std::time::Duration::ZERO;
-        self.tool_starts.clear();
+        self.chat.update(cx, |c, cx| {
+            c.reset_empty();
+            cx.notify();
+        });
         self.current_cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
+        {
+            let cwd = self.current_cwd.clone();
+            self.chat.update(cx, |ch, _| ch.cwd = cwd);
+        }
         self.sync_fs_sandbox();
-        self.chat_reset_pending = true;
-        self.sync_chat_list(true);
+        self.refresh_sidebar(cx);
         cx.notify();
     }
 
@@ -2050,7 +1751,7 @@ open: false,
     /// 决定会话落点）。仅当当前会话为空时重绑——新建一份挂到所选工作区
     /// 的会话，删除旧的 header-only 文件，同步 cwd/沙箱/工具工作目录。
     fn rebind_empty_session_to_workspace(&mut self, cx: &mut Context<Self>) {
-        if self.running || !self.is_empty_session() {
+        if self.running(cx) || !self.is_empty_session(cx) {
             return;
         }
         let ws_path = self
@@ -2064,7 +1765,7 @@ open: false,
             // 旧的空会话若未挂任何工作区（启动空白的遗留），清理掉
             let old_id = self.current_session_id();
             let old_cwd = self.current_cwd.clone();
-            if self.is_empty_session()
+            if self.is_empty_session(cx)
                 && !self.workspaces.iter().any(|w| w.session_ids.iter().any(|sid| sid == old_id.as_str()))
                 && let Ok((old_session, _)) = self.recorder.load(&old_id, Some(old_cwd.as_str()))
                 && session_is_blank(&old_session)
@@ -2096,300 +1797,43 @@ open: false,
             self.sessions.retain(|s| s.id != old_id);
         }
         self.current_cwd = ws_path.clone();
+        {
+            let cwd = ws_path.clone();
+            self.chat.update(cx, |ch, _| ch.cwd = cwd);
+        }
         self.agent.set_session(Session::new(new_id.clone()));
-        self.entries.clear();
-        self.running = false;
-        self.turn_started_at = None;
         self.selected_tool = None;
+        self.chat.update(cx, |c, cx| {
+            c.reset_empty();
+            cx.notify();
+        });
         self.sessions.insert(
             0,
             SessionMeta { id: new_id.clone(), title: "新会话".into(), time_label: "刚刚".into(), cwd: Some(ws_path), blank: true },
         );
-        self.chat_reset_pending = true;
         let ws = self.current_workspace.clone();
         self.assign_session_to_workspace(&new_id, ws.as_deref());
         self.sync_fs_sandbox();
-        self.sync_chat_list(true);
+        self.refresh_sidebar(cx);
         cx.notify();
-    }
-
-    /// 虚拟列表条目总数：消息 + 流式状态行 + 统计行。
-    fn chat_item_count(&self) -> usize {
-        // 统计行不在滚动流里（web：composer.dock 槽，输入卡上方）
-        self.entries.len() + usize::from(self.running)
-    }
-
-    /// 同步列表长度并按需滚底（流式期间沿用贴底语义）。
-    fn sync_chat_list(&mut self, force_bottom: bool) {
-        let n = self.chat_item_count();
-        // append-only 增长（流式）走 splice：保留滚动锚点——reset 会清
-        // logical_scroll_top 把视图弹回顶部，吸底跟随随之失效
-        if self.chat_reset_pending || n < self.chat_items {
-            self.chat_list.reset(n);
-            self.chat_reset_pending = false;
-        } else if n > self.chat_items {
-            // splice 的第二参数是替换后的数量：空范围插 (n - 旧总数) 条
-            self.chat_list.splice(self.chat_items..self.chat_items, n - self.chat_items);
-        }
-        self.chat_items = n;
-        if n > 0 && (force_bottom || self.list_bottom.get()) {
-            self.chat_list.scroll_to_reveal_item(n - 1);
-        }
-    }
-
-    /// 条目高度失效：内容高度不经 splice/reset 变化（展开收起、流式文本
-    /// 增长）时，列表按陈旧行高排布、行间重叠；标记全部 Unmeasured 重测，
-    /// 滚动锚点由 splice 自行调整。
-    fn invalidate_chat_heights(&self) {
-        let n = self.chat_item_count();
-        if n > 0 {
-            self.chat_list.splice(0..n, n);
-        }
-    }
-
-    /// 消息流当前是否贴底（scroll handler 维护的可见范围判断）。
-    fn chat_near_bottom(&self) -> bool {
-        self.list_bottom.get()
-    }
-
-    /// web StatsLine 文本（组内数据缺失时整组省略）。
-    fn stats_line(&self) -> String {
-        stats_line_text(
-            self.stats_turns,
-            self.stats_steps,
-            self.session_llm_time,
-            self.session_tool_time,
-            self.stats_input_tokens,
-            self.stats_output_tokens,
-            self.stats_cache_read,
-        )
     }
 
     fn current_session_id(&self) -> SessionId {
         self.agent.session().lock().unwrap().id.clone()
     }
 
-    fn is_empty_session(&self) -> bool {
-        self.entries.is_empty()
+    fn running(&self, cx: &App) -> bool {
+        self.chat.read_with(cx, |c, _| c.running())
+    }
+
+    fn is_empty_session(&self, cx: &App) -> bool {
+        self.chat.read_with(cx, |c, _| c.is_empty())
     }
 
     /// web InputBar 的 inert 态：空会话且未绑定工作区 → 编辑器不挂载、
     /// 消息控件锁定，卡面整体充当「选择工作区」触发器
-    fn workspace_locked(&self) -> bool {
-        self.is_empty_session() && self.current_workspace.is_none()
-    }
-
-    fn push_user(&mut self, text: String) {
-        // 会话标题：首条用户消息后自动生成（截断到 30 字符）
-        let current = self.current_session_id();
-        if let Some(meta) = self.sessions.iter_mut().find(|s| s.id == current)
-            && meta.title == "新会话"
-            && !text.is_empty()
-        {
-            meta.title = text.chars().take(30).collect();
-            meta.blank = false;
-            // 标题落盘（web session/title 事件 + session_projcache 投影行），
-            // 否则 web 端看到的本会话永远无标题
-            let title = meta.title.clone();
-            let cwd = self.current_cwd.clone();
-            let _ = self.recorder.append(&current, &cwd, &SessionEvent::SessionTitle { title });
-        }
-        self.entries.push(ChatEntry {
-            role: Role::User,
-            blocks: vec![MsgBlock::Text(text)],
-            done: true,
-            elapsed: None, usage: None, ended_at_ms: None,
-            turn: self.ui_turn,
-         context: None,
-open: false,
-});
-        self.sync_chat_list(true);
-    }
-
-    fn last_assistant(&mut self) -> &mut ChatEntry {
-        let new = !matches!(self.entries.last(), Some(e) if e.role == Role::Assistant && !e.done);
-        if new {
-            self.entries.push(ChatEntry {
-                role: Role::Assistant,
-                blocks: Vec::new(),
-                done: false,
-                elapsed: None, usage: None, ended_at_ms: None,
-                turn: self.ui_turn,
-             context: None,
-open: false,
-});
-        }
-        self.entries.last_mut().unwrap()
-    }
-
-    fn push_text(&mut self, text: &str) {
-        let blocks = &mut self.last_assistant().blocks;
-        match blocks.last_mut() {
-            Some(MsgBlock::Text(t)) => t.push_str(text),
-            _ => blocks.push(MsgBlock::Text(text.to_string())),
-        }
-    }
-
-    fn push_reasoning(&mut self, text: &str) {
-        let blocks = &mut self.last_assistant().blocks;
-        match blocks.last_mut() {
-            Some(MsgBlock::Reasoning { text: t, .. }) => t.push_str(text),
-            _ => blocks.push(MsgBlock::Reasoning { text: text.to_string(), open: false }),
-        }
-    }
-
-    fn push_event(&mut self, ev: AgentEvent) {
-        match ev {
-            AgentEvent::TurnStarted { turn } => {
-                self.running = true;
-                self.turn_started_at = Some(Instant::now());
-                self.stats_turns += 1;
-                self.ui_turn = turn;
-                self.turn_open = Some(turn);
-                self.turn_tool_time = std::time::Duration::ZERO;
-                self.turn_usage = TurnUsage::default();
-                self.turn_first_token = None;
-                self.tool_starts.clear();
-                self.stream_text_shown.borrow_mut().take();
-            }
-            AgentEvent::TextDelta { text } => {
-                if self.turn_first_token.is_none() {
-                    self.turn_first_token = Some(Instant::now());
-                }
-                self.push_text(&text);
-            }
-            AgentEvent::ReasoningDelta { text } => {
-                if self.turn_first_token.is_none() {
-                    self.turn_first_token = Some(Instant::now());
-                }
-                self.push_reasoning(&text);
-            }
-            AgentEvent::ToolCall { tool_call_id, name, arguments: args } => {
-                self.stats_tools += 1;
-                self.tool_starts.insert(tool_call_id.0.clone(), Instant::now());
-                self.last_assistant().blocks.push(MsgBlock::Tool(ToolBlock {
-                    id: tool_call_id.0,
-                    name,
-                    arguments: args,
-                    result: None,
-                    error: false,
-                    open: false,
-                    expanded: false,
-                    collapsed_groups: Vec::new(),
-                }));
-            }
-            AgentEvent::ToolResult { tool_call_id, is_error } => {
-                if let Some(start) = self.tool_starts.remove(&tool_call_id.0) {
-                    self.turn_tool_time += start.elapsed();
-                }
-                // 实时结果文本从会话日志回读（事件本身只带 id/error）。
-                let result = self.latest_tool_result_text(&tool_call_id.0);
-                let last = self.entries.last_mut();
-                attach_tool_result(last, &tool_call_id.0, result.0.as_str(), is_error);
-            }
-            AgentEvent::AssistantMessage { usage, .. } => {
-                self.stats_steps += 1;
-                if let Some(u) = usage {
-                    self.stats_input_tokens += u.input_tokens;
-                    self.stats_output_tokens += u.output_tokens;
-                    if let Some(cr) = u.cache_read_tokens { self.stats_cache_read += cr; }
-                    if let Some(cw) = u.cache_write_tokens { self.stats_cache_write += cw; }
-                    // 本轮 token 四桶累计（web TurnTokenUsage 的折叠语义）
-                    self.turn_usage.input_tokens += u.input_tokens;
-                    self.turn_usage.output_tokens += u.output_tokens;
-                    let acc = &mut self.turn_usage;
-                    acc.cache_read = match (acc.cache_read, u.cache_read_tokens) {
-                        (Some(a), Some(b)) => Some(a + b),
-                        (None, b) => b,
-                        (a, None) => a,
-                    };
-                    acc.cache_write = match (acc.cache_write, u.cache_write_tokens) {
-                        (Some(a), Some(b)) => Some(a + b),
-                        (None, b) => b,
-                        (a, None) => a,
-                    };
-                    acc.reasoning = match (acc.reasoning, u.reasoning_tokens) {
-                        (Some(a), Some(b)) => Some(a + b),
-                        (None, b) => b,
-                        (a, None) => a,
-                    };
-                }
-            }
-            AgentEvent::TurnEnded { turn, .. } => {
-                self.running = false;
-                let elapsed = self.turn_started_at.map(|t| t.elapsed());
-                // 冻结本轮统计快照（web turn tail：usage 药丸 + 用时对话框）
-                let mut usage = std::mem::take(&mut self.turn_usage);
-                if let (Some(total), Some(ttft_at)) = (elapsed, self.turn_first_token.take()) {
-                    usage.run_ms = total.as_millis() as u64;
-                    usage.llm_ms = total.saturating_sub(self.turn_tool_time).as_millis() as u64;
-                    usage.ttft_ms = Some(ttft_at.saturating_duration_since(self.turn_started_at.unwrap_or(ttft_at)).as_millis() as u64);
-                }
-                usage.route = format!("{}/{}", self.active_provider, self.desired_model);
-                let has_usage = usage.total_tokens() > 0;
-                if let Some(e) = self.entries.last_mut() {
-                    e.done = true;
-                    e.elapsed = elapsed;
-                    if has_usage {
-                        e.usage = Some(usage);
-                    }
-                    e.ended_at_ms = Some(now_ms());
-                }
-                // 结转本轮 LLM/工具耗时（web sessionStats 的 llmMs/toolMs）
-                if let Some(total) = elapsed {
-                    self.session_llm_time += total.saturating_sub(self.turn_tool_time);
-                    self.session_tool_time += self.turn_tool_time;
-                }
-                self.turn_started_at = None;
-                self.turn_open = None;
-                // 该轮折尔回到 compact 默认（web：manual overrides 保留其余轮）
-                self.turn_expanded.remove(&turn);
-            }
-            AgentEvent::Error { message, .. } => {
-                self.running = false;
-                self.turn_started_at = None;
-                self.entries.push(ChatEntry {
-                    role: Role::Error,
-                    blocks: vec![MsgBlock::Text(message)],
-                    done: true,
-                    elapsed: None, usage: None, ended_at_ms: None,
-                    turn: self.ui_turn,
-                 context: None,
-open: false,
-});
-            }
-            AgentEvent::Compacted { .. } => {
-                self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: self.ui_turn, context: None,
-open: false,
-});
-            }
-        }
-        // 智能吸底：只有用户本来就贴在底部时才跟随滚动（web 同款行为）；
-        // 用户上翻阅读时不再被流式输出拽走。
-        self.sync_chat_list(self.chat_near_bottom());
-    }
-
-    /// 从会话日志回读指定工具调用的最新结果文本。
-    fn latest_tool_result_text(&self, call_id: &str) -> (String, bool) {
-        let session = self.agent.session();
-        let session = session.lock().unwrap();
-        for entry in session.entries().iter().rev() {
-            if let SessionEvent::ToolResult { message, .. } = &entry.event
-                && let Some(ContentBlock::ToolResult { tool_call_id, content, is_error }) =
-                    message.content.first()
-                && tool_call_id.0 == call_id
-            {
-                let text: String = content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                return (text, is_error.unwrap_or(false));
-            }
-        }
-        (String::new(), false)
+    fn workspace_locked(&self, cx: &App) -> bool {
+        self.is_empty_session(cx) && self.current_workspace.is_none()
     }
 
     /// 发送按钮路径：读输入框 → 追加 → 清空（window 由 on_click 闭包提供）。
@@ -2429,8 +1873,8 @@ open: false,
     }
 
     /// 发送统一入口（发送按钮与回车共用）：先派生 @ 引用的上下文注入，
-    /// 再走普通用户消息。
-    fn dispatch_user_text(&mut self, text: &str, _cx: &mut Context<Self>) {
+    /// 再走普通用户消息。entries 入列走 ChatView；标题/落盘是宿主职责。
+    fn dispatch_user_text(&mut self, text: &str, cx: &mut Context<Self>) {
         for (path, content) in self.resolve_file_references(text) {
             let name = std::path::Path::new(&path)
                 .file_name()
@@ -2459,22 +1903,35 @@ open: false,
                 std::slice::from_ref(&path),
                 &None,
             );
-            self.entries.push(ChatEntry {
-                role: Role::Context,
-                blocks: vec![MsgBlock::Text(format!("引用文件 {path}"))],
-                done: true,
-                elapsed: None, usage: None, ended_at_ms: None,
-                turn: self.ui_turn,
-                context: Some(info),
-                open: false,
+            self.chat.update(cx, |c, cx| {
+                c.push_context_entry(info, format!("引用文件 {path}"));
+                cx.notify();
             });
         }
-        self.push_user(text.to_string());
+        // 会话标题：首条用户消息后自动生成（截断到 30 字符）
+        let current = self.current_session_id();
+        if let Some(meta) = self.sessions.iter_mut().find(|s| s.id == current)
+            && meta.title == "新会话"
+            && !text.is_empty()
+        {
+            meta.title = text.chars().take(30).collect();
+            meta.blank = false;
+            // 标题落盘（web session/title 事件 + session_projcache 投影行），
+            // 否则 web 端看到的本会话永远无标题
+            let title = meta.title.clone();
+            let cwd = self.current_cwd.clone();
+            let _ = self.recorder.append(&current, &cwd, &SessionEvent::SessionTitle { title });
+            self.refresh_sidebar(cx);
+        }
+        self.chat.update(cx, |c, cx| {
+            c.push_user_entry(text.to_string());
+            cx.notify();
+        });
         self.agent.followup(text);
     }
 
     fn send_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace_locked() {
+        if self.workspace_locked(cx) {
             // web inert 态：消息控件锁定，发送动作改为引导选择工作区
             self.hero_ws_menu = true;
             cx.notify();
@@ -2485,7 +1942,7 @@ open: false,
         if text.is_empty() {
             return;
         }
-        if self.running {
+        if self.running(cx) {
             // 通用设置「繁忙时 Enter 行为」：排队投递，或打断当前轮
             match self.settings.enter {
                 EnterBehavior::Queue => {}
@@ -2743,6 +2200,10 @@ open: false,
         self.set_route(&provider, &model);
         self.active_provider = provider;
         self.desired_model = model;
+        {
+            let label = format!("{}/{}", self.active_provider, self.desired_model);
+            self.chat.update(cx, |c, _| c.route_label = label);
+        }
         self.model_menu = false;
         self.persist_settings();
         cx.notify();
@@ -2772,1046 +2233,6 @@ open: false,
 
     // --- 渲染 ---------------------------------------------------------------
 
-    fn block_element(&self, block: &MsgBlock, ei: usize, bi: usize, this: &Entity<AppView>, content_w: f32) -> AnyElement {
-        match block {
-            MsgBlock::Text(t) => {
-                // 流式尾按 400ms 节流喂 TextView（间隔须 > 上游 200ms 防抖窗，
-                // 否则连续 delta 使解析永不触发）；非尾块（已完结）直接用现文
-                let is_stream_tail = self.running
-                    && ei + 1 == self.entries.len()
-                    && bi + 1 == self.entries.get(ei).map(|e| e.blocks.len()).unwrap_or(0);
-                let now = std::time::Instant::now();
-                let shown = if is_stream_tail {
-                    let cached = self.stream_text_shown.borrow().as_ref().and_then(
-                        |(ce, cb, at, txt)| {
-                            (*ce == ei && *cb == bi
-                                && now.duration_since(*at).as_millis() < 400)
-                                .then(|| txt.clone())
-                        },
-                    );
-                    match cached {
-                        Some(txt) => txt,
-                        None => {
-                            *self.stream_text_shown.borrow_mut() =
-                                Some((ei, bi, now, t.clone()));
-                            // 文本增长 → 该条目高度变化 → 待 tick 统一重测
-                            self.heights_dirty.set(true);
-                            t.clone()
-                        }
-                    }
-                } else {
-                    t.clone()
-                };
-                div()
-                    .w_full()
-                    .text_color(theme::t().text)
-                    .child(MarkdownBlock { text: shown, id: 1_000_000 + ei * 1000 + bi })
-                    .into_any_element()
-            }
-
-            MsgBlock::Reasoning { text, open } => {
-                let open = *open;
-                let t = this.clone();
-                // web ReasoningRow 语义：running = 本块是**正在流式消息的
-                // 最后一个块**（streaming && i === last）。曾用 entry.done
-                // 判定——done 只在整轮结束时打给最后一条，导致历史步骤的
-                // Think 行整轮误扫。工具块一旦出现，本块即非尾，停止扫光。
-                let active = self.running
-                    && ei + 1 == self.entries.len()
-                    && bi + 1 == self.entries.get(ei).map(|e| e.blocks.len()).unwrap_or(0);
-                // web 结构：root(v_flex) > row(24px header) + thinkBody(展开体)
-                // 展开体是 header 的兄弟节点，不在 24px 行内
-                let mut header = div()
-                    .id(("think-row", (ei * 1000 + bi) as u64))
-                    .relative()
-                    .overflow_hidden()
-                    .flex()
-                    .items_center()
-                    .h(px(24.0))
-                    .gap_1p5()
-                    .cursor_pointer()
-                    .rounded(px(6.0))
-                    .on_click(move |_, _, cx| {
-                        t.update(cx, |v, cx| {
-                            if let Some(MsgBlock::Reasoning { open: o, .. }) =
-                                v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                            {
-                                *o = !*o;
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .child(
-                        Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
-                            .size(px(12.0))
-                            .text_color(theme::t().text_2),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text)
-                            .child("Think"),
-                    )
-                    .child(dot_sep())
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text_3)
-                            // web：运行时摘要跟随最新一行（latestLine +
-                            // scrollLeft 右贴），完成后回到首行
-                            .child(if active {
-                                text.lines().last().unwrap_or("").chars().take(120).collect::<String>()
-                            } else {
-                                first_line(text)
-                            }),
-                    );
-                if active {
-                    // web .row::after 运行扫光（行容器 relative + overflow_hidden）；
-                    // with_animation 每帧驱动 left，替代曾用的 100ms 全局 tick
-                    header = header.child(
-                        widgets::row_sweep_band().with_animation(
-                            ("think-sweep", (ei * 1000 + bi) as u64),
-                            Animation::new(Duration::from_millis(widgets::SWEEP_PERIOD_MS))
-                                .repeat()
-                                .with_easing(widgets::row_sweep_easing),
-                            move |band, delta| {
-                                band.left(px(-widgets::SWEEP_BAND + (content_w + widgets::SWEEP_BAND) * delta))
-                            },
-                        ),
-                    );
-                }
-                let mut wrapper = div().w_full().v_flex().child(header);
-                if open {
-                    wrapper = wrapper.child(
-                        div()
-                            .pt_1()
-                            .pb_1()
-                            .pl(px(22.0))
-                            .pr_2()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text_3)
-                            // web .thinkBody：pre-wrap 语义——逐行渲染保留段落
-                            .v_flex()
-                            .gap(px(4.0))
-                            .children(
-                                text.lines().map(|l| {
-                                    div().child(l.to_string())
-                                })
-                            ),
-                    );
-                }
-                wrapper.into_any_element()
-            }
-
-            MsgBlock::Tool(tool) => {
-                let open = tool.open;
-                let (_, icon) = tool_display(&tool.name);
-                let (title, summary, file_path) = widgets::tool_row_texts(&tool.name, &tool.arguments);
-                // web ToolRow：失败行折叠摘要 = 输出首行（failureLine 替换语义）
-                let failure = if tool.error && tool.result.is_some() {
-                    Some(widgets::first_line(tool.result.as_deref().unwrap_or("")))
-                } else {
-                    None
-                };
-                let summary_text = failure.clone().unwrap_or_else(|| {
-                    // 有链接的 read/write 摘要 = 相对化后的 path；
-                    // list/exists 等无链接 op 的摘要同样剥工作区根/~ 前缀
-                    // （web relativizeToCwd 作用于全部文件工具摘要）
-                    let raw = file_path.as_deref().unwrap_or(summary.as_str());
-                    widgets::display_path(raw, &self.current_cwd)
-                });
-                let t = this.clone();
-                let running = tool.result.is_none();
-                // Inspect 跳转目标：该调用在轨迹列表中的行号（之前的工具块计数）
-                let mut traj_ix = 0usize;
-                'traj_count: for (i, e) in self.entries.iter().enumerate() {
-                    for (j, b) in e.blocks.iter().enumerate() {
-                        if matches!(b, MsgBlock::Tool(_)) {
-                            if i == ei && j == bi {
-                                break 'traj_count;
-                            }
-                            traj_ix += 1;
-                        }
-                    }
-                }
-                let row_group: SharedString = format!("toolrow-{}-{}", ei, bi).into();
-                let mut header = div()
-                    .id(("tool-row", (ei * 1000 + bi) as u64))
-                    .group(row_group.clone())
-                    .relative()
-                    .overflow_hidden()
-                    .flex()
-                    .items_center()
-                    .h(px(24.0))
-                    .gap_1p5()
-                    .cursor_pointer()
-                    .rounded(px(6.0))
-                    .on_click(move |_, _, cx| {
-                        t.update(cx, |v, cx| {
-                            if let Some(MsgBlock::Tool(tool)) =
-                                v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                            {
-                                // web 行为：点击工具行在下方原地展开/收起 IO 卡，
-                                // 不强制打开右侧详情面板
-                                tool.open = !tool.open;
-                                v.selected_tool = Some(ToolDetail {
-                                    name: tool.name.clone(),
-                                    arguments: tool.arguments.clone(),
-                                    result: tool.result.clone(),
-                                    error: tool.error,
-                                });
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .child({
-                        // web DisclosureRow leading：16px 槽双层图标——静止为
-                        // 工具图标（错误终态为状态点），行 hover 淡入向下
-                        // 箭头；展开态常驻向下箭头
-                        if open {
-                            div()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
-                        } else {
-                            let idle: AnyElement = if tool.error && tool.result.is_some() {
-                                // web ToolRow leadingFor：终态 error 用状态点替换工具图标
-                                state_dot(theme::t().error).into_any_element()
-                            } else {
-                                Icon::new(icon).size(px(14.0)).text_color(theme::t().text_3).into_any_element()
-                            };
-                            div()
-                                .relative()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex_none()
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .bottom_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(idle)
-                                        .group_hover(row_group.clone(), |s| s.opacity(0.0)),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .bottom_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
-                                        .opacity(0.0)
-                                        .group_hover(row_group, |s| s.opacity(1.0)),
-                                )
-                        }
-                    })
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text)
-                            .child(title),
-                    )
-                    .child(dot_sep());
-                // web fileLink：文件工具的 path 摘要渲染为下划线链接，
-                // 点击用宿主默认应用打开（阻断行点击的展开切换）
-                if file_path.is_some() && failure.is_none() {
-                    let open_path = file_path.clone().unwrap_or_default();
-                    header = header.child(
-                        div()
-                            .id(("tool-file", (ei * 1000 + bi) as u64))
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text_2)
-                            .underline()
-                            .cursor_pointer()
-                            .hover(|s| s.text_color(theme::t().text))
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                widgets::open_with_host_app(&open_path);
-                            })
-                            .child(summary_text.clone()),
-                    );
-                } else {
-                    header = header.child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(if failure.is_some() { theme::t().error } else { theme::t().text_3 })
-                            .child(summary_text.clone()),
-                    );
-                }
-                if running {
-                    // web .row::after 运行扫光：with_animation 每帧驱动 left
-                    header = header.child(
-                        widgets::row_sweep_band().with_animation(
-                            ("tool-sweep", (ei * 1000 + bi) as u64),
-                            Animation::new(Duration::from_millis(widgets::SWEEP_PERIOD_MS))
-                                .repeat()
-                                .with_easing(widgets::row_sweep_easing),
-                            move |band, delta| {
-                                band.left(px(-widgets::SWEEP_BAND + (content_w + widgets::SWEEP_BAND) * delta))
-                            },
-                        ),
-                    );
-                }
-                // hover 显现 Inspect pill 的悬停域：标题行 + 展开体整体
-                let group: SharedString = format!("tool-blk-{ei}-{bi}").into();
-                let mut wrapper = div().w_full().v_flex().group(group.clone()).child(header);
-                if open {
-                    // web ToolRow 卡片分派：terminal/read/diff/web 各走专属
-                    // 原语；错误行与未匹配工具回退通用 IO 卡（web 卡模型
-                    // 在错误/缺元数据时为 null 的同一回退语义）
-                    let args_json: serde_json::Value =
-                        serde_json::from_str(&tool.arguments).unwrap_or(serde_json::Value::Null);
-                    let arg_str = |key: &str| -> String {
-                        args_json
-                            .get(key)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string()
-                    };
-                    let uid = (ei * 1000 + bi) as u64;
-                    // web deriveBody：IO 卡的输入 = pretty JSON（解析失败回退原文）
-                    let pretty_args = serde_json::from_str::<serde_json::Value>(&tool.arguments)
-                        .ok()
-                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                        .unwrap_or_else(|| tool.arguments.clone());
-                    let element = match tool.name.as_str() {
-                        "shell" => {
-                            let t_fold = this.clone();
-                            widgets::terminal_card(
-                                uid,
-                                &arg_str("command"),
-                                &self.current_cwd,
-                                tool.result.as_deref(),
-                                running,
-                                tool.error,
-                                tool.expanded,
-                                move |_, _, cx| {
-                                    t_fold.update(cx, |v, cx| {
-                                        if let Some(MsgBlock::Tool(tool)) =
-                                            v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                        {
-                                            tool.expanded = !tool.expanded;
-                                        }
-                                        // 折叠/展开改了条目高度：列表须重测
-                                        v.invalidate_chat_heights();
-                                        cx.notify();
-                                    });
-                                },
-                            )
-                            .into_any_element()
-                        }
-                        "fs" if !tool.error && tool.result.is_some() => {
-                            let path = arg_str("path");
-                            let shown = widgets::display_path(&path, &self.current_cwd);
-                            let result = tool.result.clone().unwrap_or_default();
-                            match arg_str("op").as_str() {
-                                "read" => {
-                                    let lang = std::path::Path::new(&path)
-                                        .extension()
-                                        .and_then(|e| e.to_str())
-                                        .unwrap_or("")
-                                        .to_lowercase();
-                                    let t_fold = this.clone();
-                                    widgets::read_card(
-                                        uid,
-                                        &shown,
-                                        &lang,
-                                        &result,
-                                        tool.expanded,
-                                        move |_, _, cx| {
-                                            t_fold.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    tool.expanded = !tool.expanded;
-                                                }
-                                                // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
-                                                cx.notify();
-                                            });
-                                        },
-                                    )
-                                    .into_any_element()
-                                }
-                                "write" => {
-                                    let content = arg_str("content");
-                                    let t_fold = this.clone();
-                                    widgets::diff_card(
-                                        uid,
-                                        &shown,
-                                        &content,
-                                        tool.expanded,
-                                        move |_, _, cx| {
-                                            t_fold.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    tool.expanded = !tool.expanded;
-                                                }
-                                                // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
-                                                cx.notify();
-                                            });
-                                        },
-                                    )
-                                    .into_any_element()
-                                }
-                                _ => widgets::io_card(
-                                    uid,
-                                    &pretty_args,
-                                    tool.result.as_deref(),
-                                    tool.error,
-                                    tool.expanded,
-                                    {
-                                        let t_fold = this.clone();
-                                        move |_, _, cx| {
-                                            t_fold.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    tool.expanded = !tool.expanded;
-                                                }
-                                                // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
-                                                cx.notify();
-                                            });
-                                        }
-                                    },
-                                )
-                                .into_any_element(),
-                            }
-                        }
-                        "grep" if !tool.error && tool.result.is_some() => {
-                            match widgets::parse_grep_result(tool.result.as_deref().unwrap_or("")) {
-                                Some(search) => {
-                                    let t_fold = this.clone();
-                                    let this_grp = this.clone();
-                                    let mk_group = move |gi: usize| {
-                                        let t = this_grp.clone();
-                                        Box::new(move |_: &gpui::ClickEvent, _: &mut gpui::Window, cx: &mut gpui::App| {
-                                            t.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    // 升序表内折叠/展开文件组
-                                                    match tool.collapsed_groups.binary_search(&gi) {
-                                                        Ok(pos) => {
-                                                            tool.collapsed_groups.remove(pos);
-                                                        }
-                                                        Err(pos) => {
-                                                            tool.collapsed_groups.insert(pos, gi);
-                                                        }
-                                                    }
-                                                }
-                                                cx.notify();
-                                            });
-                                        }) as Box<dyn Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App)>
-                                    };
-                                    widgets::search_card(
-                                        uid,
-                                        widgets::SearchCardData::Matches { search: &search },
-                                        tool.expanded,
-                                        &tool.collapsed_groups,
-                                        move |_, _, cx| {
-                                            t_fold.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    tool.expanded = !tool.expanded;
-                                                }
-                                                // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
-                                                cx.notify();
-                                            });
-                                        },
-                                        Box::new(mk_group),
-                                    )
-                                    .into_any_element()
-                                }
-                                None => widgets::io_card(
-                                    uid,
-                                    &pretty_args,
-                                    tool.result.as_deref(),
-                                    tool.error,
-                                    tool.expanded,
-                                    {
-                                        let t_fold = this.clone();
-                                        move |_, _, cx| {
-                                            t_fold.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    tool.expanded = !tool.expanded;
-                                                }
-                                                // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
-                                                cx.notify();
-                                            });
-                                        }
-                                    },
-                                )
-                                .into_any_element(),
-                            }
-                        }
-                        "glob" if !tool.error && tool.result.is_some() => {
-                            match widgets::parse_glob_result(tool.result.as_deref().unwrap_or("")) {
-                                Some(paths) => {
-                                    let t_fold = this.clone();
-                                    widgets::search_card(
-                                        uid,
-                                        widgets::SearchCardData::Paths { paths: &paths },
-                                        tool.expanded,
-                                        &tool.collapsed_groups,
-                                        move |_, _, cx| {
-                                            t_fold.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    tool.expanded = !tool.expanded;
-                                                }
-                                                // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
-                                                cx.notify();
-                                            });
-                                        },
-                                        Box::new(|_| Box::new(|_, _, _| {})),
-                                    )
-                                    .into_any_element()
-                                }
-                                None => widgets::io_card(
-                                    uid,
-                                    &pretty_args,
-                                    tool.result.as_deref(),
-                                    tool.error,
-                                    tool.expanded,
-                                    {
-                                        let t_fold = this.clone();
-                                        move |_, _, cx| {
-                                            t_fold.update(cx, |v, cx| {
-                                                if let Some(MsgBlock::Tool(tool)) =
-                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                                {
-                                                    tool.expanded = !tool.expanded;
-                                                }
-                                                // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
-                                                cx.notify();
-                                            });
-                                        }
-                                    },
-                                )
-                                .into_any_element(),
-                            }
-                        }
-                        "web_fetch" if !tool.error && tool.result.is_some() => widgets::web_fetch_card(
-                            uid,
-                            &arg_str("url"),
-                            tool.result.as_deref().is_some_and(|r| r.chars().count() >= 8000),
-                        )
-                        .into_any_element(),
-                        _ => widgets::io_card(
-                            uid,
-                            &pretty_args,
-                            tool.result.as_deref(),
-                            tool.error,
-                            tool.expanded,
-                            {
-                                let t_fold = this.clone();
-                                move |_, _, cx| {
-                                    t_fold.update(cx, |v, cx| {
-                                        if let Some(MsgBlock::Tool(tool)) =
-                                            v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
-                                        {
-                                            tool.expanded = !tool.expanded;
-                                        }
-                                        // 折叠/展开改了条目高度：列表须重测
-                                        v.invalidate_chat_heights();
-                                        cx.notify();
-                                    });
-                                }
-                            },
-                        )
-                        .into_any_element(),
-                    };
-                    wrapper = wrapper.child(element);
-                    // web inspectButton：展开体下方左对齐小 pill，
-                    // hover 整个工具块时显现，点击跳轨迹视图对应行
-                    let t_insp = this.clone();
-                    // gpui 无 align-self：外层全宽 flex 使 pill 靠左
-                    wrapper = wrapper.child(
-                        div().w_full().flex().child(
-                            div()
-                                .id(("tool-inspect", (ei * 1000 + bi) as u64))
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .mt(px(4.0))
-                                .mb(px(2.0))
-                                .ml(px(4.0))
-                                .px(px(8.0))
-                                .py(px(2.0))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(theme::t().border_l2)
-                                .bg(theme::t().bg_base)
-                                .text_color(theme::t().text_2)
-                                .text_size(px(11.0))
-                                .line_height(px(16.0))
-                                .cursor_pointer()
-                                .opacity(0.0)
-                                .group_hover(group.clone(), |s| s.opacity(1.0))
-                                .hover(|s| s.bg(theme::t().elevated).text_color(theme::t().text))
-                                .on_click(move |_, _, cx| {
-                                    t_insp.update(cx, |v, cx| {
-                                        v.tab = CenterTab::Trajectory;
-                                        v.traj_scroll.scroll_to_item(traj_ix);
-                                        cx.notify();
-                                    });
-                                })
-                                .child(Icon::new(IconName::Inspector).size(px(12.0)))
-                                .child("查看"),
-                        ),
-                    );
-                }
-                wrapper.into_any_element()
-            }
-        }
-    }
-
-    fn render_entry(&self, entry: &ChatEntry, ei: usize, this: &Entity<AppView>, content_w: f32) -> Div {
-        match entry.role {
-            Role::User => {
-                let text = entry
-                    .blocks
-                    .first()
-                    .map(|b| match b {
-                        MsgBlock::Text(t) => t.clone(),
-                        _ => String::new(),
-                    })
-                    .unwrap_or_default();
-                let t = this.clone();
-                let bubble_text = text.clone();
-                let group: SharedString = format!("user-msg-{ei}").into();
-                let group_copy = group.clone();
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap(px(6.0))
-                    .group(group)
-                    .child(
-                        div()
-                            .max_w(px(layout::user_bubble_max(content_w)))
-                            .rounded(px(22.0))
-                            .bg(theme::t().surface)
-                            .px_4()
-                            .py(px(10.0))
-                            .text_size(px(theme::FONT_BUBBLE))
-                            .line_height(px(theme::FONT_BUBBLE_LEADING))
-                            .text_color(theme::t().text)
-                            
-                            .child(bubble_text),
-                    )
-                    .child(
-                        // 气泡下方的复制按钮（web MessageIconActions：悬停显现）
-                        div()
-                            .id(("copy-user", ei as u64))
-                            .size(px(20.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(4.0))
-                            .cursor_pointer()
-                            .text_color(theme::t().caption)
-                            .opacity(0.0)
-                            .group_hover(group_copy, |s| s.opacity(1.0))
-                            .hover(|s| s.text_color(theme::t().text_2).bg(theme::t().hover))
-                            .tooltip(tip("复制"))
-                            .on_click(move |_, _, cx| {
-                                let text = text.clone();
-                                t.update(cx, |_, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                                });
-                            })
-                            .child(Icon::new(IconName::Copy).size(px(14.0))),
-                    )
-            }
-            Role::Assistant => {
-                let group: SharedString = format!("assistant-msg-{ei}").into();
-                let mut col = div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap(px(16.0))
-                    .group(group);
-                for (bi, block) in entry.blocks.iter().enumerate() {
-                    col = col.child(self.block_element(block, ei, bi, this, content_w));
-                }
-                if entry.done && let Some(elapsed) = entry.elapsed {
-                    col = col.child(render_entry_footer(elapsed, entry.usage.clone(), entry.ended_at_ms, this, ei));
-                }
-                div().w_full().child(col)
-            }
-            Role::Error => {
-                let text = entry
-                    .blocks
-                    .first()
-                    .map(|b| match b {
-                        MsgBlock::Text(t) => t.clone(),
-                        _ => String::new(),
-                    })
-                    .unwrap_or_default();
-                div().w_full().child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .text_size(px(13.0))
-                        .line_height(px(20.0))
-                        .child(
-                            div()
-                                .mt(px(6.0))
-                                .size(px(8.0))
-                                .rounded_full()
-                                .flex_none()
-                                .bg(theme::t().error),
-                        )
-                        .child(
-                            div().child(
-                                div()
-                                    .text_color(theme::t().error)
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("出错了"),
-                            ),
-                        )
-                        .child(
-                            div().flex_1().min_w_0().text_color(theme::t().text_2).child(text),
-                        ),
-                )
-            }
-            Role::Context => {
-                // 上下文注入行（web ContextInjectionRow，DisclosureRow from
-                // Figma 10:2482）：24px 头行（图标+标题+点+生产者+点+摘要）
-                // + 展开体（代码底、141px 上限、11/16 mono tertiary）
-                let info = entry.context.clone().unwrap_or_default();
-                let open = entry.open;
-                let t = this.clone();
-                let body = entry
-                    .blocks
-                    .first()
-                    .map(|b| match b {
-                        MsgBlock::Text(t) => t.clone(),
-                        _ => String::new(),
-                    })
-                    .unwrap_or_default();
-                let row_group: SharedString = format!("ctxrow-{}", ei).into();
-                let mut header = div()
-                    .id(("ctx-row", ei as u64))
-                    .group(row_group.clone())
-                    .flex()
-                    .items_center()
-                    .h(px(24.0))
-                    .gap_1p5()
-                    .cursor_pointer()
-                    .rounded(px(6.0))
-                    .on_click(move |_, _, cx| {
-                        t.update(cx, |v, cx| {
-                            if let Some(e) = v.entries.get_mut(ei) {
-                                e.open = !e.open;
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .child({
-                        // web DisclosureRow leading（同 tool row）：静止为
-                        // 注入图标，行 hover 淡入向下箭头；展开态常驻箭头
-                        if open {
-                            div()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
-                        } else {
-                            div()
-                                .relative()
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex_none()
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .bottom_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            gpui::svg()
-                                                .path("icons/context-injection.svg")
-                                                .w(px(14.0))
-                                                .h(px(14.0))
-                                                .flex_none()
-                                                .text_color(theme::t().text_3),
-                                        )
-                                        .group_hover(row_group.clone(), |s| s.opacity(0.0)),
-                                )
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .right_0()
-                                        .bottom_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(Icon::new(IconName::ChevronDown).size(px(14.0)).text_color(theme::t().text_3))
-                                        .opacity(0.0)
-                                        .group_hover(row_group, |s| s.opacity(1.0)),
-                                )
-                        }
-                    })
-                    .child(
-                        div()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text)
-                            .child(info.title),
-                    );
-                if let Some(label) = &info.label {
-                    header = header.child(dot_sep()).child(
-                        div()
-                            .flex_none()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text_3)
-                            .child(label.clone()),
-                    );
-                }
-                if let Some(summary) = &info.summary {
-                    header = header.child(dot_sep()).child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(theme::FONT_ROW_LEADING))
-                            .text_color(theme::t().text_3)
-                            .child(summary.clone()),
-                    );
-                }
-                let mut wrap = div().w_full().v_flex().child(header);
-                if open {
-                    wrap = wrap.child(
-                        div()
-                            .id(("ctx-body", ei as u64))
-                            .ml(px(22.0))
-                            .mt(px(4.0))
-                            .max_h(px(141.0))
-                            .overflow_y_scroll()
-                            .rounded(px(8.0))
-                            .bg(theme::t().code_bg)
-                            .pt(px(10.0))
-                            .pr(px(16.0))
-                            .pb(px(12.0))
-                            .pl(px(12.0))
-                            .font_family(theme_mono())
-                            .text_size(px(11.0))
-                            .line_height(px(16.0))
-                            .text_color(theme::t().text_3)
-                            .child(body),
-                    );
-                }
-                div().w_full().v_flex().child(wrap)
-            }
-            Role::Notice => {
-                // 压缩分隔条：居中 hairline + 说明文字（web compaction 提示行）
-                div()
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .py(px(4.0))
-                    .child(div().flex_1().h(px(1.0)).bg(theme::t().border_l2))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(theme::FONT_CAPTION))
-                            .line_height(px(theme::FONT_CAPTION_LEADING))
-                            .text_color(theme::t().text_3)
-                            .child("上下文已压缩 · 已生成摘要检查点"),
-                    )
-                    .child(div().flex_1().h(px(1.0)).bg(theme::t().border_l2))
-            }
-        }
-    }
-
-    /// 消息流底部进行中的状态行（web ChatView .turnStatus）。
-    fn render_status_line(&self) -> Div {
-        div().w_full().child(
-            div()
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_ROW))
-                        .line_height(px(22.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::t().accent)
-                        .child("Deep diving…"),
-                )
-                .children(self.turn_started_at.map(|t| {
-                    div()
-                        .ml_2()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .line_height(px(theme::FONT_CAPTION_LEADING))
-                        .text_color(theme::t().caption)
-                        .child(format!("{}秒", t.elapsed().as_secs()))
-                })),
-        )
-    }
-
-    /// 轨迹 tab：全量工具调用台账。滚动容器在本方法内（track_scroll 接
-    /// Inspect pill 的 scroll_to_item；行必须是其直接子节点才能按行号跳转）。
-    fn render_trajectory(&self, this: &Entity<AppView>, width: f32) -> Stateful<Div> {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (ei, entry) in self.entries.iter().enumerate() {
-            for (bi, block) in entry.blocks.iter().enumerate() {
-                if let MsgBlock::Tool(tool) = block {
-                    let (label, icon) = tool_display(&tool.name);
-                    let (_, traj_summary, _) = widgets::tool_row_texts(&tool.name, &tool.arguments);
-                    let traj_summary = widgets::display_path(&traj_summary, &self.current_cwd);
-                    let t = this.clone();
-                    let name = tool.name.clone();
-                    let arguments = tool.arguments.clone();
-                    let result = tool.result.clone();
-                    let error = tool.error;
-                    rows.push(
-                        div()
-                            .id(("traj", (ei * 1000 + bi) as u64))
-                            .flex()
-                            .items_center()
-                            .h(px(32.0))
-                            .px_2()
-                            .gap_1p5()
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme::t().hover))
-                            .on_click(move |_, _, cx| {
-                                t.update(cx, |v, cx| {
-                                    v.selected_tool = Some(ToolDetail {
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
-                                        result: result.clone(),
-                                        error,
-                                    });
-                                    v.details_open = true;
-                                    cx.notify();
-                                });
-                            })
-                            .when(tool.error && tool.result.is_some(), |r| {
-                        // web ToolRow leadingFor：终态 error 用状态点替换工具图标
-                        r.child(state_dot(theme::t().error))
-                    })
-                    .when(!(tool.error && tool.result.is_some()), |r| {
-                        r.child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
-                    })
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_ROW))
-                                    .line_height(px(theme::FONT_ROW_LEADING))
-                                    .text_color(theme::t().text)
-                                    .child(label),
-                            )
-                            .child(dot_sep())
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(theme::FONT_ROW))
-                                    .line_height(px(theme::FONT_ROW_LEADING))
-                                    .text_color(theme::t().text_3)
-                                    .child(traj_summary),
-                            )
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
-        let mut col = div()
-            .id("traj-scroll")
-            .h_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.traj_scroll)
-            .w_full()
-            .max_w(px(layout::chat_content_width(width)))
-            .mx_auto()
-            .v_flex()
-            .py_4();
-        if rows.is_empty() {
-            col = col.child(
-                div()
-                    .py_4()
-                    .text_size(px(13.0))
-                    .line_height(px(20.0))
-                    .text_color(theme::t().text_3)
-                    .child("本轮还没有工具调用记录"),
-            );
-        } else {
-            col = col.children(rows);
-        }
-        col
-    }
 }
 
 // --- Render ------------------------------------------------------------------
@@ -3839,7 +2260,17 @@ impl Render for AppView {
         let sidebar_pref = if collapsed { 0.0 } else { self.sidebar_width };
         let details_pref = if self.details_open { self.details_width } else { 0.0 };
         let (sw, cw, dw) = compute_columns(vw, sidebar_pref, details_pref);
+        self.center_width = cw;
+        let _ = sw;
         let has_text = !self.input.read_with(cx, |s, _| s.value().trim().is_empty());
+        // ChatView 快照：header/composer 的渲染输入（子实体状态一次读取）
+        let snap = self.chat.read_with(cx, |c, _| ChatSnap {
+            empty: c.is_empty(),
+            running: c.running(),
+            tab: c.tab(),
+            stats: c.stats_line(),
+            stats_steps: c.stats_steps(),
+        });
 
         let this = cx.entity();
         let drag_target = this.clone();
@@ -3880,6 +2311,8 @@ impl Render for AppView {
                             let w = x.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
                             if (w - v.sidebar_width).abs() >= 1.0 {
                                 v.sidebar_width = w;
+                                // 侧栏宽度镜像推送（其渲染宽度来自自身快照）
+                                v.refresh_sidebar(cx);
                                 cx.notify();
                             }
                         }
@@ -3893,11 +2326,11 @@ impl Render for AppView {
                     }
                 });
             })
-            .child(self.render_sidebar(collapsed, sw, this.clone()));
+            .child(self.sidebar.clone());
         if !collapsed {
             root = root.child(drag_handle(DragSide::Sidebar));
         }
-        root = root.child(self.render_center(cw, this.clone(), has_text));
+        root = root.child(self.render_center(cw, this.clone(), has_text, &snap));
         if dw > 0.0 {
             root = root.child(drag_handle(DragSide::Details));
             root = root.child(self.render_details(dw, this.clone()));
@@ -3944,6 +2377,7 @@ impl Render for AppView {
                                         t_save.update(cx, |v, cx| {
                                             v.rename_workspace(&id, title.clone());
                                             v.rename_input.update(cx, |s, cx| s.set_value("", window, cx));
+                                            v.refresh_sidebar(cx);
                                             cx.notify();
                                         });
                                     })),
@@ -4014,927 +2448,8 @@ impl Render for AppView {
 
 impl AppView {
 
-    fn render_sidebar(&self, collapsed: bool, width: f32, this: Entity<AppView>) -> Div {
-        let mut col = div()
-            .h_full()
-            .w(px(width))
-            .flex_none()
-            .bg(theme::t().sidebar_bg)
-            .border_r_1()
-            .border_color(theme::t().border_l1);
-        if collapsed {
-            let t_expand = this.clone();
-            let t_new = this.clone();
-            let t_settings = this.clone();
-            col = col
-                .v_flex()
-                .items_center()
-                .pt(px(18.0))
-                .px(px(10.0))
-                .pb_1p5()
-                .gap_3()
-                .child(
-                    // web rail：折叠态 toggle 呈现鲸鱼标记
-                    div()
-                        .id("sb-expand")
-                        .size(px(36.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(10.0))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::t().hover))
-                        .tooltip(tip("展开侧边栏"))
-                        .on_click(move |_, _, cx| {
-                            t_expand.update(cx, |v, cx| { v.sidebar_collapsed = false; cx.notify(); });
-                        })
-                        .child(
-                            gpui::svg()
-                                .path("brands/fish.svg")
-                                .w(px(24.0)).h(px(17.65))
-                                .text_color(theme::t().text),
-                        ),
-                )
-                .child(
-                    rail_icon("sb-new", IconName::Plus, "新建会话", move |_, _, cx| {
-                        t_new.update(cx, |v, cx| { v.new_session(cx); });
-                    }),
-                )
-                .child(div().flex_grow())
-                .child(
-                    rail_icon("sb-settings", IconName::Settings, "设置", move |_, _, cx| {
-                        t_settings.update(cx, |v, cx| { v.settings_open = true; cx.notify(); });
-                    }),
-                );
-        } else {
-            let t_collapse = this.clone();
-            let t_new = this.clone();
-            let t_settings = this.clone();
-            let current_id = self.current_session_id();
-            // 分组构建：每个工作区 = 34px 行（folder/title/折叠 chevron/
-            //   hover +/…）+ 展开时的会话行；未分组会话排末尾。
-            let t_pick = this.clone();
-            let mut all_rows: Vec<AnyElement> = Vec::new();
-            let mut row_index = 0usize;
-            // 行 bounds 表每帧重建（prepaint 填、点击回调读）：行菜单锚定
-            // 行底，位置不随点击落点漂移、免疫滚动
-            let row_bounds = self.sb_row_bounds.clone();
-            row_bounds.borrow_mut().clear();
-            let shell_bounds = row_bounds.clone();
-            let anchored_row = move |key: String, row: AnyElement| -> AnyElement {
-                let kb = key;
-                let sb = shell_bounds.clone();
-                div()
-                    .on_children_prepainted(move |children, _, _| {
-                        if let Some(b) = children.first().cloned() {
-                            sb.borrow_mut().insert(kb.clone(), b);
-                        }
-                    })
-                    .child(row)
-                    .into_any_element()
-            };
-            let search_active = !self.search_query.is_empty();
-            if search_active {
-                // web searchTree：匹配会话平铺（工作区行常规渲染跳过）
-                let needle = self.search_query.to_lowercase();
-                for meta in &self.sessions {
-                    if self.archived.contains(meta.id.as_str()) {
-                        continue;
-                    }
-                    if !meta.title.to_lowercase().contains(&needle) {
-                        continue;
-                    }
-                    let t_sw = this.clone();
-                    let id = meta.id.clone();
-                    let t_m = this.clone();
-                    let id_m = meta.id.as_str().to_string();
-                    let key = format!("sbrow-{row_index}");
-                    let kb = key.clone();
-                    let slot = row_bounds.clone();
-                    let active = meta.id == current_id;
-                    all_rows.push(anchored_row(
-                        key,
-                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
-                            let id = id.clone();
-                            t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                        }, move |click, _, cx| {
-                            let id = id_m.clone();
-                            let y = slot.borrow().get(kb.as_str())
-                                .map(|b| f32::from(b.origin.y + b.size.height))
-                                .unwrap_or_else(|| click_anchor_y(click));
-                            t_m.update(cx, |v, cx| {
-                                v.sidebar_menu = Some(("session".into(), id, y));
-                                cx.notify();
-                            });
-                        })
-                        .into_any_element(),
-                    ));
-                    row_index += 1;
-                }
-            }
-            for w in &self.workspaces {
-                if search_active && !self.group_flat {
-                    // 搜索命中：不发工作区行（会话已平铺）
-                }
-                let wid = w.id.clone();
-                let wtitle = w.title.clone();
-                let wid3 = wid.clone();
-                let wcollapsed = self.collapsed_workspaces.contains(&wid);
-                // --- 工作区行 ---
-                {
-                    let t_toggle = this.clone();
-                    let t_plus = this.clone();
-                    let t_more = this.clone();
-                    let group: SharedString = format!("ws-{wid}").into();
-                    let g2 = group.clone();
-                    let _g3 = group.clone();
-                    all_rows.push(anchored_row(
-                        format!("sbrow-{row_index}"),
-                        div()
-                            .id(SharedString::from(format!("ws-row-{wid}")))
-                            .group(group)
-                            .h(px(34.0))
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2()
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme::t().hover))
-                            .on_click(move |_, _, cx| {
-                                let id = wid3.clone();
-                                t_toggle.update(cx, |v, cx| {
-                                    if !v.collapsed_workspaces.remove(&id) {
-                                        v.collapsed_workspaces.insert(id);
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                            .child(Icon::new(IconName::Folder).size(px(16.0)).text_color(theme::t().accent))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(theme::FONT_ROW))
-                                    .line_height(px(20.0))
-                                    .text_color(theme::t().text)
-                                    .child(wtitle.clone()),
-                            )
-                            .child(
-                                // hover 出的操作（/…）
-                                div()
-                                    .id(SharedString::from(format!("ws-actions-{wid}")))
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .opacity(0.0)
-                                    .group_hover(g2, |s| s.opacity(1.0))
-                                    .child({
-                                        let w = wid.clone();
-                                        let mut b = div()
-                                            .id(SharedString::from(format!("ws-plus-{w}")))
-                                            .size(px(16.0))
-                                            .rounded(px(4.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(theme::t().active))
-                                            // 行内按钮阻断冒泡：点 ＋ 不应同时
-                                            // 折叠/展开工作区
-                                            .on_click(move |_, _, cx| {
-                                                cx.stop_propagation();
-                                                let id = w.clone();
-                                                t_plus.update(cx, |v, cx| {
-                                                    v.current_workspace = Some(id.clone());
-                                                    v.sync_fs_sandbox();
-                                                    if v.collapsed_workspaces.remove(&id) {}
-                                                    v.new_session(cx);
-                                                });
-                                            });
-                                        b = b.child(Icon::new(IconName::Plus).size(px(12.0)).text_color(theme::t().text_2));
-                                        b
-                                    })
-                                    .child({
-                                        let w = wid.clone();
-                                        let key = format!("sbrow-{row_index}");
-                                        let kb = key.clone();
-                                        let slot = row_bounds.clone();
-                                        div()
-                                            .id(SharedString::from(format!("ws-more-{w}")))
-                                            .size(px(16.0))
-                                            .rounded(px(4.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(theme::t().active))
-                                            .on_click(move |click, _, cx| {
-                                                // 行内按钮阻断冒泡：点 … 只开菜单，
-                                                // 不同时触发工作区折叠/展开
-                                                cx.stop_propagation();
-                                                let w = w.clone();
-                                                let y = slot.borrow().get(kb.as_str())
-                                                    .map(|b| f32::from(b.origin.y + b.size.height))
-                                                    .unwrap_or_else(|| click_anchor_y(click));
-                                                t_more.update(cx, |v, cx| {
-                                                    v.sidebar_menu = Some(("ws".into(), w, y));
-                                                    cx.notify();
-                                                });
-                                            })
-                                            .child(Icon::new(IconName::Ellipsis).size(px(12.0)).text_color(theme::t().text_2))
-                                    }),
-                            )
-                            .child(Icon::new(if wcollapsed { IconName::ChevronRight } else { IconName::ChevronDown })
-                                .size(px(12.0))
-                                .text_color(theme::t().caption))
-                            .into_any_element(),
-                    ));
-                    row_index += 1;
-                }
-                // --- 该组会话行 ---
-                if !wcollapsed && !self.group_flat {
-                    // web 语义：会话按其 project cwd 归组（目录即真相）
-                    let w_key = dsh_persist::project_key(&w.path);
-                    let members: Vec<&SessionMeta> = self
-                        .sessions
-                        .iter()
-                        .filter(|m| {
-                            !self.archived.contains(m.id.as_str())
-                                && m.cwd
-                                    .as_deref()
-                                    .map(|c| dsh_persist::project_key(c) == w_key)
-                                    .unwrap_or(false)
-                        })
-                        .collect();
-                    let w_sids: Vec<String> = if self.order_manual {
-                        let manual: Vec<String> = w.session_ids.clone();
-                        let mut ordered: Vec<String> =
-                            manual.into_iter().filter(|s| members.iter().any(|m| m.id.as_str() == s)).collect();
-                        for m in &members {
-                            if !ordered.iter().any(|s| s == m.id.as_str()) {
-                                ordered.push(m.id.as_str().to_string());
-                            }
-                        }
-                        ordered
-                    } else {
-                        members.iter().map(|m| m.id.as_str().to_string()).collect()
-                    };
-                    for sid in &w_sids {
-                        if let Some(meta) = self.sessions.iter().find(|m| m.id.as_str() == sid) {
-                            let t_sw = this.clone();
-                            let id = meta.id.clone();
-                            let active = meta.id == current_id;
-                            {
-                                let t_m = this.clone();
-                                let id_m = meta.id.as_str().to_string();
-                                let key = format!("sbrow-{row_index}");
-                                let kb = key.clone();
-                                let slot = row_bounds.clone();
-                                all_rows.push(anchored_row(
-                                    key,
-                                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
-                                        let id = id.clone();
-                                        t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                                    }, move |click, _, cx| {
-                                        let id = id_m.clone();
-                                        let y = slot.borrow().get(kb.as_str())
-                                            .map(|b| f32::from(b.origin.y + b.size.height))
-                                            .unwrap_or_else(|| click_anchor_y(click));
-                                        t_m.update(cx, |v, cx| {
-                                            v.sidebar_menu = Some(("session".into(), id, y));
-                                            cx.notify();
-                                        });
-                                    })
-                                    .into_any_element(),
-                                ));
-                            }
-                            row_index += 1;
-                        }
-                    }
-                }
-            }
-            // 未分组会话：cwd 缺失或不属于任何工作区
-            let ws_keys: std::collections::HashSet<String> = self
-                .workspaces
-                .iter()
-                .map(|w| dsh_persist::project_key(&w.path))
-                .collect();
-            for meta in self.sessions.iter().filter(|m| {
-                !self.archived.contains(m.id.as_str())
-                    && m.cwd
-                        .as_deref()
-                        .map(|c| !ws_keys.contains(&dsh_persist::project_key(c)))
-                        .unwrap_or(true)
-            }) {
-                let t_sw = this.clone();
-                let id = meta.id.clone();
-                let active = meta.id == current_id;
-                {
-                    let t_m = this.clone();
-                    let id_m = meta.id.as_str().to_string();
-                    let key = format!("sbrow-{row_index}");
-                    let kb = key.clone();
-                    let slot = row_bounds.clone();
-                    all_rows.push(anchored_row(
-                        key,
-                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
-                            let id = id.clone();
-                            t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
-                        }, move |click, _, cx| {
-                            let id = id_m.clone();
-                            let y = slot.borrow().get(kb.as_str())
-                                .map(|b| f32::from(b.origin.y + b.size.height))
-                                .unwrap_or_else(|| click_anchor_y(click));
-                            t_m.update(cx, |v, cx| {
-                                v.sidebar_menu = Some(("session".into(), id, y));
-                                cx.notify();
-                            });
-                        })
-                        .into_any_element(),
-                    ));
-                }
-                row_index += 1;
-            }
-            let _ = t_pick.clone();
-            col = col
-                .v_flex()
-                .px_3()
-                .py_1p5()
-                .child(
-                    // 品牌行：logo + 名字 + HARNESS pill + 折叠按钮（60px 高）
-                    div()
-                        .h(px(60.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .pl_1()
-                        .child(
-                            div().flex_1().min_w_0().flex().items_center().gap_2()
-                                .child(
-                                    // 官方鲸鱼标记（web FishLogo，currentColor 随主题）
-                                    gpui::svg()
-                                        .path("brands/fish.svg")
-                                        .w(px(24.0)).h(px(17.65))
-                                        .text_color(theme::t().text),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(theme::FONT_BRAND))
-                                        .line_height(px(24.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("deepseek"),
-                                )
-                                .child(
-                                    // 徽牌（web buildRevision：品牌色底 + 反色字）
-                                    div()
-                                        .px(px(4.0))
-                                        .rounded(px(3.0))
-                                        .bg(theme::t().text)
-                                        .text_color(theme::t().bg_base)
-                                        .font_family(theme_mono())
-                                        .text_size(px(8.0))
-                                        .line_height(px(16.0))
-                                        .child("HARNESS"),
-                                ),
-                        )
-                        .child(
-                            icon_btn("sb-collapse", IconName::PanelLeftClose, theme::t().text_2, "收起侧边栏", move |_, _, cx| {
-                                t_collapse.update(cx, |v, cx| { v.sidebar_collapsed = true; cx.notify(); });
-                            }),
-                        ),
-                )
-                .child(
-                    // 新建会话：38px、r12、白 12% 描边（web .newSession）
-                    div()
-                        .id("sb-new-session")
-                        .h(px(38.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_1p5()
-                        .mx_0p5()
-                        .mb_2()
-                        .rounded(px(12.0))
-                        .border_1()
-                        .border_color(theme::t().border_l2)
-                        .bg(theme::t().surface)
-                        .text_size(px(theme::FONT_ROW))
-                        .line_height(px(22.0))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::t().text)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::t().surface_2))
-                        .on_click(move |_, _, cx| {
-                            t_new.update(cx, |v, cx| { v.new_session(cx); });
-                        })
-                        .child(Icon::new(IconName::Plus).size(px(16.0)))
-                        .child("新建会话"),
-                )
-                .child(
-                    // 区块头：会话 + 搜索 / 视图 / 新建工作区（web .sectionHeader）
-                    div()
-                        .h(px(36.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .pl_1()
-                        .mb_1()
-                        .when(!self.search_open, |hdr| {
-                            hdr.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_size(px(theme::FONT_ROW))
-                                    .line_height(px(20.0))
-                                    .text_color(theme::t().text_3)
-                                    .child("工作区"),
-                            )
-                            .child({
-                                let t = this.clone();
-                                icon_btn("sb-search", IconName::Search, theme::t().text_2, "搜索会话", move |_, _, cx| {
-                                    t.update(cx, |v, cx| {
-                                        v.search_open = true;
-                                        cx.notify();
-                                    });
-                                })
-                            })
-                        })
-                        .when(self.search_open, |hdr| {
-                            // web .searchExpanded：动作簇（视图选项 / 添加
-                            // 工作区）整体让位，药丸独占头行。展开动效对齐
-                            // web 的 180ms ease-in-out：药丸从 28px 圆钮长到
-                            // 整行，输入与清除钮同步淡入（gpui 无 CSS 过渡，
-                            // 用 with_animation 补）
-                            let t = this.clone();
-                            let search_bounds = self.sb_search_bounds.clone();
-                            let pill_full = (width - 28.0).max(120.0);
-                            hdr.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .on_children_prepainted(move |children, _, _| {
-                                        *search_bounds.borrow_mut() = children.first().cloned();
-                                    })
-                                    .child(
-                                        div()
-                                            .id("sb-search-pill")
-                                            .h(px(30.0))
-                                            .flex()
-                                            .items_center()
-                                            .overflow_hidden()
-                                            .pr(px(4.0))
-                                            .rounded(px(10.0))
-                                            .border_1()
-                                            .border_color(theme::t().border_l2)
-                                            .child(
-                                                div()
-                                                    .w(px(28.0))
-                                                    .h(px(30.0))
-                                                    .flex_none()
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(
-                                                        Icon::new(IconName::Search)
-                                                            .size(px(11.0))
-                                                            .text_color(theme::t().caption),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .flex()
-                                                    .items_center()
-                                                    .child(
-                                                        Input::new(&self.search_input)
-                                                            .appearance(false)
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .text_size(px(theme::FONT_TAB)),
-                                                    )
-                                                    .child({
-                                                        div()
-                                                            .id("sb-search-clear")
-                                                            .w(px(24.0))
-                                                            .h(px(24.0))
-                                                            .flex_none()
-                                                            .flex()
-                                                            .items_center()
-                                                            .justify_center()
-                                                            .rounded_full()
-                                                            .cursor_pointer()
-                                                            .text_color(theme::t().text_2)
-                                                            .hover(|s| s.bg(theme::t().hover))
-                                                            .on_click(move |_, window, cx| {
-                                                                t.update(cx, |v, cx| {
-                                                                    v.search_open = false;
-                                                                    v.search_query.clear();
-                                                                    v.search_input.update(cx, |s, cx| {
-                                                                        s.set_value("", window, cx);
-                                                                    });
-                                                                    cx.notify();
-                                                                });
-                                                            })
-                                                            .child(Icon::new(IconName::Close).size(px(14.0)))
-                                                    })
-                                                    .with_animation(
-                                                        "sb-search-fade",
-                                                        Animation::new(Duration::from_millis(
-                                                            120,
-                                                        )),
-                                                        |el, delta| el.opacity(delta),
-                                                    ),
-                                            )
-                                            .with_animation(
-                                                "sb-search-expand",
-                                                Animation::new(Duration::from_millis(180))
-                                                    .with_easing(ease_in_out),
-                                                move |pill, delta| {
-                                                    pill.w(px(28.0 + (pill_full - 28.0) * delta))
-                                                },
-                                            ),
-                                    ),
-                            )
-                        })
-                        .when(!self.search_open, |hdr| {
-                            // web .headerActions：搜索展开时整簇隐藏
-                            hdr.child({
-                                let t = this.clone();
-                                let anchor_bounds = self.sb_anchor_bounds.clone();
-                                // 包一层捕获按钮窗口 bounds（菜单锚定基准）
-                                div()
-                                    .on_children_prepainted(move |children, _, _| {
-                                        *anchor_bounds.borrow_mut() = children.first().cloned();
-                                    })
-                                    .child(icon_btn("sb-view", IconName::Ellipsis, theme::t().text_2, "视图选项", move |_, _, cx| {
-                                        t.update(cx, |v, cx| {
-                                            v.sidebar_menu = Some(("view".into(), String::new(), 96.0));
-                                            cx.notify();
-                                        });
-                                    }))
-                            })
-                            .child({
-                                let t_add_ws = this.clone();
-                                icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, window, cx| {
-                                    // 异步目录拾取：Task 丢弃即取消，必须 detach。
-                                    // 不挂父窗：rfd set_parent 会调 gpui Window 的
-                                    // display_handle()，0.2.2 Windows 后端是
-                                    // unimplemented!()，点击即崩（panic 绕过 rfd
-                                    // 的 .ok() 容错）；无主对话框在 Windows 上安全。
-                                    let _ = window;
-                                    let t = t_add_ws.clone();
-                                    let dialog = rfd::AsyncFileDialog::new();
-                                    cx.spawn(async move |cx| {
-                                        let picked = dialog.pick_folder().await;
-                                        eprintln!("[ws-pick] resolved: {:?}", picked.as_ref().map(|f| f.path().to_string_lossy().to_string()));
-                                        if let Some(folder) = picked {
-                                            let p = folder.path().to_string_lossy().to_string();
-                                            let _ = t.update(cx, |v, cx| {
-                                                if !v.workspaces.iter().any(|w| w.path == p) {
-                                                    v.create_workspace(p, cx);
-                                                }
-                                            });
-                                        }
-                                    })
-                                    .detach();
-                                })
-                            })
-                        }),
-                )
-                .child(
-                    // 会话列表 + 底部渐隐（web .fade）
-                    div()
-                        .relative()
-                        .flex_grow()
-                        .min_h_0()
-                        .child(
-                            div()
-                                .id("sidebar-list")
-                                .h_full()
-                                .overflow_y_scroll()
-                                .v_flex()
-                                .gap_0p5()
-                                .children(all_rows),
-                        )
-                        .child(
-                            // 底部渐隐（web .fade）：起点必须是与 sidebar_bg 同
-                            // 色但 alpha=0 的颜色——若用 transparent_black，浅色
-                            // 侧栏上插值的中间像素会变灰，呈现一条黑带。
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(24.0))
-                                .bg(linear_gradient(
-                                    180.0,
-                                    linear_color_stop(
-                                        {
-                                            let sb = theme::t().sidebar_bg;
-                                            gpui::Rgba { r: sb.r, g: sb.g, b: sb.b, a: 0.0 }
-                                        },
-                                        0.0,
-                                    ),
-                                    linear_color_stop(theme::t().sidebar_bg, 1.0),
-                                )),
-                        ),
-                )
-                .when_some(self.sidebar_menu.clone(), |col, (kind, target, y)| {
-                    // 点外关闭（同 hero 面板）：定位壳铺满侧栏来承接菜单
-                    // （taffy 绝对定位以直接父容器为基准），菜单 bounds 经
-                    // prepaint 捕获；canvas 在 paint 阶段注册窗口级 mousedown，
-                    // Bubble 相且落点在菜单外才收起。
-                    let menu_bounds = Arc::new(std::sync::Mutex::new(None::<Bounds<Pixels>>));
-                    let t_dismiss = this.clone();
-                    // 视图菜单锚定触发按钮（web portal align=end：按钮下方
-                    // 4px、右缘对齐按钮右缘）；行菜单（ws/session）保持
-                    // 旧的全宽位。卡规格：min 218 / max 360、r12、
-                    // inverted 发丝边、specific-menu 底（web .list）
-                    let anchor = if kind == "view" {
-                        match (
-                            self.sb_anchor_bounds.borrow().clone(),
-                            self.sb_col_bounds.borrow().clone(),
-                        ) {
-                            (Some(a), Some(c)) => {
-                                // web place() 的视口夹取：x = 按钮右缘 - 菜单宽，
-                                // 两侧留 12px。菜单实际宽即 min-width 218（内容
-                                // 不超）；侧栏过窄时左缘夹在 12px，右缘溢进中栏
-                                // 而不是被窗口裁掉
-                                let btn_right = f32::from(a.origin.x + a.size.width - c.origin.x);
-                                let menu_w = 218.0;
-                                let upper = (self.viewport - menu_w - 12.0).max(12.0);
-                                Some((
-                                    f32::from(a.origin.y + a.size.height - c.origin.y) + 4.0,
-                                    (btn_right - menu_w).clamp(12.0, upper),
-                                ))
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    col.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left_0()
-                            .right_0()
-                            .on_children_prepainted({
-                                let mb = menu_bounds.clone();
-                                move |children, _, _| {
-                                    *mb.lock().unwrap() = children.first().cloned();
-                                }
-                            })
-                            .child(
-                        div()
-                            .id("sb-menu")
-                            .absolute()
-                            // 不透明卡面：遮住后方元素的 hover/点击
-                            .occlude()
-                            .map(|d| {
-                                if let Some((top, left)) = anchor {
-                                    d.top(px(top)).left(px(left))
-                                } else {
-                                    // 行菜单（ws/session）：y 是触发行的窗口
-                                    // 底缘（prepaint 捕获的行 bounds），换算成
-                                    // 列内 top 再留 4px 间隙——位置恒定，免疫
-                                    // 列表滚动与点击落点漂移
-                                    let top = match self.sb_col_bounds.borrow().clone() {
-                                        Some(c) => y - f32::from(c.origin.y) + 4.0,
-                                        None => y,
-                                    };
-                                    d.top(px(top)).left(px(8.0)).right(px(8.0))
-                                }
-                            })
-                            .min_w(px(218.0))
-                            .max_w(px(360.0))
-                            .v_flex()
-                            .p(px(4.0))
-                            .rounded(px(12.0))
-                            .border_1()
-                            .border_color(theme::t().border_inverted)
-                            .bg(theme::t().menu)
-                            .shadow_lg()
-                            .children(if kind == "view" {
-                                // 视图选项（web ViewOptionsMenu：分组 label + 单选 + 分隔 + 排序）
-                                let t1 = this.clone();
-                                let t2 = this.clone();
-                                let t3 = this.clone();
-                                let t4 = this.clone();
-                                vec![
-                                    sb_menu_label("分组方式").into_any_element(),
-                                    sb_menu_check_row(
-                                        "view-group-ws",
-                                        "按工作区",
-                                        !self.group_flat,
-                                        move |_, _, cx| t1.update(cx, |v, cx| {
-                                            v.group_flat = false;
-                                            v.sidebar_menu = None;
-                                            cx.notify();
-                                        }),
-                                    ).into_any_element(),
-                                    sb_menu_check_row(
-                                        "view-group-flat",
-                                        "单列表",
-                                        self.group_flat,
-                                        move |_, _, cx| t2.update(cx, |v, cx| {
-                                            v.group_flat = true;
-                                            v.sidebar_menu = None;
-                                            cx.notify();
-                                        }),
-                                    ).into_any_element(),
-                                    sb_menu_divider().into_any_element(),
-                                    sb_menu_label("排序方式").into_any_element(),
-                                    sb_menu_check_row(
-                                        "view-order-manual",
-                                        "手动排序",
-                                        self.order_manual,
-                                        move |_, _, cx| t3.update(cx, |v, cx| {
-                                            v.order_manual = true;
-                                            v.sidebar_menu = None;
-                                            cx.notify();
-                                        }),
-                                    ).into_any_element(),
-                                    sb_menu_check_row(
-                                        "view-order-updated",
-                                        "最近更新",
-                                        !self.order_manual,
-                                        move |_, _, cx| t4.update(cx, |v, cx| {
-                                            v.order_manual = false;
-                                            v.sidebar_menu = None;
-                                            cx.notify();
-                                        }),
-                                    ).into_any_element(),
-                                ]
-                            } else if kind == "ws" {
-                                let t1 = this.clone();
-                                let t2 = this.clone();
-                                let id1 = target.clone();
-                                let id2 = target.clone();
-                                vec![
-                                    sb_menu_row("ws-rename", "重命名", false, move |_, _, cx| {
-                                        let id = id1.clone();
-                                        t1.update(cx, |v, cx| {
-                                            v.sidebar_menu = None;
-                                            v.renaming_workspace = Some(id);
-                                            cx.notify();
-                                        });
-                                    }).into_any_element(),
-                                    sb_menu_row("ws-delete", "删除工作区", true, move |_, _, cx| {
-                                        let id = id2.clone();
-                                        t2.update(cx, |v, cx| {
-                                            v.sidebar_menu = None;
-                                            v.delete_workspace(&id);
-                                            cx.notify();
-                                        });
-                                    }).into_any_element(),
-                                ]
-                            } else {
-                                // web Rows 会话菜单三项：rename / fork / archive
-                                let t1 = this.clone();
-                                let id1 = target.clone();
-                                let t2 = this.clone();
-                                let id2 = target.clone();
-                                let t3 = this.clone();
-                                let id3 = target.clone();
-                                let title = self
-                                    .sessions
-                                    .iter()
-                                    .find(|m| m.id.as_str() == target)
-                                    .map(|m| m.title.clone())
-                                    .unwrap_or_default();
-                                vec![
-                                    sb_menu_row("sess-rename", "重命名", false, move |_, window, cx| {
-                                        let id = id1.clone();
-                                        t1.update(cx, |v, cx| {
-                                            v.sidebar_menu = None;
-                                            v.renaming_session = Some(id);
-                                            v.rename_input.update(cx, |s, cx| {
-                                                s.set_value(&title, window, cx);
-                                            });
-                                            cx.notify();
-                                        });
-                                    }).into_any_element(),
-                                    sb_menu_row("sess-fork", "分叉会话", false, move |_, _, cx| {
-                                        let id = id2.clone();
-                                        t2.update(cx, |v, cx| {
-                                            v.sidebar_menu = None;
-                                            let sid = dsh_llm::SessionId::new(id);
-                                            v.fork_session(&sid, cx);
-                                        });
-                                    }).into_any_element(),
-                                    // web：归档不触碰日志，不作破坏性标红
-                                    sb_menu_row("sess-archive", "归档会话", false, move |_, _, cx| {
-                                        let id = id3.clone();
-                                        t3.update(cx, |v, cx| {
-                                            v.sidebar_menu = None;
-                                            let sid = dsh_llm::SessionId::new(id);
-                                            v.archive_session(&sid, cx);
-                                        });
-                                    }).into_any_element(),
-                                ]
-                            }),
-                        ),
-                    )
-                    .child(
-                        // canvas 必须脱流（同 hero：gap 型 v_flex 会多一条间隙）
-                        div().absolute().child(canvas(
-                            move |_, _, _| {},
-                            move |_, _, window, _| {
-                                let bounds = menu_bounds
-                                    .lock()
-                                    .unwrap()
-                                    .clone()
-                                    .unwrap_or_default();
-                                window.on_mouse_event(
-                                    move |event: &MouseDownEvent, phase: DispatchPhase, _, cx| {
-                                        // Capture 相：先于元素回调关闭旧菜单——
-                                        // 点另一行的 … 时新菜单随后被元素回调
-                                        // 打开，一次点击即完成「移动」
-                                        if phase == DispatchPhase::Capture
-                                            && !bounds.contains(&event.position)
-                                        {
-                                            t_dismiss.update(cx, |v, cx| {
-                                                if v.sidebar_menu.is_some() {
-                                                    v.sidebar_menu = None;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }
-                                    },
-                                );
-                            },
-                        )),
-                    )
-                })
-                .when(self.search_open, |col| {
-                    // web WorkspaceBrowser 外点收起：点搜索药丸之外先失焦，
-                    // 查询为空才收起；非空保持展开（结果仍可见）
-                    let search_bounds = self.sb_search_bounds.clone();
-                    let t = this.clone();
-                    col.child(
-                        div().absolute().child(canvas(
-                            move |_, _, _| {},
-                            move |_, _, window, _| {
-                                let bounds = search_bounds.borrow().clone().unwrap_or_default();
-                                window.on_mouse_event(
-                                    move |event: &MouseDownEvent, phase: DispatchPhase, _, cx| {
-                                        if phase == DispatchPhase::Bubble
-                                            && !bounds.contains(&event.position)
-                                        {
-                                            t.update(cx, |v, cx| {
-                                                if v.search_open
-                                                    && v.search_query.trim().is_empty()
-                                                {
-                                                    v.search_open = false;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }
-                                    },
-                                );
-                            },
-                        )),
-                    )
-                })
-                .child(
-                    // 底部设置
-                    div()
-                        .id("sb-settings")
-                        .h(px(32.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .rounded(px(8.0))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::t().hover))
-                        .on_click(move |_, _, cx| {
-                            t_settings.update(cx, |v, cx| { v.settings_open = true; cx.notify(); });
-                        })
-                        .child(Icon::new(IconName::Settings).size(px(16.0)).text_color(theme::t().text_3))
-                        .child(
-                            div()
-                                .text_size(px(theme::FONT_ROW))
-                                .line_height(px(20.0))
-                                .text_color(theme::t().text_2)
-                                .child("设置"),
-                        ),
-                );
-        }
-        col
-    }
 
-    fn render_center(&self, width: f32, this: Entity<AppView>, has_text: bool) -> Div {
+    fn render_center(&self, width: f32, this: Entity<AppView>, has_text: bool, snap: &ChatSnap) -> Div {
         let t = this.clone();
         let mut center = div()
             .h_full()
@@ -4944,199 +2459,27 @@ impl AppView {
             .v_flex()
             .bg(theme::t().bg_base);
 
-        let show_header = !self.is_empty_session() || self.running;
+        let show_header = !snap.empty || snap.running;
         if show_header {
-            center = center.child(self.render_header(this.clone()));
+            center = center.child(self.render_header(this.clone(), snap));
         }
 
-        // 主体：hero（空会话）/ 对话 / 轨迹
-        if self.is_empty_session() && !self.running {
-            center = center.child(self.render_hero(this, has_text, width));
+        // 主体：hero（空会话）/ 对话/轨迹（ChatView entity）
+        if snap.empty && !snap.running {
+            center = center.child(self.render_hero(this, has_text, width, snap));
         } else {
-            let body = match self.tab {
-                CenterTab::Conversation => self.render_chat(&this, width).into_any_element(),
-                CenterTab::Trajectory => self.render_trajectory(&this, width).into_any_element(),
-            };
-            let show_jump = !self.chat_near_bottom();
-            let t_jump = this.clone();
-            // 虚拟列表（gpui list，可变高）：内容在 ChatEntry 之外补两行
-            // （流式状态 / 统计），render_item 按序号派发。
-            let list_this = this.clone();
-            // web --dsh-chat-content-width：内容列随中栏宽度自适应
-            let content_w = layout::chat_content_width(width);
-            let chat_list_state = self.chat_list.clone();
-            let chat_list_el = gpui::list(chat_list_state.clone(), move |ix, _window, cx| {
-                let entry = list_this.read_with(cx, |v, _| v.entries.get(ix).cloned());
-                match entry {
-                    Some(e) => {
-                        let this = list_this.clone();
-                        list_this
-                            .read_with(cx, |v, _| {
-                                // 轮次过程折叠（web turn-process，compact 默认）：
-                                // 过程组首条目的槽位渲染控制行；闭合时其余成员
-                                // 零高隐藏；答案条目隐藏本步 reasoning 块
-                                if let Some(f) = v.turn_process_folds().get(&e.turn).copied() {
-                                    let expanded = v.turn_expanded.contains(&e.turn);
-                                    let member = matches!(e.role, Role::Assistant | Role::Context)
-                                        && f.first_process <= ix
-                                        && ix < f.answer;
-                                    if member {
-                                        let t_ctl = this.clone();
-                                        if ix == f.first_process {
-                                            let mut labels: Vec<String> = Vec::new();
-                                            if f.tools > 0 {
-                                                labels.push(format!("{} 次工具调用", f.tools));
-                                            }
-                                            if f.messages > 0 {
-                                                labels.push(format!("{} 条消息", f.messages));
-                                            }
-                                            if f.subagents > 0 {
-                                                labels.push(format!("{} 个 subagent", f.subagents));
-                                            }
-                                            let label = if labels.is_empty() {
-                                                "已思考".to_string()
-                                            } else {
-                                                labels.join(" · ")
-                                            };
-                                            let control = widgets::turn_process_control(
-                                                ix as u64,
-                                                &label,
-                                                expanded,
-                                                move |_, _, cx| {
-                                                    t_ctl.update(cx, |v, cx| {
-                                                        if !v.turn_expanded.remove(&e.turn) {
-                                                            v.turn_expanded.insert(e.turn);
-                                                        }
-                                                        // 成员从零高占位 ↔ 完整条目，
-                                                        // 高度大变：列表须重测，否则重叠
-                                                        v.invalidate_chat_heights();
-                                                        cx.notify();
-                                                    });
-                                                },
-                                            );
-                                            if expanded {
-                                                // 控制行（固定 33px）与展开体必须是
-                                                // 兄弟节点（web 同构）：曾把整个条目
-                                                // 塞进控制行当 child，内容垂直溢出、
-                                                // 叠在后续行上
-                                                return div()
-                                                    .w_full()
-                                                    .v_flex()
-                                                    .child(control)
-                                                    .child(v.render_entry(&e, ix, &this, content_w))
-                                                    .into_any_element();
-                                            }
-                                            return control.into_any_element();
-                                        }
-                                        if !expanded {
-                                            // 隐藏成员：零高占位（无 pb，不出 16px 缝）
-                                            return div().into_any_element();
-                                        }
-                                    }
-                                    if ix == f.answer && !expanded {
-                                        let mut answer = e.clone();
-                                        answer.blocks.retain(|b| !matches!(b, MsgBlock::Reasoning { .. }));
-                                        return v.render_entry(&answer, ix, &this, content_w).pb_4().into_any_element();
-                                    }
-                                }
-                                // gpui list 无 gap 概念：条目间距用 pb 模拟（web 列 gap 16px）
-                                v.render_entry(&e, ix, &this, content_w).pb_4().into_any_element()
-                            })
-                            .into_any_element()
-                    }
-                    None => {
-                        let ix = ix;
-                        list_this
-                            .read_with(cx, |v, _| {
-                                if ix == v.entries.len() && v.running {
-                                    v.render_status_line().into_any_element()
-                                } else {
-                                    // 统计行已移至输入卡上方（web composer.dock 槽）
-                                    div().into_any_element()
-                                }
-                            })
-                            .into_any_element()
-                    }
-                }
-            })
-            .size_full()
-            .with_sizing_behavior(ListSizingBehavior::Auto)
-            // 内容列随中栏宽度自适应、居中（web ChatView .column）
-            .max_w(px(content_w))
-            .mx_auto();
+            // 对话/轨迹主体都是 ChatView entity：对话 = 虚拟列表（折叠派生
+            // 缓存、滚轮转发、贴底药丸在其内部），轨迹 = 工具台账。delta
+            // 级失效只打 ChatView，侧栏/详情经 AnyView 缓存复用上帧结果。
             center = center
-                .child(
-                    // chat tab 用虚拟列表；轨迹保持普通流
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .relative()
-                        .child(
-                            if self.tab == CenterTab::Conversation {
-                                // 两侧空白：list hitbox 只覆盖内容列（padding
-                                // 区在命中链之外），由 wrapper 接住滚轮转发给
-                                // 列表；指针在列表 viewport 内时交给列表自身，
-                                // 避免双重滚动
-                                div()
-                                    .id("chat-scroll")
-                                    .h_full()
-                                    .on_scroll_wheel({
-                                        let wheel_state = chat_list_state.clone();
-                                        let wheel_view = this.clone();
-                                        move |event: &ScrollWheelEvent, _window, cx| {
-                                            if !wheel_state.viewport_bounds().contains(&event.position)
-                                            {
-                                                let delta = event.delta.pixel_delta(px(20.0));
-                                                if !delta.y.is_zero() {
-                                                    wheel_state.scroll_by(-delta.y);
-                                                    wheel_view.update(cx, |_, cx| cx.notify());
-                                                }
-                                            }
-                                        }
-                                    })
-                                    .child(chat_list_el.px_8())
-                                    .into_any_element()
-                            } else {
-                                body.into_any_element()
-                            },
-                        )
-                        .when(show_jump, |d| {
-                            d.child(
-                                div()
-                                    .id("chat-jump-bottom")
-                                    .absolute()
-                                    .right(px(24.0))
-                                    .bottom(px(16.0))
-                                    .size(px(34.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .border_1()
-                                    .border_color(theme::t().border_l2)
-                                    .bg(theme::t().surface)
-                                    .text_color(theme::t().text_2)
-                                    .cursor_pointer()
-                                    .shadow_md()
-                                    .hover(|s| s.bg(theme::t().surface_2).text_color(theme::t().text))
-                                    .tooltip(tip("回到底部"))
-                                    .on_click(move |_, _, cx| {
-                                        t_jump.update(cx, |v, _cx| {
-                                            v.list_bottom.set(true);
-                                            v.sync_chat_list(true);
-                                        });
-                                    })
-                                    .child(Icon::new(IconName::ChevronDown).size(px(16.0))),
-                            )
-                        }),
-                )
-                .child(self.render_composer_area(t, has_text, width));
+                .child(div().flex_1().min_h_0().child(self.chat.clone()))
+                .child(self.render_composer_area(t, has_text, width, snap));
         }
         center
     }
 
     /// 会话 header：标题行 + 对话/轨迹 tab（ConversationRoot .header）。
-    fn render_header(&self, this: Entity<AppView>) -> Div {
+    fn render_header(&self, this: Entity<AppView>, snap: &ChatSnap) -> Div {
         let title = self
             .sessions
             .iter()
@@ -5188,11 +2531,11 @@ impl AppView {
                         }),
                     ),
             )
-            .child(self.render_tabs(this))
+            .child(self.render_tabs(this, snap))
     }
 
     /// 对话 / 轨迹 tab 条（13/16 wt500，激活蓝 + 2px 底条）。
-    fn render_tabs(&self, this: Entity<AppView>) -> Div {
+    fn render_tabs(&self, this: Entity<AppView>, snap: &ChatSnap) -> Div {
         let t1 = this.clone();
         let t2 = this;
         let tab = |id: &'static str, label: &'static str, active: bool, t: Entity<AppView>| {
@@ -5208,10 +2551,14 @@ impl AppView {
                 .text_color(if active { theme::t().accent } else { theme::t().text_3 })
                 .hover(|s| s.text_color(theme::t().text_2))
                 .on_click(move |_, _, cx| {
-                    t.update(cx, |v, cx| {
-                        v.tab = if label == "轨迹" { CenterTab::Trajectory } else { CenterTab::Conversation };
-                        cx.notify();
-                    });
+                    // tab 状态在 ChatView 上；其 notify 沿祖先链把 AppView
+                    // 一并置脏，header 高亮下帧刷新
+                    let tab = if label == "轨迹" { CenterTab::Trajectory } else { CenterTab::Conversation };
+                    t.read_with(cx, |v, _| v.chat.clone())
+                        .update(cx, |c, cx| {
+                            c.tab = tab;
+                            cx.notify();
+                        });
                 })
                 .child(label)
         };
@@ -5220,104 +2567,21 @@ impl AppView {
             .pl_2()
             .flex()
             .gap(px(36.0))
-            .child(tab("tab-chat", "对话", self.tab == CenterTab::Conversation, t1))
-            .child(tab("tab-traj", "轨迹", self.tab == CenterTab::Trajectory, t2))
-    }
-
-    /// 轮次过程折叠派生（web turn-process Definition 语义，1:1）：
-    /// 已关闭轮 + 末条助手条目含非空文本且无工具块 → 该条目为答案边界；
-    /// 边界前的助手条目（reasoning/早前回复/工具行）构成过程组。
-    /// 错误行与 Notice（压缩检查点）独立在外，始终可见。
-    /// 仅 compact 视图参与；返回 turn -> 折叠信息。
-    fn turn_process_folds(&self) -> std::collections::HashMap<u64, TurnFold> {
-        let mut out = std::collections::HashMap::new();
-        if self.settings.transcript_view != TranscriptView::Compact {
-            return out;
-        }
-        let mut by_turn: std::collections::HashMap<u64, Vec<usize>> = Default::default();
-        for (i, e) in self.entries.iter().enumerate() {
-            // 上下文注入也是过程证据（web：fold 进过程组，不计入摘要计数）
-            if matches!(e.role, Role::Assistant | Role::Context) {
-                by_turn.entry(e.turn).or_default().push(i);
-            }
-        }
-        for (t, idxs) in by_turn {
-            // 打开的轮次不折叠；答案自身不算过程（<2 条 = 无过程组）
-            if self.turn_open == Some(t) || idxs.len() < 2 {
-                continue;
-            }
-            let Some(answer) = idxs.iter().rev().find(|&&i| self.entries[i].role == Role::Assistant).copied() else {
-                continue;
-            };
-            let answer_entry = &self.entries[answer];
-            let has_text = answer_entry
-                .blocks
-                .iter()
-                .any(|b| matches!(b, MsgBlock::Text(x) if !x.trim().is_empty()));
-            let has_tool = answer_entry.blocks.iter().any(|b| matches!(b, MsgBlock::Tool(_)));
-            if !has_text || has_tool {
-                continue;
-            }
-            let process: Vec<usize> = idxs.iter().copied().take_while(|&i| i < answer).collect();
-            if process.is_empty() {
-                continue;
-            }
-            let (mut tools, mut subagents, mut messages) = (0usize, 0usize, 0usize);
-            for &i in &process {
-                let e = &self.entries[i];
-                let mut reply = false;
-                for b in &e.blocks {
-                    match b {
-                        // subagent 委派单独计数（web 同名规则：subagent / subagent_*）
-                        MsgBlock::Tool(tool) => {
-                            if tool.name == "subagent" || tool.name.starts_with("subagent_") {
-                                subagents += 1;
-                            } else {
-                                tools += 1;
-                            }
-                        }
-                        MsgBlock::Text(x) if !x.trim().is_empty() => reply = true,
-                        _ => {}
-                    }
-                }
-                if reply {
-                    messages += 1;
-                }
-            }
-            out.insert(t, TurnFold { first_process: process[0], answer, tools, messages, subagents });
-        }
-        out
-    }
-
-    /// 消息流（748px 内容列 + 16px 项间距，ChatView .column）。
-    fn render_chat(&self, this: &Entity<AppView>, width: f32) -> Div {
-        let mut col = div()
-            .w_full()
-            .max_w(px(layout::chat_content_width(width)))
-            .mx_auto()
-            .v_flex()
-            .gap_4()
-            .py_4()
-            .children(
-                self.entries.iter().enumerate().map(|(i, e)| self.render_entry(e, i, this, layout::chat_content_width(width))),
-            );
-        if self.running {
-            col = col.child(self.render_status_line());
-        }
-        // 统计行移至 composer 区（web composer.dock 槽），不在滚动流内
-        div().w_full().child(col)
+            .child(tab("tab-chat", "对话", snap.tab == CenterTab::Conversation, t1))
+            .child(tab("tab-traj", "轨迹", snap.tab == CenterTab::Trajectory, t2))
     }
 
     /// 底部 composer 区：输入卡 + 统计行（web composer.dock 槽，卡下 footer）。
-    fn render_composer_area(&self, this: Entity<AppView>, has_text: bool, width: f32) -> Div {
+    fn render_composer_area(&self, this: Entity<AppView>, has_text: bool, width: f32, snap: &ChatSnap) -> Div {
         let content_w = layout::chat_content_width(width);
         let card_w = layout::composer_card_width(width);
+        let locked = snap.empty && self.current_workspace.is_none();
         let mut area = div()
             .flex_none()
             .v_flex()
             .bg(theme::t().bg_base)
             .pb_2()
-            .child(self.composer_card(this, has_text, card_w));
+            .child(self.composer_card(this, has_text, card_w, snap.running, locked));
         // web StatsLine：输入卡下方常驻 footer。占位恒在（固定行高），
         // 避免首条统计出现时输入卡上移；steps>0 只决定有无文本，
         // 文本居中（.root text-align: center）
@@ -5339,14 +2603,14 @@ impl AppView {
                         .text_size(px(theme::FONT_CAPTION))
                         .line_height(px(20.0))
                         .text_color(theme::t().text_3)
-                        .when(self.stats_steps > 0, |d| d.child(self.stats_line())),
+                        .when(snap.stats_steps > 0, |d| d.child(snap.stats.clone())),
                 ),
         );
         area
     }
 
     /// 空会话 hero：标题 + 工作区行 + 居中输入卡（HeroShell）。
-    fn render_hero(&self, this: Entity<AppView>, has_text: bool, center_w: f32) -> Div {
+    fn render_hero(&self, this: Entity<AppView>, has_text: bool, center_w: f32, snap: &ChatSnap) -> Div {
         let hero_this = this.clone();
         // web ConversationRoot .heroGlow：资产 1051×468 对设计卡 776，宽随卡缩放，
         // 中心锚在卡面（底边上方 92px），translate(-50%, 50%) 使椭圆中心落在锚上。
@@ -5475,7 +2739,7 @@ impl AppView {
                                     ),
                             ),
                     )
-                    .child(self.composer_card(this, has_text, layout::composer_card_width(center_w)))
+                    .child(self.composer_card(this, has_text, layout::composer_card_width(center_w), snap.running, snap.empty && self.current_workspace.is_none()))
                     // 下拉面板挂在栈层级（输入卡之后渲染 → 绘制在其上，
                     // 对齐 web .workspaceRow z-index:10 的效果）；遮罩提供
                     // 点击外部关闭
@@ -5654,8 +2918,7 @@ impl AppView {
 
     /// 输入卡（web InputBar .card）：r22、白 6% 描边、850 表面、
     /// 文本在上（16/24），控件行在下（+ / 模式 | 模型 / 发送）。
-    fn composer_card(&self, this: Entity<AppView>, has_text: bool, card_w: f32) -> Stateful<Div> {
-        let running = self.running;
+    fn composer_card(&self, this: Entity<AppView>, has_text: bool, card_w: f32, running: bool, locked: bool) -> Stateful<Div> {
         let t_model_menu = this.clone();
 
         // 模型菜单（模型牌弹出）：各提供方分组 + 模型行，当前项带勾
@@ -5837,12 +3100,12 @@ impl AppView {
             .border_color(theme::t().border_l1)
             .bg(theme::t().surface)
             // web workspaceTrigger：未选工作区时卡面即选择器触发器
-            .when(self.workspace_locked(), |d| {
+            .when(locked, |d| {
                 d.cursor_pointer().on_click(move |_, _, cx| {
                     t_card.update(cx, |v, cx| { v.hero_ws_menu = true; cx.notify(); });
                 })
             })
-            .child(if self.workspace_locked() {
+            .child(if locked {
                 // web：inert 态编辑器不挂载，占位文案即引导。高度必须
                 // 等于 Input 单行外壳（input_py 8×2 + 行高 20 = 36），
                 // 否则选定工作区切换编辑器时垂直居中的 hero 会位移
@@ -5953,255 +3216,6 @@ impl AppView {
 
 
 
-
-
-
-/// 助手消息完成后的 footer（web turn tail）：复制按钮（悬停显现）+
-/// 「用量」「用时」两个统计药丸（各自点击弹出详情对话框，TurnUsagePanel
-/// 同语义；无用量数据的轮次保持纯文本用时行）+ 日历时钟文本。
-fn render_entry_footer(
-    elapsed: Duration,
-    usage: Option<TurnUsage>,
-    ended_at_ms: Option<u64>,
-    this: &Entity<AppView>,
-    ei: usize,
-) -> Div {
-    let t = this.clone();
-    let group: SharedString = format!("assistant-msg-{ei}").into();
-    let group_copy = group.clone();
-
-    // 用量药丸 + 对话框（有 token 数据才出现；web 同款）
-    let usage_pill = usage.clone().map(|u| {
-        gpui_component::popover::Popover::new(("turn-usage-pop", ei as u64))
-            .anchor(gpui::Corner::TopLeft)
-            .trigger(
-                gpui_component::button::Button::new(("turn-usage-btn", ei as u64))
-                    .ghost()
-                    .child(pill_row(
-                        "icons/database.svg",
-                        format!("用量 {} tok", format_tokens_compact(u.total_tokens())),
-                    )),
-            )
-            .content(move |_, _, _| turn_usage_panel(u.clone()).into_any_element())
-    });
-
-    // 用时药丸 + 对话框（有用量数据时是药丸，否则并入纯文本分支）
-    let time_pill = usage.clone().map(|u| {
-        gpui_component::popover::Popover::new(("turn-time-pop", ei as u64))
-            .anchor(gpui::Corner::TopLeft)
-            .trigger(
-                gpui_component::button::Button::new(("turn-time-btn", ei as u64))
-                    .ghost()
-                    .child(pill_row(
-                        "icons/clock.svg",
-                        format!("用时 {}", format_run_duration(elapsed.as_millis() as u64)),
-                    )),
-            )
-            .content(move |_, _, _| turn_time_panel(u.clone()).into_any_element())
-    });
-
-    let plain_time = format!("用时 {}", format_run_duration(elapsed.as_millis() as u64));
-
-    let mut row = div().w_full().flex().items_center().gap_2().child(
-        div()
-            .id(("copy-assistant", ei as u64))
-            .size(px(20.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(4.0))
-            .cursor_pointer()
-            .text_color(theme::t().caption)
-            .opacity(0.0)
-            .group_hover(group_copy, |s| s.opacity(1.0))
-            .hover(|s| s.text_color(theme::t().text_2).bg(theme::t().hover))
-            .tooltip(tip("复制"))
-            .on_click(move |_, _, cx| {
-                t.update(cx, |v, cx| {
-                    // 复制本条助手消息全部文本块
-                    let mut text = String::new();
-                    if let Some(entry) = v.entries.get(ei) {
-                        for block in &entry.blocks {
-                            if let MsgBlock::Text(t) = block {
-                                text.push_str(t);
-                            }
-                        }
-                    }
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                });
-            })
-            .child(Icon::new(IconName::Copy).size(px(14.0))),
-    );
-    match (usage_pill, time_pill) {
-        (Some(usage_p), Some(time_p)) => {
-            row = row.child(usage_p).child(time_p);
-        }
-        (None, Some(_)) | (None, None) => {
-            // 无用量数据：保持纯文本用时行（web 同语义，间距不变）
-            row = row.child(plain_text_footer(&plain_time));
-        }
-        (Some(_), None) => {
-            row = row.child(plain_text_footer(&plain_time));
-        }
-    }
-    // 日历时钟文本缀在统计之后（web clock 位置）
-    if let Some(ended) = ended_at_ms {
-        let clock = format_message_clock(ended, now_ms());
-        if !clock.is_empty() {
-            row = row.child(plain_text_footer(&clock));
-        }
-    }
-    row
-}
-
-/// 药丸行（图标 + 标签，caption 色 12px）。
-fn pill_row(icon_path: &'static str, label: String) -> Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_1()
-        .text_size(px(theme::FONT_CAPTION))
-        .text_color(theme::t().caption)
-        .child(
-            gpui::svg()
-                .path(icon_path)
-                .size(px(12.0))
-                .text_color(theme::t().caption),
-        )
-        .child(label)
-}
-
-/// 纯文本 footer 段（时钟 / 无用量时的用时）。
-fn plain_text_footer(text: &str) -> Div {
-    div()
-        .text_size(px(theme::FONT_CAPTION))
-        .line_height(px(theme::FONT_CAPTION_LEADING))
-        .text_color(theme::t().caption)
-        .child(text.to_string())
-}
-
-/// 统计对话框骨架（web TurnUsagePanel.module.css 的 panel 面）。
-fn turn_stat_panel(
-    icon_path: &'static str,
-    title: &'static str,
-    title_value: Option<String>,
-    rows: Vec<(&'static str, String)>,
-) -> Div {
-    let mut panel = div()
-        .w(px(300.0))
-        .bg(theme::t().surface)
-        .border_1()
-        .border_color(theme::t().border_l2)
-        .rounded(px(10.0))
-        .p(px(12.0))
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .shadow_lg();
-    let mut title_row = div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_2()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_size(px(theme::FONT_CAPTION))
-                .text_color(theme::t().text_2)
-                .child(
-                    gpui::svg()
-                        .path(icon_path)
-                        .size(px(12.0))
-                        .text_color(theme::t().text_2),
-                )
-                .child(title),
-        );
-    if let Some(v) = title_value {
-        title_row = title_row.child(
-            div()
-                .text_size(px(theme::FONT_CAPTION))
-                .text_color(theme::t().caption)
-                .child(v),
-        );
-    }
-    panel = panel.child(title_row);
-    panel = panel.child(div().w_full().h(px(1.0)).bg(theme::t().border_l1));
-    for (label, value) in rows {
-        panel = panel.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(theme::t().caption)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .text_color(theme::t().text_2)
-                        .child(value),
-                ),
-        );
-    }
-    panel
-}
-
-/// 本轮用量对话框（web TurnUsagePanel：模型路由 / 缓存命中 / 四桶明细）。
-fn turn_usage_panel(u: TurnUsage) -> Div {
-    let mut rows = vec![];
-    if !u.route.is_empty() {
-        rows.push(("提供方 / 模型", u.route.clone()));
-    }
-    if let Some(hit) = u.cache_hit_percent() {
-        rows.push(("缓存命中", format!("{hit}%")));
-    }
-    rows.push((
-        "未缓存输入",
-        format!("{} tok", format_tokens_exact(u.uncached_input())),
-    ));
-    if let Some(read) = u.cache_read {
-        rows.push(("缓存读取", format!("{} tok", format_tokens_exact(read))));
-    }
-    if let Some(write) = u.cache_write {
-        rows.push(("缓存写入", format!("{} tok", format_tokens_exact(write))));
-    }
-    let output = match u.reasoning {
-        Some(r) => format!(
-            "{} tok（其中推理 {}）",
-            format_tokens_exact(u.output_tokens),
-            format_tokens_exact(r)
-        ),
-        None => format!("{} tok", format_tokens_exact(u.output_tokens)),
-    };
-    rows.push(("输出", output));
-    turn_stat_panel(
-        "icons/database.svg",
-        "本轮用量",
-        Some(format!("{} tok", format_tokens_exact(u.total_tokens()))),
-        rows,
-    )
-}
-
-/// 本轮用时对话框（web TurnTimePanel：总用时 / TPS / TTFT）。
-fn turn_time_panel(u: TurnUsage) -> Div {
-    let mut rows = vec![("本轮总用时", format_run_duration(u.run_ms))];
-    if let Some(tps) = u.tokens_per_second() {
-        rows.push(("输出速度（TPS）", format!("{} tok/s", format_tps(tps))));
-    }
-    if let Some(ttft) = u.ttft_ms {
-        rows.push((
-            "首 token 平均用时（TTFT）",
-            format!("{}秒", format_latency_seconds(ttft)),
-        ));
-    }
-    turn_stat_panel("icons/clock.svg", "本轮用时和速度", None, rows)
-}
 
 /// 视图菜单分组 label（web Menu label：caption 色小字）。
 /// web increasedForkTitle：`标题 (N)` / `标题（N）` 后缀自增，无后缀补 ` (1)`。
@@ -6330,20 +3344,6 @@ fn sb_menu_row(
         .hover(|s| s.bg(theme::t().hover))
         .on_click(on_click)
         .child(label)
-}
-
-fn attach_tool_result(
-    last: Option<&mut ChatEntry>,
-    call_id: &str,
-    result: &str,
-    error: bool,
-) {
-    if let Some(entry) = last
-        && let Some(MsgBlock::Tool(tool)) = entry.blocks.iter_mut().rev().find(|b| matches!(b, MsgBlock::Tool(t) if t.id == call_id))
-    {
-        tool.result = Some(result.to_string());
-        tool.error = error;
-    }
 }
 
 // --- 启动 --------------------------------------------------------------------
@@ -6645,7 +3645,7 @@ fn main() {
     }
 
     Application::new()
-        .with_assets(assets::AppAssets)
+        .with_assets(assets::AppAssets::new())
         .run(move |cx| {
         gpui_component::init(cx);
         theme::apply(startup_theme, cx);
@@ -6745,41 +3745,23 @@ fn main() {
                     )
                 });
 
+                // 事件泵：delta 级事件只打 ChatView——AppView 不被逐事件
+                // mutate，侧栏等兄弟子视图的 element 缓存保持有效（notify
+                // 仍沿祖先链让 AppView 壳层重渲染）；轮次边界/统计变化才
+                // 提升为宿主级 notify。
+                let chat_view = app.read(cx).chat.clone();
                 let view = app.clone();
                 cx.spawn(move |cx: &mut AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
                         while let Ok(ev) = event_rx.recv_async().await {
-                            let _ = cx.update_entity(&view, |app: &mut AppView, cx: &mut Context<AppView>| {
-                                app.push_event(ev);
+                            let app_level = cx.update_entity(&chat_view, |c: &mut ChatView, cx: &mut Context<ChatView>| {
+                                let r = c.apply_event(ev);
                                 cx.notify();
+                                r
                             });
-                        }
-                    }
-                })
-                .detach();
-
-                // 流式期间每秒重绘一次，让状态行的耗时计时跳动
-                let tick_view = app.clone();
-                cx.spawn(move |cx: &mut AsyncApp| {
-                    let mut cx = cx.clone();
-                    async move {
-                        loop {
-                            Timer::after(Duration::from_millis(100)).await;
-                            let Ok(running) = tick_view.update(&mut cx, |v, _| v.running) else {
-                                return;
-                            };
-                            if running {
-                                let need_notify = tick_view.update(&mut cx, |v, _| {
-                                    let dirty = v.heights_dirty.replace(false);
-                                    if dirty {
-                                        v.invalidate_chat_heights();
-                                    }
-                                    dirty
-                                });
-                                if matches!(need_notify, Ok(true)) {
-                                    let _ = tick_view.update(&mut cx, |_, cx| cx.notify());
-                                }
+                            if matches!(app_level, Ok(true)) {
+                                let _ = cx.update_entity(&view, |_: &mut AppView, cx: &mut Context<AppView>| cx.notify());
                             }
                         }
                     }

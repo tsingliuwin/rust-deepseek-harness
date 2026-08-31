@@ -1,201 +1,59 @@
-//! 嵌入的图标资源（来自 gpui-component v0.5.1 仓库 crates/assets，MIT/Apache-2.0）。
-//! 由脚本生成：把 assets/icons 下的 SVG 以 include_bytes! 编进二进制，
-//! 经 `Application::with_assets` 提供给 gpui 的 SVG 渲染器。
+//! 资源源组合：图标基座来自官方 `gpui-component-assets` crate（与
+//! gpui-component 0.5.1 同源同版本，随依赖更新走），本地只维护自有
+//! 资产（brands 与 3 个官方目录没有的 svg）。此前 88 个图标逐个
+//! include_bytes! 手抄进仓库，升级依赖时无感漂移。
 
+use gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
-use gpui::{AssetSource, SharedString};
 
-pub struct AppAssets;
+/// 本地自有资产（官方 icons 目录之外的全部）。
+const LOCAL: &[(&str, &[u8])] = &[
+    ("brands/fish.svg", include_bytes!("../assets/brands/fish.svg")),
+    ("brands/hero-glow.png", include_bytes!("../assets/brands/hero-glow.png")),
+    ("icons/context-injection.svg", include_bytes!("../assets/icons/context-injection.svg")),
+    ("icons/clock.svg", include_bytes!("../assets/icons/clock.svg")),
+    ("icons/database.svg", include_bytes!("../assets/icons/database.svg")),
+];
+
+pub struct AppAssets {
+    icons: gpui_component_assets::Assets,
+}
+
+impl AppAssets {
+    pub fn new() -> Self {
+        Self { icons: gpui_component_assets::Assets }
+    }
+}
+
+impl Default for AppAssets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl AssetSource for AppAssets {
-    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        match path {
-            "icons/a-large-small.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/a-large-small.svg") as &[u8]))),
-            "icons/arrow-down.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/arrow-down.svg") as &[u8]))),
-            "icons/arrow-left.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/arrow-left.svg") as &[u8]))),
-            "icons/arrow-right.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/arrow-right.svg") as &[u8]))),
-            "icons/arrow-up.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/arrow-up.svg") as &[u8]))),
-            "icons/asterisk.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/asterisk.svg") as &[u8]))),
-            "icons/bell.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/bell.svg") as &[u8]))),
-            "icons/book-open.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/book-open.svg") as &[u8]))),
-            "icons/bot.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/bot.svg") as &[u8]))),
-            "icons/building-2.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/building-2.svg") as &[u8]))),
-            "icons/calendar.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/calendar.svg") as &[u8]))),
-            "icons/case-sensitive.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/case-sensitive.svg") as &[u8]))),
-            "icons/chart-pie.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/chart-pie.svg") as &[u8]))),
-            "icons/check.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/check.svg") as &[u8]))),
-            "icons/chevron-down.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/chevron-down.svg") as &[u8]))),
-            "icons/chevron-left.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/chevron-left.svg") as &[u8]))),
-            "icons/chevron-right.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/chevron-right.svg") as &[u8]))),
-            "icons/chevron-up.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/chevron-up.svg") as &[u8]))),
-            "icons/chevrons-up-down.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/chevrons-up-down.svg") as &[u8]))),
-            "icons/circle-check.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/circle-check.svg") as &[u8]))),
-            "icons/circle-user.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/circle-user.svg") as &[u8]))),
-            "icons/circle-x.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/circle-x.svg") as &[u8]))),
-            "icons/clock.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/clock.svg") as &[u8]))),
-            "icons/database.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/database.svg") as &[u8]))),
-            "icons/close.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/close.svg") as &[u8]))),
-            "icons/copy.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/copy.svg") as &[u8]))),
-            "icons/dash.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/dash.svg") as &[u8]))),
-            "icons/delete.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/delete.svg") as &[u8]))),
-            "icons/ellipsis-vertical.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/ellipsis-vertical.svg") as &[u8]))),
-            "icons/ellipsis.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/ellipsis.svg") as &[u8]))),
-            "icons/external-link.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/external-link.svg") as &[u8]))),
-            "icons/eye-off.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/eye-off.svg") as &[u8]))),
-            "icons/eye.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/eye.svg") as &[u8]))),
-            "icons/file.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/file.svg") as &[u8]))),
-            "icons/folder-closed.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/folder-closed.svg") as &[u8]))),
-            "icons/folder-open.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/folder-open.svg") as &[u8]))),
-            "icons/folder.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/folder.svg") as &[u8]))),
-            "icons/frame.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/frame.svg") as &[u8]))),
-            "icons/gallery-vertical-end.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/gallery-vertical-end.svg") as &[u8]))),
-            "icons/github.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/github.svg") as &[u8]))),
-            "icons/globe.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/globe.svg") as &[u8]))),
-            "icons/heart-off.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/heart-off.svg") as &[u8]))),
-            "icons/heart.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/heart.svg") as &[u8]))),
-            "icons/inbox.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/inbox.svg") as &[u8]))),
-            "icons/info.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/info.svg") as &[u8]))),
-            "icons/inspector.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/inspector.svg") as &[u8]))),
-            "icons/layout-dashboard.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/layout-dashboard.svg") as &[u8]))),
-            "icons/loader-circle.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/loader-circle.svg") as &[u8]))),
-            "icons/loader.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/loader.svg") as &[u8]))),
-            "icons/map.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/map.svg") as &[u8]))),
-            "icons/maximize.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/maximize.svg") as &[u8]))),
-            "icons/menu.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/menu.svg") as &[u8]))),
-            "icons/minimize.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/minimize.svg") as &[u8]))),
-            "icons/minus.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/minus.svg") as &[u8]))),
-            "icons/moon.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/moon.svg") as &[u8]))),
-            "icons/palette.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/palette.svg") as &[u8]))),
-            "icons/panel-bottom-open.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-bottom-open.svg") as &[u8]))),
-            "icons/panel-bottom.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-bottom.svg") as &[u8]))),
-            "icons/panel-left-close.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-left-close.svg") as &[u8]))),
-            "icons/panel-left-open.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-left-open.svg") as &[u8]))),
-            "icons/panel-left.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-left.svg") as &[u8]))),
-            "icons/panel-right-close.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-right-close.svg") as &[u8]))),
-            "icons/panel-right-open.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-right-open.svg") as &[u8]))),
-            "icons/panel-right.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/panel-right.svg") as &[u8]))),
-            "icons/plus.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/plus.svg") as &[u8]))),
-            "icons/redo-2.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/redo-2.svg") as &[u8]))),
-            "icons/redo.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/redo.svg") as &[u8]))),
-            "icons/replace.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/replace.svg") as &[u8]))),
-            "icons/resize-corner.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/resize-corner.svg") as &[u8]))),
-            "icons/search.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/search.svg") as &[u8]))),
-            "icons/settings-2.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/settings-2.svg") as &[u8]))),
-            "icons/settings.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/settings.svg") as &[u8]))),
-            "icons/sort-ascending.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/sort-ascending.svg") as &[u8]))),
-            "icons/sort-descending.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/sort-descending.svg") as &[u8]))),
-            "icons/square-terminal.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/square-terminal.svg") as &[u8]))),
-            "icons/star-off.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/star-off.svg") as &[u8]))),
-            "icons/star.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/star.svg") as &[u8]))),
-            "icons/sun.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/sun.svg") as &[u8]))),
-            "icons/thumbs-down.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/thumbs-down.svg") as &[u8]))),
-            "icons/thumbs-up.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/thumbs-up.svg") as &[u8]))),
-            "icons/triangle-alert.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/triangle-alert.svg") as &[u8]))),
-            "icons/undo-2.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/undo-2.svg") as &[u8]))),
-            "icons/undo.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/undo.svg") as &[u8]))),
-            "icons/user.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/user.svg") as &[u8]))),
-            "icons/window-close.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/window-close.svg") as &[u8]))),
-            "icons/window-maximize.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/window-maximize.svg") as &[u8]))),
-            "icons/window-minimize.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/window-minimize.svg") as &[u8]))),
-            "icons/window-restore.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/window-restore.svg") as &[u8]))),
-            "brands/fish.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/brands/fish.svg") as &[u8]))),
-            "icons/context-injection.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/context-injection.svg") as &[u8]))),
-            "brands/hero-glow.png" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/brands/hero-glow.png") as &[u8]))),
-            _ => Ok(None),
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path.is_empty() {
+            return Ok(None);
+        }
+        if let Some((_, bytes)) = LOCAL.iter().find(|(p, _)| *p == path) {
+            return Ok(Some(Cow::Borrowed(*bytes)));
+        }
+        // 官方源 miss 时返回 Err（anyhow "could not find asset"）——
+        // 组合语义里等价于 None
+        match self.icons.load(path) {
+            Ok(found) => Ok(found),
+            Err(_) => Ok(None),
         }
     }
 
-    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(vec![
-            "brands/fish.svg".into(),
-            "icons/context-injection.svg".into(),
-            "brands/hero-glow.png".into(),
-            "icons/a-large-small.svg".into(),
-            "icons/arrow-down.svg".into(),
-            "icons/arrow-left.svg".into(),
-            "icons/arrow-right.svg".into(),
-            "icons/arrow-up.svg".into(),
-            "icons/asterisk.svg".into(),
-            "icons/bell.svg".into(),
-            "icons/book-open.svg".into(),
-            "icons/bot.svg".into(),
-            "icons/building-2.svg".into(),
-            "icons/calendar.svg".into(),
-            "icons/case-sensitive.svg".into(),
-            "icons/chart-pie.svg".into(),
-            "icons/check.svg".into(),
-            "icons/chevron-down.svg".into(),
-            "icons/chevron-left.svg".into(),
-            "icons/chevron-right.svg".into(),
-            "icons/chevron-up.svg".into(),
-            "icons/chevrons-up-down.svg".into(),
-            "icons/circle-check.svg".into(),
-            "icons/circle-user.svg".into(),
-            "icons/circle-x.svg".into(),
-            "icons/close.svg".into(),
-            "icons/copy.svg".into(),
-            "icons/dash.svg".into(),
-            "icons/delete.svg".into(),
-            "icons/ellipsis-vertical.svg".into(),
-            "icons/ellipsis.svg".into(),
-            "icons/external-link.svg".into(),
-            "icons/eye-off.svg".into(),
-            "icons/eye.svg".into(),
-            "icons/file.svg".into(),
-            "icons/folder-closed.svg".into(),
-            "icons/folder-open.svg".into(),
-            "icons/folder.svg".into(),
-            "icons/frame.svg".into(),
-            "icons/gallery-vertical-end.svg".into(),
-            "icons/github.svg".into(),
-            "icons/globe.svg".into(),
-            "icons/heart-off.svg".into(),
-            "icons/heart.svg".into(),
-            "icons/inbox.svg".into(),
-            "icons/info.svg".into(),
-            "icons/inspector.svg".into(),
-            "icons/layout-dashboard.svg".into(),
-            "icons/loader-circle.svg".into(),
-            "icons/loader.svg".into(),
-            "icons/map.svg".into(),
-            "icons/maximize.svg".into(),
-            "icons/menu.svg".into(),
-            "icons/minimize.svg".into(),
-            "icons/minus.svg".into(),
-            "icons/moon.svg".into(),
-            "icons/palette.svg".into(),
-            "icons/panel-bottom-open.svg".into(),
-            "icons/panel-bottom.svg".into(),
-            "icons/panel-left-close.svg".into(),
-            "icons/panel-left-open.svg".into(),
-            "icons/panel-left.svg".into(),
-            "icons/panel-right-close.svg".into(),
-            "icons/panel-right-open.svg".into(),
-            "icons/panel-right.svg".into(),
-            "icons/plus.svg".into(),
-            "icons/redo-2.svg".into(),
-            "icons/redo.svg".into(),
-            "icons/replace.svg".into(),
-            "icons/resize-corner.svg".into(),
-            "icons/search.svg".into(),
-            "icons/settings-2.svg".into(),
-            "icons/settings.svg".into(),
-            "icons/sort-ascending.svg".into(),
-            "icons/sort-descending.svg".into(),
-            "icons/square-terminal.svg".into(),
-            "icons/star-off.svg".into(),
-            "icons/star.svg".into(),
-            "icons/sun.svg".into(),
-            "icons/thumbs-down.svg".into(),
-            "icons/thumbs-up.svg".into(),
-            "icons/triangle-alert.svg".into(),
-            "icons/undo-2.svg".into(),
-            "icons/undo.svg".into(),
-            "icons/user.svg".into(),
-            "icons/window-close.svg".into(),
-            "icons/window-maximize.svg".into(),
-            "icons/window-minimize.svg".into(),
-            "icons/window-restore.svg".into(),
-        ])
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        let mut out: Vec<SharedString> = self.icons.list(path).unwrap_or_default();
+        for (p, _) in LOCAL {
+            if p.starts_with(path) {
+                out.push((*p).into());
+            }
+        }
+        Ok(out)
     }
 }

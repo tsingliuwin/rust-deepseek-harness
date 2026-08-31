@@ -410,6 +410,9 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
                 if v.settings.transcript_view != mode {
                     v.settings.transcript_view = mode;
                     v.persist_settings();
+                    // 折叠派生在 ChatView 内，镜像须同步（否则 compact 切换
+                    // 不生效直到下一次会话切换）
+                    v.chat.update(cx, |c, _| c.transcript_view = mode);
                     cx.notify();
                 }
             });

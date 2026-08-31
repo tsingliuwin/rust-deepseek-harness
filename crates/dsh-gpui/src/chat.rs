@@ -168,7 +168,15 @@ impl ChatView {
                     return;
                 };
                 if dirty {
-                    let _ = tick.update(&mut cx, |v, _| v.invalidate_chat_heights());
+                    let _ = tick.update(&mut cx, |v, _| {
+                        v.invalidate_stream_tail();
+                        // splice 对 old_range 内的滚动锚会回拽到范围头，
+                        // 贴底态须立即重新锚定到底，否则视口跳到该条开头
+                        if v.list_bottom.get() {
+                            let n = v.chat_item_count();
+                            v.chat_list.scroll_to(ListOffset { item_ix: n, offset_in_item: px(0.) });
+                        }
+                    });
                     let _ = tick.update(&mut cx, |_, cx| cx.notify());
                 }
             }
@@ -196,18 +204,31 @@ impl ChatView {
         }
         self.chat_items = n;
         if n > 0 && (force_bottom || self.list_bottom.get()) {
-            self.chat_list.scroll_to_reveal_item(n - 1);
+            // 贴底锚定用逻辑偏移（item_ix = n = 列表末边界），不依赖各条
+            // 已测高度。曾用 scroll_to_reveal_item(n-1)：它按陈旧高度和算
+            // 底部位置，流式时最后一条持续长高，目标偏移反复偏差 → 上下闪
+            self.chat_list.scroll_to(ListOffset { item_ix: n, offset_in_item: px(0.) });
         }
     }
 
-    /// 条目高度失效：内容高度不经 splice/reset 变化（展开收起、流式文本
-    /// 增长）时，列表按陈旧行高排布、行间重叠；标记全部 Unmeasured 重测，
-    /// 滚动锚点由 splice 自行调整。
-    fn invalidate_chat_heights(&self) {
+    /// 条目高度失效（区间化）：内容高度不经 splice/reset 变化（展开收起、
+    /// 折叠切换、流式文本增长）时，列表按陈旧行高排布、行间重叠，需把对应
+    /// 条目标记 Unmeasured 重测。此前全量 splice(0..n) 除把所有高度清零
+    /// 外，还会把 old_range 内的滚动锚拽回范围头（= 列表顶），再被下一个
+    /// 流式事件拉回底部——高帧率下表现为周期性上下闪。
+    fn invalidate_chat_heights_range(&self, range: std::ops::Range<usize>) {
         let n = self.chat_item_count();
-        if n > 0 {
-            self.chat_list.splice(0..n, n);
+        let end = range.end.min(n);
+        if range.start < end {
+            self.chat_list.splice(range.start..end, end - range.start);
         }
+    }
+
+    /// 流式文本增长的高度失效：只有最后一条消息（与状态行）在长高。
+    fn invalidate_stream_tail(&self) {
+        let last_entry = self.entries.len().saturating_sub(1);
+        let n = self.chat_item_count();
+        self.invalidate_chat_heights_range(last_entry..n);
     }
 
     /// 消息流当前是否贴底（scroll handler 维护的可见范围判断）。
@@ -1061,7 +1082,7 @@ open: false,
                                             tool.expanded = !tool.expanded;
                                         }
                                         // 折叠/展开改了条目高度：列表须重测
-                                        v.invalidate_chat_heights();
+                                        v.invalidate_chat_heights_range(ei..ei + 1);
                                         cx.notify();
                                     });
                                 },
@@ -1094,7 +1115,7 @@ open: false,
                                                     tool.expanded = !tool.expanded;
                                                 }
                                                 // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
+                                                v.invalidate_chat_heights_range(ei..ei + 1);
                                                 cx.notify();
                                             });
                                         },
@@ -1117,7 +1138,7 @@ open: false,
                                                     tool.expanded = !tool.expanded;
                                                 }
                                                 // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
+                                                v.invalidate_chat_heights_range(ei..ei + 1);
                                                 cx.notify();
                                             });
                                         },
@@ -1140,7 +1161,7 @@ open: false,
                                                     tool.expanded = !tool.expanded;
                                                 }
                                                 // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
+                                                v.invalidate_chat_heights_range(ei..ei + 1);
                                                 cx.notify();
                                             });
                                         }
@@ -1188,7 +1209,7 @@ open: false,
                                                     tool.expanded = !tool.expanded;
                                                 }
                                                 // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
+                                                v.invalidate_chat_heights_range(ei..ei + 1);
                                                 cx.notify();
                                             });
                                         },
@@ -1212,7 +1233,7 @@ open: false,
                                                     tool.expanded = !tool.expanded;
                                                 }
                                                 // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
+                                                v.invalidate_chat_heights_range(ei..ei + 1);
                                                 cx.notify();
                                             });
                                         }
@@ -1238,7 +1259,7 @@ open: false,
                                                     tool.expanded = !tool.expanded;
                                                 }
                                                 // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
+                                                v.invalidate_chat_heights_range(ei..ei + 1);
                                                 cx.notify();
                                             });
                                         },
@@ -1262,7 +1283,7 @@ open: false,
                                                     tool.expanded = !tool.expanded;
                                                 }
                                                 // 折叠/展开改了条目高度：列表须重测
-                                                v.invalidate_chat_heights();
+                                                v.invalidate_chat_heights_range(ei..ei + 1);
                                                 cx.notify();
                                             });
                                         }
@@ -1293,7 +1314,7 @@ open: false,
                                             tool.expanded = !tool.expanded;
                                         }
                                         // 折叠/展开改了条目高度：列表须重测
-                                        v.invalidate_chat_heights();
+                                        v.invalidate_chat_heights_range(ei..ei + 1);
                                         cx.notify();
                                     });
                                 }
@@ -1810,9 +1831,9 @@ impl Render for ChatView {
                                                     if !v.turn_expanded.remove(&e.turn) {
                                                         v.turn_expanded.insert(e.turn);
                                                     }
-                                                    // 成员从零高占位 ↔ 完整条目，
-                                                    // 高度大变：列表须重测，否则重叠
-                                                    v.invalidate_chat_heights();
+                                                    // 成员从零高占位 ↔ 完整条目，该轮
+                                                    // 条目高度集体变化：区间失效重测
+                                                    v.invalidate_chat_heights_range(f.first_process..f.answer + 1);
                                                     cx.notify();
                                                 });
                                             },

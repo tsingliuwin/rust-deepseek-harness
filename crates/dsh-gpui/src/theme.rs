@@ -245,9 +245,9 @@ pub fn apply(mode: ThemeMode, cx: &mut gpui::App) {
 // --- 字号标尺（`--dsw-font-*`，主题无关） -----------------------------------
 
 #[allow(dead_code)]
-pub const FONT_MARKDOWN_BASE: f32 = 16.0; // 16/28 正文
+pub const FONT_MARKDOWN_BASE: f32 = 14.0; // 14/24 正文（web --dsw-font-markdown-base）
 #[allow(dead_code)]
-pub const FONT_MARKDOWN_BASE_LEADING: f32 = 28.0;
+pub const FONT_MARKDOWN_BASE_LEADING: f32 = 24.0;
 /// 用户气泡 16/24。
 pub const FONT_BUBBLE: f32 = 16.0;
 pub const FONT_BUBBLE_LEADING: f32 = 24.0;

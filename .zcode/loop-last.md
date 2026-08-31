@@ -2,6 +2,16 @@
 
 每次 `/loop` 后追加一节；下一次复查先比对此处，确认旧修复未复发。
 
+## 2026-08-31 · 第 16 轮（输出排版对齐 web）
+
+- **用户要求**：参考 dsh web 端输出文字的行间距/字间距等。
+- **对照**：web MarkdownText.module.css + ui-theme `--dsw-font-markdown-*`——正文 **14px/24px**、标题 700 weight 21/30、19/28、18/26、h4 600 14/24、段间距 16px（首尾清零）、行内 code 12/19 + bg + padding 0 5px、strong 600。
+- **gpui 原状**：正文 ~16/26（继承默认）、标题 24/22/20/16、段/块间距 12px——整体大一档。
+- **修复**：MarkdownBlock 正文显式 `text_size(14)/line_height(24)`（FONT_MARKDOWN_BASE 常量同步 16/28→14/24）；标题标尺 21/19/18/14、base 14；段间 gap 12→16。
+- **上游限制（沿用第 11 轮 backlog）**：行内 code 背景无 padding、标题字重/行高无旋钮——TextViewStyle 只暴露 heading 字号；要完全对齐需 vendor patch。
+- **验证**：54 测试全绿；18:18 二进制已部署，待用户目测。
+- **下轮重点**：① 输出正文字号/行距与 web 观感一致；② 标题层级清晰；③ 全部历史验收项。
+
 ## 2026-08-31 · 第 15 轮（两侧空白仍不滚——wrapper 转发）
 
 - **残留死区**：列表 hitbox 只覆盖内容列（gpui list 自身 bounds），px_8 挪进 List 也不改变命中链——两侧空白在列表命中范围之外。

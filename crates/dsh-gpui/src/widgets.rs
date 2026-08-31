@@ -160,6 +160,8 @@ impl RenderOnce for MarkdownBlock {
                     }
                     col = col.child(
                         TextView::markdown(self.id * 1000 + i * 2, text, window, cx)
+                            .text_size(px(theme::FONT_MARKDOWN_BASE))
+                            .line_height(px(theme::FONT_MARKDOWN_BASE_LEADING))
                             .style(style.clone()),
                     );
                 }

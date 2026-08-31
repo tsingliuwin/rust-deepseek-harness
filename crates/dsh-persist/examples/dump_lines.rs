@@ -28,6 +28,8 @@ fn main() {
                         dsh_session::SessionEvent::RequestHeader { .. } => "request/header",
                         dsh_session::SessionEvent::RequestContext(_) => "request/context",
                         dsh_session::SessionEvent::SessionTitle { .. } => "session/title",
+                        dsh_session::SessionEvent::LlmRetry { .. } => "llm/retry",
+                        dsh_session::SessionEvent::LlmRetryStarted { .. } => "llm/retry-started",
                         dsh_session::SessionEvent::Compaction { .. } => "compaction",
                     };
                     *counts.entry(k).or_insert(0) += 1;

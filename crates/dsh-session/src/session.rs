@@ -94,6 +94,23 @@ pub enum SessionEvent {
     /// 会话标题（log-only，latest-wins；不进模型可见面）。
     /// web SessionTitleEventData 的 title 部分（messageSeqs/source 不落盘）。
     SessionTitle { title: String },
+    /// 一次 provider 路由重试等待排定前的持久记录（web `llm/retry`，
+    /// LlmRetryEventData：normal 模式带 maxRetries，always 模式不带）。
+    LlmRetry {
+        retry_id: String,
+        turn: u64,
+        step: u64,
+        provider: String,
+        mode: String,
+        policy_key: String,
+        retry: u32,
+        max_retries: Option<u32>,
+        delay_ms: u64,
+        failure: dsh_llm::LlmFailure,
+    },
+    /// 一次重试等待完成、下一次请求尝试开始前的持久迁移（web
+    /// `llm/retry-started`）。
+    LlmRetryStarted { retry_id: String, turn: u64, step: u64, retry: u32 },
 }
 
 /// A log entry: the event plus its monotonic sequence number.

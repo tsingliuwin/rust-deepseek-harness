@@ -32,6 +32,8 @@ impl AssetSource for AppAssets {
             "icons/circle-check.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/circle-check.svg") as &[u8]))),
             "icons/circle-user.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/circle-user.svg") as &[u8]))),
             "icons/circle-x.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/circle-x.svg") as &[u8]))),
+            "icons/clock.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/clock.svg") as &[u8]))),
+            "icons/database.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/database.svg") as &[u8]))),
             "icons/close.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/close.svg") as &[u8]))),
             "icons/copy.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/copy.svg") as &[u8]))),
             "icons/dash.svg" => Ok(Some(Cow::Borrowed(include_bytes!("../assets/icons/dash.svg") as &[u8]))),

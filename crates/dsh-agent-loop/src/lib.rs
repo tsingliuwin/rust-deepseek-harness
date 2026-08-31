@@ -23,15 +23,85 @@ use dsh_llm::{
     AbortSignal, BlockAssembler, CallId, ContentBlock, FinishReason, GenerateOptions, LlmCallConfig,
     LlmRuntime, Message, SessionId, StreamChunk,
 };
+use dsh_session::SessionEntry;
 use dsh_session::{EpochHeader, HeaderReason, Session, SessionEvent, TurnEndReason};
+use dsh_session_projection::{Disposer, ProjectionDefinition, SessionProjections};
 use dsh_system_prompt::{PromptAssembly, SystemPrompt};
 use dsh_tools::{ToolExecutionInput, ToolExecutionResult, ToolRegistry};
 use flume::{Receiver, Sender};
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Notify;
 
 pub mod retry;
+
+/// 一步的边界事实（`step/start` 或 `step/end` 及其 seq）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepBoundary {
+    pub kind: StepBoundaryKind,
+    pub seq: u64,
+}
+
+/// 边界种类。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StepBoundaryKind {
+    Start,
+    End,
+}
+
+/// 从单个 agent 会话日志折叠出的轮次/步边界事实（web
+/// `TurnBoundaryProjection`，由 dsh-agent-loop 注册 `turnBoundary` 单元）。
+///
+/// 读方契约：key 由 agent-loop 注册，缺席即「无打开轮次 / 无边界」的能力
+/// 缺席而非损坏状态；对缺席无安全回退的读方（如 step-open 判定）可以
+/// 显式报错（上游同一注释）。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnBoundaryProjection {
+    /// 打开轮次的 `turn/start` seq；轮次之间为 null。
+    pub open_turn_start_seq: Option<u64>,
+    /// 最近一次 `step/start` 的 seq；首步前为 null。
+    pub last_step_start_seq: Option<u64>,
+    /// 最近的步边界（start 或 end）及其 seq。
+    pub last_step_boundary: Option<StepBoundary>,
+    /// 最近 `turn/start` 的轮次号；首轮前为 0。
+    pub last_turn: u64,
+}
+
+/// `turnBoundary` 投影定义（stateVersion 与上游一致为 2；注册放在全部
+/// config 校验之后是上游注释的语义——被拒绝的构造不留下投影单元）。
+pub fn turn_boundary_projection_definition() -> ProjectionDefinition<TurnBoundaryProjection> {
+    ProjectionDefinition {
+        key: "turnBoundary",
+        state_version: 2,
+        init: TurnBoundaryProjection::default,
+        apply: |state, entry: &SessionEntry| {
+            let mut next = state.clone();
+            match &entry.event {
+                SessionEvent::TurnStart { turn } => {
+                    next.open_turn_start_seq = Some(entry.seq);
+                    next.last_turn = *turn;
+                }
+                SessionEvent::TurnEnd { .. } => {
+                    next.open_turn_start_seq = None;
+                }
+                SessionEvent::StepStart { .. } => {
+                    next.last_step_start_seq = Some(entry.seq);
+                    next.last_step_boundary =
+                        Some(StepBoundary { kind: StepBoundaryKind::Start, seq: entry.seq });
+                }
+                SessionEvent::StepEnd { .. } => {
+                    next.last_step_boundary =
+                        Some(StepBoundary { kind: StepBoundaryKind::End, seq: entry.seq });
+                }
+                _ => {}
+            }
+            next
+        },
+    }
+}
 
 /// Static configuration for one agent.
 #[derive(Clone, Debug)]
@@ -83,12 +153,16 @@ pub struct ReactLoopAgent {
     llm: Arc<LlmRuntime>,
     tools: Arc<ToolRegistry>,
     prompt: Arc<SystemPrompt>,
+    projections: Arc<SessionProjections>,
     events: EventBus,
     wake: Arc<Notify>,
     abort: Arc<Mutex<AbortSignal>>,
     status: Arc<Mutex<AgentStatus>>,
     ui_events: Mutex<Option<Sender<AgentEvent>>>,
     on_event: Mutex<Option<EventSink>>,
+    /// `turnBoundary` 注册的撤销柄（注册随 agent 存活，上游 rode the fiber）。
+    /// Mutex 使整体保持 Sync（Disposer 本身只是 Send）。
+    _turn_boundary_registration: Mutex<Option<Disposer>>,
 }
 
 /// Side-channel observer for every appended session event.
@@ -101,8 +175,12 @@ impl ReactLoopAgent {
         llm: Arc<LlmRuntime>,
         tools: Arc<ToolRegistry>,
         prompt: Arc<SystemPrompt>,
+        projections: Arc<SessionProjections>,
         events: EventBus,
     ) -> Arc<Self> {
+        // 注册柄由 agent 持有：注册随 agent 存活，disposer 的强引用反过来
+        // 保证注册表不会先于 agent 消失。
+        let turn_boundary_registration = projections.register(turn_boundary_projection_definition());
         Arc::new(Self {
             options: Arc::new(RwLock::new(options)),
             session: Arc::new(Mutex::new(Session::new(id))),
@@ -110,12 +188,14 @@ impl ReactLoopAgent {
             llm,
             tools,
             prompt,
+            projections,
             events,
             wake: Arc::new(Notify::new()),
             abort: Arc::new(Mutex::new(AbortSignal::new())),
             status: Arc::new(Mutex::new(AgentStatus::Idle)),
             ui_events: Mutex::new(None),
             on_event: Mutex::new(None),
+            _turn_boundary_registration: Mutex::new(Some(turn_boundary_registration)),
         })
     }
 
@@ -132,8 +212,21 @@ impl ReactLoopAgent {
 
     /// Replace the agent's session (session switching). The inbox is cleared.
     pub fn set_session(&self, session: Session) {
+        self.projections.forget_session(&self.session.lock().unwrap());
         *self.session.lock().unwrap() = session;
         self.inbox.lock().unwrap().clear();
+    }
+
+    /// Append one event to the session log and fan it out to the sink
+    /// (persistence). Public seam for log-writing plugins (upstream
+    /// `agent.session.append(...)`): retry events ride this too.
+    pub fn append_session_event(&self, event: SessionEvent) {
+        self.append_event(event);
+    }
+
+    /// The projection registry this agent folds boundary facts into.
+    pub fn projections(&self) -> Arc<SessionProjections> {
+        Arc::clone(&self.projections)
     }
 
     /// Register a side-channel observer for every appended session event
@@ -332,9 +425,15 @@ impl ReactLoopAgent {
     }
 
     async fn run_turn(&self) {
+        // 上游 agent.ts：lastTurn 从 turnBoundary 投影读取（key 恒在——
+        // 本 crate 注册了它），缺席回退 0 只是类型层面的兜底。
         let turn = {
             let s = self.session.lock().unwrap();
-            s.last_turn() + 1
+            self.projections
+                .state_of(&s, "turnBoundary")
+                .and_then(|v| v.get("lastTurn").and_then(|t| t.as_u64()))
+                .unwrap_or(0)
+                + 1
         };
         self.append_event(SessionEvent::TurnStart { turn });
         self.emit_ui(AgentEvent::TurnStarted { turn });

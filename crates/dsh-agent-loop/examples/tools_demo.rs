@@ -66,14 +66,15 @@ async fn main() {
     let _h = llm.register_adapter(&["mock".to_string()], Arc::new(FsMockAdapter)).unwrap();
 
     let tools = Arc::new(ToolRegistry::new());
-    let _fs = tools.register(Arc::new(FsTool)).unwrap();
+    let _fs = tools.register(Arc::new(FsTool::default())).unwrap();
 
     let agent = ReactLoopAgent::new(
         SessionId::new("fs-demo"),
-        AgentOptions { provider: "mock".into(), model: "mock".into(), max_tokens: None, system_prompt: None, compaction: Default::default() },
+        AgentOptions { provider: "mock".into(), model: "mock".into(), max_tokens: None, system_prompt: None, compaction: Default::default(), workdir: Default::default() },
         llm,
         tools,
         Arc::new(SystemPrompt::new()),
+        Arc::new(dsh_session_projection::SessionProjections::default()),
         events,
     );
     let _rx = agent.subscribe();

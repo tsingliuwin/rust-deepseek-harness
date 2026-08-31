@@ -12,6 +12,8 @@ dsh-tools = { path = "../dsh-tools" }
 dsh-system-prompt = { path = "../dsh-system-prompt" }
 dsh-agent = { path = "../dsh-agent" }
 dsh-compaction = { path = "../dsh-compaction" }
+dsh-session-projection = { path = "../dsh-session-projection" }
+uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true

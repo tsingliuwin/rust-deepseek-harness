@@ -12,6 +12,7 @@ dsh-llm = { path = "../dsh-llm" }
 dsh-tools = { path = "../dsh-tools" }
 dsh-system-prompt = { path = "../dsh-system-prompt" }
 dsh-agent-loop = { path = "../dsh-agent-loop" }
+dsh-session-projection = { path = "../dsh-session-projection" }
 dsh-llm-deepseek = { path = "../dsh-llm-deepseek" }
 dsh-fs = { path = "../dsh-fs" }
 dsh-shell = { path = "../dsh-shell" }
@@ -28,5 +29,6 @@ async-stream.workspace = true
 uuid.workspace = true
 serde.workspace = true
 serde_yaml = "0.9"
+chrono = "0.4"
 rfd = "0.15"
 serde_json.workspace = true

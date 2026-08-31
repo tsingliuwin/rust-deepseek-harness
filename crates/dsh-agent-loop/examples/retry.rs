@@ -65,7 +65,11 @@ impl LlmAdapter for FlakyAdapter {
 #[tokio::main]
 async fn main() {
     let events = EventBus::new();
-    let _retry = attach_retry(&events);
+    // 0.1.2-alpha.2 起：重试进度持久进会话日志（llm/retry 事件），计数从
+    // llmRetry 投影读取——安装点需要投影注册表与 agent 槽。
+    let projections = Arc::new(dsh_session_projection::SessionProjections::default());
+    let agent_slot: Arc<std::sync::OnceLock<Arc<ReactLoopAgent>>> = Arc::new(std::sync::OnceLock::new());
+    let _retry = attach_retry(&events, Arc::clone(&projections), Arc::clone(&agent_slot));
 
     let llm = Arc::new(LlmRuntime::with_events(events.clone()));
     let adapter = Arc::new(FlakyAdapter { calls: AtomicU32::new(0) });
@@ -84,8 +88,10 @@ async fn main() {
         llm,
         Arc::new(ToolRegistry::new()),
         Arc::new(SystemPrompt::new()),
+        Arc::new(dsh_session_projection::SessionProjections::default()),
         events,
     );
+    let _ = agent_slot.set(Arc::clone(&agent));
     let _rx = agent.subscribe();
     agent.spawn();
 

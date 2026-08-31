@@ -1,0 +1,12 @@
+[package]
+name = "dsh-session-projection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dsh-cordis = { path = "../cordis" }
+dsh-session = { path = "../dsh-session" }
+dsh-llm = { path = "../dsh-llm" }
+serde = { workspace = true }
+serde_json = { workspace = true }

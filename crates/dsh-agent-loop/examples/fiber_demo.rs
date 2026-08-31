@@ -92,7 +92,7 @@ impl Plugin for PromptPlugin {
             .and_then(|v| v.as_str())
             .unwrap_or("(default prompt)")
             .to_string();
-        let disposer = prompt.add_section(PromptSection { name: "prompt-plugin".into(), text });
+        let disposer = prompt.add_section(PromptSection { name: "prompt-plugin".into(), order: 0, text });
         scope.effect(dsh_cordis::Effect::from_box(disposer));
         Ok(())
     }
@@ -114,6 +114,7 @@ impl Plugin for GreeterPlugin {
         let prompt = scope.get::<SystemPrompt>().expect("SystemPrompt");
         let disposer = prompt.add_section(PromptSection {
             name: "greeter-plugin".into(),
+            order: 0,
             text: format!("greeting: {}", greeter.0),
         });
         scope.effect(dsh_cordis::Effect::from_box(disposer));

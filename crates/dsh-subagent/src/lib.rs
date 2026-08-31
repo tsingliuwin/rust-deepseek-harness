@@ -16,6 +16,7 @@ use dsh_cordis::event::EventBus;
 use dsh_llm::types::ContentBlock;
 use dsh_llm::LlmRuntime;
 use dsh_session::{Session, SessionEvent};
+use dsh_session_projection::SessionProjections;
 use dsh_system_prompt::SystemPrompt;
 use dsh_tools::{Tool, ToolDefinition, ToolExecutionInput, ToolExecutionResult};
 
@@ -35,6 +36,8 @@ pub struct SubagentTool {
     depth: Arc<AtomicU32>,
     /// 允许的最大嵌套层数。
     max_depth: u32,
+    /// 子 agent 会话投影注册表（默认独立；宿主可共享自己的注册表）。
+    projections: Arc<SessionProjections>,
     /// 单次子任务等待上限。
     timeout: Duration,
 }
@@ -57,8 +60,17 @@ impl SubagentTool {
             system_prompt: None,
             depth: Arc::new(AtomicU32::new(0)),
             max_depth: 2,
+            projections: Arc::new(SessionProjections::default()),
             timeout: Duration::from_secs(300),
         })
+    }
+
+    /// 共享宿主的投影注册表（子 agent 的 turnBoundary 折进同一注册表）。
+    pub fn with_projections(mut self: Arc<Self>, projections: Arc<SessionProjections>) -> Arc<Self> {
+        if let Some(tool) = Arc::get_mut(&mut self) {
+            tool.projections = projections;
+        }
+        self
     }
 
     /// 覆盖子 agent 的基础 system prompt 与 token 上限。
@@ -179,6 +191,7 @@ prompt as a complete brief. This call waits for the subagent and returns its fin
             Arc::clone(&self.llm),
             Arc::clone(&self.tools),
             Arc::clone(&self.prompt),
+            Arc::clone(&self.projections),
             EventBus::new(),
         );
         let _events = child.subscribe(); // 子事件隔离：留接收端防背压，不转发

@@ -448,7 +448,7 @@ mod tests {
             // 显式传 path（进程级 cwd 在并行测试里不可依赖）
             format!(r#"{{"pattern": "alpha", "path": {}}}"#, serde_json::to_string(&dir).unwrap()).into(),
         );
-        let result = GrepTool.execute(&input).await;
+        let result = GrepTool::default().execute(&input).await;
         let ToolExecutionResult { content, is_error, .. } = &result;
         assert!(!is_error, "{result:?}");
         let text = content
@@ -513,7 +513,7 @@ mod tests {
                 "glob".into(),
                 raw,
             );
-            GlobTool.execute(&input).await
+            GlobTool::default().execute(&input).await
         };
         // basename 模式：*.rs 命中任意深度，剔除 .git 内文件；skipped.rs 在根上
         let result = run(format!(r#"{{"pattern": "*.rs", "path": {}}}"#, serde_json::to_string(&dir).unwrap())).await;

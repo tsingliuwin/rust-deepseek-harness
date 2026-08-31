@@ -11,6 +11,7 @@ dsh-session = { path = "../dsh-session" }
 dsh-tools = { path = "../dsh-tools" }
 dsh-system-prompt = { path = "../dsh-system-prompt" }
 dsh-agent-loop = { path = "../dsh-agent-loop" }
+dsh-session-projection = { path = "../dsh-session-projection" }
 async-trait.workspace = true
 tokio.workspace = true
 uuid.workspace = true

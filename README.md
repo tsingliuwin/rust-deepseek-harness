@@ -71,6 +71,15 @@ cargo run -p dsh-agent-loop --example tools_demo
 
 17. **轮次过程折叠**（同步 web 0.1.2-alpha.1 的 8b09a0be52）：已完成轮次在 compact 视图（默认）下，把最终答案之前的 Think/早前回复/工具行折叠为单一控制行（计数省零、全零「已思考」、subagent 单列），点击展开整组；答案条目折叠时隐藏本步 reasoning；打开的轮次永不折叠；设置「对话视图」= `ui-chat.transcriptView`。
 
+18. **同步 web 0.1.2-alpha.2**（dsh-v0.1.2-alpha.1 → dsh-v0.1.2-alpha.2，2026-08-31 分析落地）：
+    - **轮次尾部双药丸**（bb1df10c69 + 9effa0c6b3 + 6f16d5868c + 21d039be1b）：助手消息 footer 塌缩为「用量」药丸（database 图标 + 紧凑总数 tok）与「用时」药丸（clock 图标 + 总用时），点击各自弹出详情对话框——用量（提供方/模型、缓存命中率、未缓存输入/缓存读取/缓存写入/输出含推理、标题行精确总数）与用时（总用时、TPS、TTFT；文案「首 token 平均用时」对齐 label 修正）；日历时钟文本缀在药丸后（同日 `HH:mm` / 今年 `M月D日 HH:mm` / 跨年 `Y年M月D日 HH:mm`）；无用量数据的轮次保持纯文本用时行。TTFT 取本步首 token 延迟、TPS 按轮 LLM 时间（轮用时 − 工具时间）折算。新增 lucide `clock.svg`/`database.svg` 补齐图标集。
+    - **session-projection 注册表**（新 crate `dsh-session-projection`）：`{key, stateVersion, init, apply}` 声明式投影单元，按 key 注册计数、按会话增量折叠（基线缓存）。agent-loop 注册 `turnBoundary`（openTurnStartSeq/lastStepStartSeq/lastStepBoundary/lastTurn，stateVersion 2，注册柄随 agent 存活），`ReactLoopAgent` 的 lastTurn 改从投影读取，不再 `findLast` 扫日志。
+    - **llm-retry 改为事件 + 投影**：`SessionEvent` 新增 `LlmRetry`/`LlmRetryStarted`（web `llm/retry`/`llm/retry-started` 逐字形状：normal 带 maxRetries、always 不带；retryId 链内稳定）；`attach_retry(events, projections, agent_slot)` 重试计数从 `llmRetry` 投影读取（按 `[provider, policyKey]` 分桶，`step/start` 与 `turn/end` 清零），provider `retry-after` 优先于退避、封顶 `max_delay_ms`；重试历史持久进会话日志，崩溃/恢复不丢不重放。
+    - **system-prompt 顺序集中分配**：`PromptSection` 增加 `order`，渲染按 `(order, name)` 升序；`SECTION_ORDERS`（上游全表 -1000…9900）与 `CONTEXT_ORDERS`（SANDBOX_POLICY 110/APPROVAL_POLICY 115/SUBAGENT_DELEGATION 120）私有化，消费方经 `get_section_order`/`get_context_order` 服务 API 查询（remove cross-package runtime relays 同语义）。
+    - **ignorable 事件契约**：persist 读取路径三分支——词汇表内未映射类型（web 宿主事件）按已知忽略；词汇表外且信封带 `ignorable: true` 的纯信息记录安全跳过；词汇表外且必读的未知类型**拒绝解释整份日志**（fail-closed，多半是更新版本 harness 所写）。`KNOWN_SESSION_EVENT_TYPES` 对齐上游 alpha.2 全集。
+    - **web_search 失败指引**（web-search-deepseek provider）：dispatch 之后的失败统一带 endpoint 与恢复指引（Settings > Plugins > Web search / `DEEPSEEK_SEARCH_BASE_URL`，"只有用户本人应选择或更改端点"），HTTP 错误消息改为「基础状态 + detail 追加」形状。
+    - 上游同版其余变更经评估不适用或无对应物：vendor cordis 仅版本号；`brandString` 运行时品牌（Rust newtype 本就名义类型）；settings `installSection` 注入式重构（无 settings 服务）；`RemoteError` 词汇收敛（无 typert remote 面）；连接恢复指示器（原生直连无网关 websocket）；插件清单/agent-preset/权限预设 UI（无插件与权限系统）；@ 菜单 stale-while-revalidate 与 CSS 修版。
+
 **下一步**（可选细化）：subagent 后台运行/持久化子会话（web 的 continuation 服务）；glob 超上限的顶层轮询采样（web sampleAcrossTopLevel）；压缩的 TokenMeter 精确计价与 compaction-tool-result-pruner；PTY 会话（参考实现同样推迟）；搜索卡 paths 形态的 UI 与 glob 输出已落地，结构化元数据通道（web presentationMeta）待 dsh-tools 增设 meta 缝后切换。
 
 ## 备注

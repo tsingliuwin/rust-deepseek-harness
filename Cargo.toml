@@ -5,6 +5,7 @@ members = [
   "crates/dsh-llm",
   "crates/dsh-llm-deepseek",
   "crates/dsh-session",
+  "crates/dsh-session-projection",
   "crates/dsh-tools",
   "crates/dsh-system-prompt",
   "crates/dsh-agent",

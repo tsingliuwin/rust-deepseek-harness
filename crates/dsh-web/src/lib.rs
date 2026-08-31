@@ -130,11 +130,14 @@ impl WebSearchTool {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("DeepSeek search request failed: {e}"))?;
+            .map_err(|e| search_endpoint_error(&endpoint, &format!("DeepSeek search request failed: {e}")))?;
         let status = resp.status();
         let payload: serde_json::Value = resp.text().await.ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
         if !status.is_success() {
-            let detail = payload
+            // 上游同构：基础消息带 HTTP 状态，可解析的错误 body 只追加更丰富
+            // 的 detail（网关 5xx/429 的非 JSON body 不损失真实错误）。
+            let mut message = format!("DeepSeek API error (HTTP {})", status.as_u16());
+            if let Some(detail) = payload
                 .get("error")
                 .map(|e| {
                     e.as_str()
@@ -142,8 +145,12 @@ impl WebSearchTool {
                         .or_else(|| e.get("message").and_then(|m| m.as_str()).map(str::to_string))
                 })
                 .flatten()
-                .unwrap_or_else(|| format!("DeepSeek API error (HTTP {})", status.as_u16()));
-            return Err(detail);
+                .filter(|d| !d.is_empty())
+            {
+                message.push_str(": ");
+                message.push_str(&detail);
+            }
+            return Err(search_endpoint_error(&endpoint, &message));
         }
         // content 块：text = provider 答案；web_search_tool_result = 结构化来源
         let mut answer = String::new();
@@ -178,8 +185,12 @@ impl WebSearchTool {
             }
         }
         if answer.is_empty() && sources.is_empty() {
-            // 结果块缺失 = 错误而非散文回退（web 同语义）
-            return Err("DeepSeek search returned no web_search result blocks".into());
+            // 结果块缺失 = 错误而非散文回退（web 同语义）；dispatch 之后的
+            // 失败按上游统一带 endpoint 与配置指引。
+            return Err(search_endpoint_error(
+                &endpoint,
+                "DeepSeek returned an unprocessable response body: no web_search result blocks",
+            ));
         }
         Ok((answer, sources))
     }
@@ -302,4 +313,15 @@ mod tests {
         let out = WebSearchTool::format_output("", &[WebSearchSource { url: "u".into(), title: None, page_age: None }], true);
         assert!(out.contains("Showing the first 20 sources."));
     }
+}
+
+/// 给 dispatch 之后的失败追加 endpoint 与恢复指引（上游 `searchEndpointError`
+/// 逐字语义：模型据此引导用户改搜索端点——只有用户本人应选择或更改端点）。
+fn search_endpoint_error(endpoint: &str, message: &str) -> String {
+    format!(
+        "{message}
+
+The web search request used endpoint {}. Search endpoint configuration is separate from chat. If that endpoint is not intended, guide the user to Settings > Plugins > Plugin configuration > Web search, where they can change and save Endpoint. If that settings page is unavailable, the user can set DEEPSEEK_SEARCH_BASE_URL or configure web-search-deepseek.baseURL to a trusted Anthropic-compatible Messages API base. Only the user should choose or change the endpoint.",
+        serde_json::to_string(endpoint).unwrap_or_else(|_| format!("\"{endpoint}\""))
+    )
 }

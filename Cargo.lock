@@ -1501,6 +1501,7 @@ dependencies = [
  "dsh-fs",
  "dsh-llm",
  "dsh-session",
+ "dsh-session-projection",
  "dsh-shell",
  "dsh-system-prompt",
  "dsh-tools",
@@ -1511,6 +1512,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1544,6 +1546,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "chrono",
  "dsh-agent-loop",
  "dsh-compaction",
  "dsh-cordis",
@@ -1553,6 +1556,7 @@ dependencies = [
  "dsh-persist",
  "dsh-search",
  "dsh-session",
+ "dsh-session-projection",
  "dsh-shell",
  "dsh-subagent",
  "dsh-system-prompt",
@@ -1636,6 +1640,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dsh-session-projection"
+version = "0.1.0"
+dependencies = [
+ "dsh-cordis",
+ "dsh-llm",
+ "dsh-session",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dsh-shell"
 version = "0.1.0"
 dependencies = [
@@ -1655,6 +1670,7 @@ dependencies = [
  "dsh-cordis",
  "dsh-llm",
  "dsh-session",
+ "dsh-session-projection",
  "dsh-system-prompt",
  "dsh-tools",
  "serde_json",

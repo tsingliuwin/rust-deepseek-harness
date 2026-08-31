@@ -108,6 +108,7 @@ async fn main() {
         llm,
         tools,
         prompt,
+        Arc::new(dsh_session_projection::SessionProjections::default()),
         events,
     );
 

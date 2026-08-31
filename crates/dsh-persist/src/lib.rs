@@ -276,13 +276,13 @@ impl SessionRecorder {
         if let Some(cwd) = cwd_hint {
             let file = self.session_file(id, cwd);
             if file.exists() {
-                let events = self.read_events(&file);
+                let events = self.read_events(&file)?;
                 return Ok((Session::from_events(id.clone(), events), Some(cwd.to_string())));
             }
         }
         // 2) 扫描所有 project 目录找该 id（多桶副本取最近修改）
         if let Some(file) = self.resolve_file(id, None) {
-            let events = self.read_events(&file);
+            let events = self.read_events(&file)?;
             let cwd = read_header_cwd(&file);
             return Ok((Session::from_events(id.clone(), events), cwd));
         }
@@ -296,7 +296,7 @@ impl SessionRecorder {
                 let file = dir.join("session.jsonl.zstd");
                 if file.exists() {
                     let cwd = read_header_cwd(&file);
-                    let events = self.read_events(&file);
+                    let events = self.read_events(&file)?;
                     return Ok((Session::from_events(id.clone(), events), cwd));
                 }
             }
@@ -405,13 +405,36 @@ impl SessionRecorder {
 
     // ---- 内部 ----
 
-    fn read_events(&self, file: &Path) -> Vec<SessionEvent> {
+    /// 读取并分类一整个日志（ignorable 契约的执行点）：
+    /// 未知类型 + 非 ignorable → 拒绝（Err）；其余未知/未映射类型按分类跳过。
+    fn read_events(&self, file: &Path) -> io::Result<Vec<SessionEvent>> {
         let (lines, _) = self.read_lines(file);
-        lines
-            .iter()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter_map(|v| web_line_to_event(&v))
-            .collect()
+        let mut events = Vec::new();
+        for line in lines {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            // 日志首行的 SessionHeader 记录（type:"session"）不是事件，
+            // 不参与 ignorable 分类
+            if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+                continue;
+            }
+            match web_line_to_event(&v) {
+                Some(e) => events.push(e),
+                None => match classify_unknown(&v) {
+                    UnknownPolicy::KnownSkip | UnknownPolicy::IgnorableSkip => {}
+                    UnknownPolicy::Refuse => {
+                        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+                        let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "session log contains event type \"{ty}\" (seq {seq}) unknown to this harness and not marked ignorable; refusing to interpret the log — it was likely written by a newer harness"
+                            ),
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(events)
     }
 
     fn read_lines(&self, file: &Path) -> (Vec<String>, u64) {
@@ -645,8 +668,110 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
             before_seq: num(data, "beforeSeq"),
             summary: data?.get("summary").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         }),
+        "llm/retry" => {
+            let d = data?;
+            let failure: dsh_llm::LlmFailure = d
+                .get("failure")
+                .and_then(|f| serde_json::from_value(f.clone()).ok())
+                .unwrap_or(dsh_llm::LlmFailure {
+                    message: String::new(),
+                    code: "UNKNOWN".into(),
+                    status: None,
+                    provider_retry_after_ms: None,
+                    request_id: None,
+                });
+            Some(SessionEvent::LlmRetry {
+                retry_id: d.get("retryId").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                turn: num(Some(d), "turn"),
+                step: num(Some(d), "step"),
+                provider: d.get("provider").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                mode: d.get("mode").and_then(|v| v.as_str()).unwrap_or("normal").to_string(),
+                policy_key: d.get("policyKey").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                retry: num(Some(d), "retry") as u32,
+                max_retries: d.get("maxRetries").and_then(|v| v.as_u64()).map(|v| v as u32),
+                delay_ms: num(Some(d), "delayMs"),
+                failure,
+            })
+        }
+        "llm/retry-started" => Some(SessionEvent::LlmRetryStarted {
+            retry_id: data?.get("retryId").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            turn: num(data, "turn"),
+            step: num(data, "step"),
+            retry: num(data, "retry") as u32,
+        }),
         _ => None,
     }
+}
+
+/// 本构建理解的事件词汇全集（上游 `KNOWN_SESSION_EVENT_TYPES`，0.1.2-alpha.2）。
+///
+/// 持久化读取路径按 [`SessionEvent.ignorable`] 契约分类未知类型：不在集合内
+/// 且未标 `ignorable` 的事件——多半是更新版本 harness 写的——拒绝解释整份
+/// 日志；标了 `ignorable`（纯信息性记录）则跳过。集合内的类型即便本骨架未
+/// 映射（approval/hook/team 等 web 宿主事件）也按已知忽略，不触发拒绝。
+pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
+    "agent-preset/selected",
+    "agent/inbox/spliced",
+    "approval/asked",
+    "approval/decided",
+    "approval/policy",
+    "assistant/chunk",
+    "assistant/message",
+    "command/done",
+    "command/run",
+    "compaction/end",
+    "compaction/prune",
+    "compaction/start",
+    "compaction/summary",
+    "feedback/record",
+    "goal/change",
+    "hook/invoked",
+    "hook/result",
+    "llm/retry",
+    "llm/retry-started",
+    "model/selection",
+    "permission/preset",
+    "plan/mode",
+    "request/context",
+    "request/header",
+    "sandbox/mode",
+    "schedule/change",
+    "session-log-deepseek/delivery-accepted",
+    "session/end-seed",
+    "session/title",
+    "session/title-llm-request",
+    "step/end",
+    "step/start",
+    "subagent/descriptor",
+    "subagent/model-selection-policy",
+    "team/member",
+    "team/message/delivered",
+    "team/message/queued",
+    "team/task",
+    "turn/end",
+    "turn/start",
+    "user/message",
+];
+
+/// 未知事件类型的分类（上游读取路径的三分支）。
+enum UnknownPolicy {
+    /// 词汇表内的类型（本骨架未映射）：按已知忽略。
+    KnownSkip,
+    /// 词汇表外但标了 `ignorable: true`：纯信息记录，安全跳过。
+    IgnorableSkip,
+    /// 词汇表外且必读：拒绝解释日志（可能来自更新版本 harness）。
+    Refuse,
+}
+
+fn classify_unknown(v: &serde_json::Value) -> UnknownPolicy {
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+    if KNOWN_SESSION_EVENT_TYPES.contains(&ty) {
+        return UnknownPolicy::KnownSkip;
+    }
+    if v.get("ignorable").and_then(|i| i.as_bool()) == Some(true) {
+        return UnknownPolicy::IgnorableSkip;
+    }
+    UnknownPolicy::Refuse
 }
 
 fn num(data: Option<&serde_json::Value>, key: &str) -> u64 {
@@ -741,6 +866,39 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         SessionEvent::AssistantChunk { turn, step, chunk } => Some(row(
             "assistant/chunk",
             serde_json::json!({"chunk": serde_json::to_value(chunk).unwrap_or(serde_json::Value::Null), "turn": turn, "step": step}),
+        )),
+        // 重试链（web llm/retry：normal 模式带 maxRetries，always 模式不带）
+        SessionEvent::LlmRetry {
+            retry_id,
+            turn,
+            step,
+            provider,
+            mode,
+            policy_key,
+            retry,
+            max_retries,
+            delay_ms,
+            failure,
+        } => {
+            let mut data = serde_json::json!({
+                "retryId": retry_id,
+                "turn": turn,
+                "step": step,
+                "provider": provider,
+                "mode": mode,
+                "policyKey": policy_key,
+                "retry": retry,
+                "delayMs": delay_ms,
+                "failure": serde_json::to_value(failure).unwrap_or(serde_json::Value::Null),
+            });
+            if let (Some(max), Some(obj)) = (max_retries, data.as_object_mut()) {
+                obj.insert("maxRetries".into(), serde_json::json!(max));
+            }
+            Some(row("llm/retry", data))
+        }
+        SessionEvent::LlmRetryStarted { retry_id, turn, step, retry } => Some(row(
+            "llm/retry-started",
+            serde_json::json!({"retryId": retry_id, "turn": turn, "step": step, "retry": retry}),
         )),
         _ => None,
     }

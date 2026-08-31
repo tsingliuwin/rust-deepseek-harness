@@ -35,6 +35,9 @@ impl DeepSeekAdapter {
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            // 只管"相邻两次读"的间隔，不封顶整条流：限流端点（如 sensenova）
+            // 可能收下请求后长时间沉默，无此超时会永久挂起整个 turn。
+            .read_timeout(Duration::from_secs(90))
             .user_agent(concat!("dsh-rust/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client");
@@ -190,6 +193,12 @@ impl DeepSeekAdapter {
             dsh_llm::INVALID_CREDENTIAL
         } else if status == 429 {
             "RATE_LIMIT"
+        } else if status == 408 {
+            dsh_llm::TIMEOUT
+        } else if (400..500).contains(&status) {
+            // 其余 4xx（400/404/413/422 等）是确定性拒绝，
+            // 重试同请求必然复现，标为不可重试的 INVALID_REQUEST。
+            dsh_llm::INVALID_REQUEST
         } else {
             dsh_llm::UNKNOWN
         };
@@ -387,12 +396,20 @@ impl StreamCtx {
                         name_sent: false,
                         started: false,
                     });
+                    // id/name 只在首个 delta 出现，后续 delta 回传空串：
+                    // 空串视为缺省，否则会把已收到的真实 id 覆盖掉，
+                    // 回传历史时端点报 missing `messages.tool_calls.id`。
                     let id = tc
                         .get("id")
                         .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty())
                         .map(CallId::new)
                         .or_else(|| block.id.clone());
-                    let name = tc.get("function").and_then(|f| f.get("name")).and_then(|x| x.as_str());
+                    let name = tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|x| x.as_str())
+                        .filter(|s| !s.is_empty());
                     let arguments = tc
                         .get("function")
                         .and_then(|f| f.get("arguments"))
@@ -465,4 +482,58 @@ fn take_event(buf: &mut Vec<u8>) -> Option<String> {
     };
     let event: Vec<u8> = buf.drain(..pos + sep_len).collect();
     Some(String::from_utf8_lossy(&event).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：DeepSeek 兼容端点只在首个 tool_call delta 带 id，后续 delta
+    /// 回传 `"id": ""`。空串不得覆盖已收到的真实 id，否则回传历史时端点
+    /// 报 missing `messages.tool_calls.id`（HTTP 400）。
+    #[test]
+    fn tool_call_id_survives_empty_id_deltas() {
+        let mut ctx = StreamCtx::default();
+        let first = ctx.handle_event(
+            r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"fs","arguments":""}}]},"finish_reason":""}]}"#,
+        );
+        let rest = ctx.handle_event(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","function":{"arguments":"{\"op\": \"list\"}"}}]},"finish_reason":""}]}"#,
+        );
+
+        let ids: Vec<&str> = first
+            .iter()
+            .chain(&rest)
+            .filter_map(|c| match c {
+                StreamChunk::ToolCallDelta { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["call_abc", "call_abc"]);
+
+        // 首个 delta 的 name 也不能被后续 delta 的空串抹掉。
+        let names: Vec<Option<&str>> = first
+            .iter()
+            .chain(&rest)
+            .filter_map(|c| match c {
+                StreamChunk::ToolCallDelta { name, .. } => Some(name.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, [Some("fs"), None]);
+    }
+
+    /// 确定性 4xx 归为 INVALID_REQUEST（不可重试）；408/429 保持可重试。
+    #[test]
+    fn http_4xx_classification() {
+        let f = DeepSeekAdapter::classify_http_failure(400, r#"{"error":{"message":"missing id"}}"#);
+        assert_eq!(f.code, dsh_llm::INVALID_REQUEST);
+        assert_eq!(DeepSeekAdapter::classify_http_failure(404, "no route").code, dsh_llm::INVALID_REQUEST);
+        assert_eq!(DeepSeekAdapter::classify_http_failure(408, "timeout").code, dsh_llm::TIMEOUT);
+        let rl = DeepSeekAdapter::classify_http_failure(429, "tpm exhausted");
+        assert_eq!(rl.code, "RATE_LIMIT");
+        let policy = dsh_llm::ResolvedRetryPolicy::default();
+        assert!(!policy.is_retryable(&f.code));
+        assert!(policy.is_retryable(&rl.code));
+    }
 }

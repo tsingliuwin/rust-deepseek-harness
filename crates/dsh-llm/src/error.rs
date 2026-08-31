@@ -17,6 +17,9 @@ pub const CONTEXT_WINDOW_EXCEEDED: &str = "CONTEXT_WINDOW_EXCEEDED";
 pub const QUOTA: &str = "QUOTA";
 pub const EMPTY_RESPONSE: &str = "EMPTY_RESPONSE";
 pub const INVALID_CREDENTIAL: &str = "INVALID_CREDENTIAL";
+/// Deterministic client-side rejection (HTTP 4xx except 408/429): retrying
+/// the same request cannot succeed, so retry policies must not pick it up.
+pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
 pub const INVALID_ARGS: &str = "INVALID_ARGS";
 pub const INVARIANT: &str = "INVARIANT";
 pub const TIMEOUT: &str = "TIMEOUT";

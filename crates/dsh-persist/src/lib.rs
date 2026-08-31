@@ -748,10 +748,26 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "team/message/delivered",
     "team/message/queued",
     "team/task",
+    "todo/write",
+    "tool-workflow/agent-end",
+    "tool-workflow/agent-start",
+    "tool-workflow/run-end",
+    "tool-workflow/run-start",
+    "tool/call",
+    "tool/code-dispatch",
+    "tool/code-dispatch-start",
+    "tool/result",
     "turn/end",
     "turn/start",
     "user/message",
+    "web/deepseek-search-llm-request",
 ];
+
+/// 存储层 chunk 打包记录类型（web `packChunkRuns` 写盘形态，上游读取时经
+/// `decodeStorageRecord` 解回 assistant/chunk——构建认识这些记录，不属于
+/// 「未知类型」守卫范围）。骨架没有 chunk 回放消费方，按已知跳过。
+pub const KNOWN_STORAGE_RECORD_TYPES: &[&str] =
+    &["text-chunks", "reasoning-chunks", "tool-call-chunks"];
 
 /// 未知事件类型的分类（上游读取路径的三分支）。
 enum UnknownPolicy {
@@ -765,7 +781,7 @@ enum UnknownPolicy {
 
 fn classify_unknown(v: &serde_json::Value) -> UnknownPolicy {
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-    if KNOWN_SESSION_EVENT_TYPES.contains(&ty) {
+    if KNOWN_SESSION_EVENT_TYPES.contains(&ty) || KNOWN_STORAGE_RECORD_TYPES.contains(&ty) {
         return UnknownPolicy::KnownSkip;
     }
     if v.get("ignorable").and_then(|i| i.as_bool()) == Some(true) {
@@ -928,6 +944,46 @@ mod tests {
         assert_eq!(row["identity"]["cwd"], "/tmp/ws");
         assert_eq!(row["rows"]["title"]["val"], "你好");
         assert_eq!(row["rows"]["title"]["ver"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_event_classification_loads_or_refuses() {
+        // 回归：桌面端自己落盘的 tool/call、web 存储层的 chunk 打包记录
+        // 都是构建已知类型——不得触发 fail-closed 拒绝（曾因此点击会话
+        // 无反应：load Err 被静默吞掉）。
+        let dir = std::env::temp_dir().join(format!("dsh-persist-ignorable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = SessionRecorder::new(dir.join("sessions"));
+        let id = SessionId::new("session-classes");
+        rec.create(&id, "/tmp/ws", "standard").unwrap();
+        let file = rec.session_file(&id, "/tmp/ws");
+        let row = |ty: &str, ignorable: bool| {
+            let mut o = serde_json::json!({
+                "type": ty,
+                "seq": 99,
+                "time": 1,
+                "data": {"toolCallId": "c1", "name": "fs"},
+            });
+            if ignorable {
+                o["ignorable"] = serde_json::json!(true);
+            }
+            o.to_string()
+        };
+        rec.append_frame(&file, &format!("{}
+", row("tool/call", false))).unwrap();
+        rec.append_frame(&file, &format!("{}
+", row("text-chunks", false))).unwrap();
+        rec.append_frame(&file, &format!("{}
+", row("plugin/future-thing", true))).unwrap();
+        // 已知未映射 + 存储记录 + ignorable 未知：都能加载（各自跳过）
+        let (session, _) = rec.load(&id, Some("/tmp/ws")).unwrap();
+        assert!(session.entries().is_empty());
+
+        // 未知且必读：拒绝解释整份日志
+        rec.append_frame(&file, &format!("{}
+", row("plugin/required-thing", false))).unwrap();
+        assert!(rec.load(&id, Some("/tmp/ws")).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

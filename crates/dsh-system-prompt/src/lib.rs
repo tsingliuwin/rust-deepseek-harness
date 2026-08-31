@@ -10,6 +10,8 @@
 //! 渲染按 `(order, name)` 升序拼接（同 order 用 name 的码元序）。
 
 use dsh_llm::ToolSchema;
+
+pub mod agent_instructions;
 use dsh_tools::ToolRegistry;
 use std::sync::{Arc, RwLock};
 
@@ -20,6 +22,7 @@ pub enum PromptSectionOrderName {
     HarnessSource,
     WebSurface,
     DeploymentPersona,
+    WorkspaceInstructions,
     PlanPolicy,
     TeamPolicy,
     PtcOnly,
@@ -62,6 +65,7 @@ const SECTION_ORDERS: &[(PromptSectionOrderName, i32)] = &[
     (PromptSectionOrderName::HarnessSource, -900),
     (PromptSectionOrderName::WebSurface, -800),
     (PromptSectionOrderName::DeploymentPersona, 0),
+    (PromptSectionOrderName::WorkspaceInstructions, 400),
     (PromptSectionOrderName::PlanPolicy, 500),
     (PromptSectionOrderName::TeamPolicy, 600),
     (PromptSectionOrderName::PtcOnly, 800),
@@ -154,12 +158,14 @@ impl SystemPrompt {
     }
 
     /// Render the joined system text from the registered sections, sorted by
-    /// `(order, name)`.
+    /// `(order, name)`. Empty-text sections (占位待重建的动态节) contribute
+    /// nothing rather than stray blank lines.
     pub fn render(&self) -> String {
         let mut sections = self.sections.read().unwrap().clone();
         sections.sort_by(|a, b| (a.order, &a.name).cmp(&(b.order, &b.name)));
         sections
             .iter()
+            .filter(|s| !s.text.trim().is_empty())
             .map(|s| s.text.clone())
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -175,4 +181,36 @@ impl SystemPrompt {
 /// Convenience: assemble from a tool registry.
 pub fn assemble_from_registry(prompt: &SystemPrompt, registry: &ToolRegistry) -> PromptAssembly {
     prompt.assemble(registry.schemas())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_instructions_order_sits_between_persona_and_plan() {
+        let prompt = SystemPrompt::new();
+        let persona = prompt.get_section_order(PromptSectionOrderName::DeploymentPersona);
+        let ws = prompt.get_section_order(PromptSectionOrderName::WorkspaceInstructions);
+        let bash = prompt.get_section_order(PromptSectionOrderName::ToolBash);
+        assert!(persona < ws && ws < bash, "{persona} < {ws} < {bash}");
+    }
+
+    #[test]
+    fn render_skips_empty_sections_and_replaces_by_dispose() {
+        let prompt = SystemPrompt::new();
+        let disposer = prompt.add_section(PromptSection {
+            name: "workspace:instructions".into(),
+            order: 400,
+            text: String::new(),
+        });
+        assert!(!prompt.render().contains("workspace rules"));
+        disposer();
+        prompt.add_section(PromptSection {
+            name: "workspace:instructions".into(),
+            order: 400,
+            text: "workspace rules".into(),
+        });
+        assert!(prompt.render().contains("workspace rules"));
+    }
 }

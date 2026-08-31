@@ -10,3 +10,7 @@ dsh-llm = { path = "../dsh-llm" }
 serde_json.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["process", "io-util"] }
+encoding_rs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+codepage.workspace = true

@@ -182,10 +182,20 @@ impl Tool for FsTool {
             _ => {}
         }
         match op {
-            "read" => match std::fs::read_to_string(path) {
-                Ok(text) => ToolExecutionResult::text(text),
-                Err(e) => ToolExecutionResult::error(format!("read failed: {e}")),
-            },
+            "read" => {
+                // 目录在 Windows 上 read_to_string 报 ERROR_ACCESS_DENIED
+                // （"拒绝访问 os error 5"），语义误导模型；显式指路到 list。
+                if path.is_dir() {
+                    return ToolExecutionResult::error(format!(
+                        "read failed: {} is a directory; use op=list",
+                        path.display()
+                    ));
+                }
+                match std::fs::read_to_string(path) {
+                    Ok(text) => ToolExecutionResult::text(text),
+                    Err(e) => ToolExecutionResult::error(format!("read failed: {e}")),
+                }
+            }
             "write" => {
                 let content = input.arguments.get("content").and_then(|v| v.as_str()).unwrap_or("");
                 match std::fs::write(path, content) {
@@ -243,5 +253,31 @@ mod tests {
     fn empty_roots_deny_all_writes() {
         let policy = WorkspaceContainment::new(Vec::new());
         assert!(!policy.allow_write(Path::new("/tmp/x")));
+    }
+
+    #[tokio::test]
+    async fn read_on_directory_points_to_list() {
+        // 目录读取曾误报「拒绝访问 os error 5」；应显式提示改用 op=list
+        let tool = FsTool::default();
+        let dir = std::env::temp_dir().join(format!("dsh-fs-dir-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = tool
+            .execute(&ToolExecutionInput::with_raw_arguments(
+                dsh_llm::CallId("t".into()),
+                "fs".into(),
+                format!(r#"{{"op": "read", "path": "{}"}}"#, dir.to_string_lossy().replace('\\', "\\\\")).into(),
+            ))
+            .await;
+        assert!(result.is_error);
+        let text = result
+            .content
+            .iter()
+            .find_map(|b| match b {
+                dsh_llm::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains("is a directory") && text.contains("op=list"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

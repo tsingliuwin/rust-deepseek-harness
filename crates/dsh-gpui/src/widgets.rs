@@ -329,30 +329,38 @@ pub(crate) fn state_dot(color: gpui::Rgba) -> Div {
 /// 运行中的行扫光（web .row::after：300px 带自左滑向右，2.6s ease-out +
 /// 10% 尾停后循环；左端渐变 = bg_base 60% 透明）。行容器需
 /// relative + overflow_hidden，扫光为其最后 child。
-pub(crate) fn row_sweep(elapsed_ms: u64, width: f32) -> Div {
-    const PERIOD_MS: u64 = 2600;
-    const BAND: f32 = 300.0;
-    let t = (elapsed_ms % PERIOD_MS) as f32 / PERIOD_MS as f32;
-    // CSS keyframes：0→-300，90% 已到右端（此后保持到 100% 循环）
+///
+/// 动画驱动：调用方以 `with_animation(Animation::new(SWEEP_PERIOD_MS)
+/// .repeat().with_easing(row_sweep_easing))` 包裹本元素并按 delta 设置
+/// `left`——gpui 每帧局部重绘、元素消失即停。曾用全局 100ms tick +
+/// 墙钟 elapsed 计算位置，扫光每秒只跳 10 格，观感为顿挫的"扫过"。
+pub(crate) const SWEEP_PERIOD_MS: u64 = 2600;
+pub(crate) const SWEEP_BAND: f32 = 300.0;
+
+/// web keyframes：前 90% 自左 ease-out 走到右端，后 10% 停驻后循环。
+pub(crate) fn row_sweep_easing(t: f32) -> f32 {
     let p = (t / 0.9).min(1.0);
-    let eased = 1.0 - (1.0 - p) * (1.0 - p); // ease-out 近似
-    let left = -BAND + (width + BAND) * eased;
+    1.0 - (1.0 - p) * (1.0 - p)
+}
+
+pub(crate) fn row_sweep_band() -> Div {
     let base = theme::t().bg_base;
     let peak = gpui::Rgba { r: base.r, g: base.g, b: base.b, a: 0.6 };
+    let band = SWEEP_BAND;
     // gpui linear_gradient 仅两个 stop：左右两半各一条渐变合成中峰（≈css 55%）
     div()
         .absolute()
         .top_0()
         .bottom_0()
-        .left(px(left))
-        .w(px(BAND))
+        .left(px(0.))
+        .w(px(band))
         .child(
             div()
                 .absolute()
                 .left_0()
                 .top_0()
                 .bottom_0()
-                .w(px(BAND / 2.0))
+                .w(px(band / 2.0))
                 .bg(gpui::linear_gradient(
                     90.0,
                     gpui::linear_color_stop(gpui::transparent_black(), 0.0),
@@ -365,7 +373,7 @@ pub(crate) fn row_sweep(elapsed_ms: u64, width: f32) -> Div {
                 .right_0()
                 .top_0()
                 .bottom_0()
-                .w(px(BAND / 2.0))
+                .w(px(band / 2.0))
                 .bg(gpui::linear_gradient(
                     90.0,
                     gpui::linear_color_stop(peak, 0.0),
@@ -452,6 +460,8 @@ pub(crate) fn terminal_card(
     output: Option<&str>,
     running: bool,
     error: bool,
+    expanded: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + Clone,
 ) -> Div {
     let dot_color = if running {
         theme::t().accent
@@ -506,10 +516,6 @@ pub(crate) fn terminal_card(
         .pr(px(14.0))
         .pb(px(9.0))
         .pl(px(30.0))
-        .max_h(px(150.0))
-        .overflow_y_scroll()
-        // 内部滚动 occlude：滚轮命中链到此为止，外层对话不跟滚
-        .occlude()
         .child(prompt);
     if !running
         && let Some(text) = output
@@ -567,24 +573,35 @@ pub(crate) fn terminal_card(
             );
         } else {
             let text = output.unwrap_or_default();
+            // web TerminalBlock 输出：8 行上限折叠（卡内不内滚——
+            // 曾用 max_h + overflow_y_scroll + occlude，滚轮大面积死区）
+            let out_lines: Vec<&str> = text.lines().collect();
+            let out_total = out_lines.len();
+            let out_hidden = out_total.saturating_sub(CARD_MAX_LINES);
+            let out_capped = out_hidden > 0 && !expanded;
+            let (out_head, out_tail) = if out_capped {
+                (CARD_MAX_LINES - CARD_MAX_LINES / 2, CARD_MAX_LINES / 2)
+            } else {
+                (out_total, 0)
+            };
             let mut out = div()
                 .id(("term-out", uid))
                 .pt(px(12.0))
                 .pr(px(14.0))
                 .pb(px(12.0))
                 .pl(px(30.0))
-                .max_h(px(224.0))
-                .overflow_y_scroll()
-                // 内部滚动 occlude（同上）
-                .occlude()
                 .overflow_x_scroll()
                 .font_family(theme_mono())
                 .text_size(px(12.0))
                 .line_height(px(18.0))
                 .text_color(theme::t().text);
-            // 尾部换行是终结符，不是额外空行（web parse 后按渲染行裁剪）
-            let trimmed = text.strip_suffix('\n').unwrap_or(text);
-            for line in trimmed.split('\n') {
+            for line in &out_lines[..out_head] {
+                out = out.child(div().min_h(px(18.0)).whitespace_nowrap().child(line.to_string()));
+            }
+            if out_hidden > 0 {
+                out = out.child(fold_toggle(uid, out_hidden, expanded, on_toggle.clone()));
+            }
+            for line in &out_lines[out_total - out_tail..] {
                 out = out.child(div().min_h(px(18.0)).whitespace_nowrap().child(line.to_string()));
             }
             card = card.child(out);
@@ -1185,7 +1202,14 @@ pub(crate) fn search_card(
 }
 
 /// 工具行展开的输入/输出卡（web ToolRow .ioCard：r12、每节上限 150px 内滚动）。
-pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) -> Div {
+pub(crate) fn io_card(
+    uid: u64,
+    input: &str,
+    output: Option<&str>,
+    error: bool,
+    expanded: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + Clone,
+) -> Div {
     let mut card = div()
         .ml_1()
         .mt_1()
@@ -1195,15 +1219,32 @@ pub(crate) fn io_card(uid: u64, input: &str, output: Option<&str>, error: bool) 
         .border_1()
         .border_color(theme::t().border_l1)
         .bg(theme::t().code_bg);
-    card = card.child(io_section(uid * 2, "输入", input, false));
+    card = card.child(io_section(uid * 2, "输入", input, false, expanded, on_toggle.clone()));
     if let Some(out) = output {
         card = card.child(div().h(px(1.0)).w_full().bg(theme::t().border_l2));
-        card = card.child(io_section(uid * 2 + 1, "输出", out, error));
+        card = card.child(io_section(uid * 2 + 1, "输出", out, error, expanded, on_toggle));
     }
     card
 }
-pub(crate) fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div {
-    // web ToolRow .ioSection：max-content 槽道标签 + 1fr 文本，gap 14，pad 12/16
+pub(crate) fn io_section(
+    uid: u64,
+    label: &str,
+    text: &str,
+    error: bool,
+    expanded: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static + Clone,
+) -> Div {
+    // web ToolRow .ioSection：8 行上限折叠（曾用 max_h + 内滚 + occlude，
+    // 滚轮大面积死区）
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let hidden = total.saturating_sub(CARD_MAX_LINES);
+    let capped = hidden > 0 && !expanded;
+    let (head, tail) = if capped {
+        (CARD_MAX_LINES - CARD_MAX_LINES / 2, CARD_MAX_LINES / 2)
+    } else {
+        (total, 0)
+    };
     div()
         .flex()
         .items_start()
@@ -1223,15 +1264,24 @@ pub(crate) fn io_section(uid: u64, label: &str, text: &str, error: bool) -> Div 
                 .id(("io-scroll", uid))
                 .flex_1()
                 .min_w_0()
-                .max_h(px(150.0))
-                .overflow_y_scroll()
-                // 内部滚动 occlude（同上）
-                .occlude()
+                .overflow_x_scroll()
                 .font_family(theme_mono())
                 .text_size(px(12.0))
                 .line_height(px(18.0))
                 .text_color(if error { theme::t().error } else { theme::t().text_2 })
-                .child(text.to_string()),
+                .children(
+                    lines[..head]
+                        .iter()
+                        .map(|l| div().min_h(px(18.0)).whitespace_nowrap().child(l.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+                .when(hidden > 0, |d| d.child(fold_toggle(uid, hidden, expanded, on_toggle.clone())))
+                .children(
+                    lines[total - tail..]
+                        .iter()
+                        .map(|l| div().min_h(px(18.0)).whitespace_nowrap().child(l.to_string()))
+                        .collect::<Vec<_>>(),
+                ),
         )
 }
 /// 详情面板的一个 section（label + 内容）。

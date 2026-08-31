@@ -8,3 +8,7 @@ license.workspace = true
 dsh-tools = { path = "../dsh-tools" }
 serde_json.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+dsh-llm = { path = "../dsh-llm" }
+tokio = { workspace = true, features = ["rt", "macros"] }

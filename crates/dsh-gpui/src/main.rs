@@ -1,10 +1,14 @@
 //! dsh-gpui — 原生 GPUI 客户端，1:1 对齐参考 dsh Web UI。
 //!
 //! 布局契约（`packages/client/ui-layout`）：左 sidebar（280px，可折叠成 56px
-//! 图标栏，<1024 自动折叠）· 中会话区（≥640px，内容列 748px）· 右 details
+//! 图标栏）· 中会话区（≥640px，内容列 748px）· 右 details
 //! （360px，300–520 可拖）。视觉 token 见 `theme.rs`（对齐
 //! `packages/client/ui-theme` 暗色主题）。会话区 = header（标题 + tab）+
 //! 消息流（用户气泡 / Think 折叠行 / 工具行 / markdown）+ 底部胶囊输入卡。
+
+// GUI 程序：不分配控制台（曾导致每次启动都带一个空终端窗口）。
+// 调试需要 stderr 时临时注释本行或从终端 cargo run。
+#![windows_subsystem = "windows"]
 
 mod assets;
 pub(crate) mod layout;
@@ -27,7 +31,7 @@ use dsh_llm::{
 };
 use dsh_llm_deepseek::DeepSeekAdapter;
 use dsh_persist::SessionRecorder;
-use dsh_session::{Session, SessionEvent};
+use dsh_session::{Session, SessionEvent, TurnEndReason};
 use dsh_shell::ShellTool;
 use dsh_system_prompt::SystemPrompt;
 use dsh_tools::ToolRegistry;
@@ -938,10 +942,61 @@ fn migrate_legacy() {
     let _ = std::fs::remove_file(&legacy_creds);
 }
 
+/// tool:shell 提示词节文本：cwd 已是工作区根（免 cd）+ 长命令先落盘再检视
+/// 的纪律 + 按 shell 实际风味给语法提示。回应真实会话里的两类浪费：
+/// bash 语法经 cmd /C 碎裂（; / 引号 / %）、cargo test 重跑 3 遍只为换
+/// 视角看输出。
+fn shell_section_text(root: &str) -> String {
+    let mut text = String::new();
+    if !root.is_empty() {
+        text.push_str(&format!("Workspace root: {root}\n"));
+    }
+    text.push_str(match dsh_shell::shell_kind() {
+        "bash" => {
+            "The shell tool runs each command through bash with its working directory already \
+             set to the workspace root: do not `cd` first. Bash syntax (pipes, `;`, `$()`, \
+             quotes, POSIX paths) works naturally."
+        }
+        _ => {
+            "The shell tool runs each command through `cmd /C` (NOT bash) with its working \
+             directory already set to the workspace root: do not `cd` first, and use \
+             Windows-style paths (`E:\\dir\\file.rs`), not POSIX-style (`/e/...`). cmd does NOT \
+             understand bash syntax: use `&&` instead of `;`, avoid `$()`, avoid `%` in format \
+             strings, and remember quotes around arguments with spaces get stripped."
+        }
+    });
+    text.push_str(
+        " For a long-running command (build, test suite, install), redirect the full \
+         output to a temporary file (e.g. `cargo test --workspace > out.txt 2>&1`) and \
+         then grep or read that file for each different view — never re-run the command \
+         just to see another slice of its output. Prefer the grep and glob tools over \
+         shell grep/find, and the fs tool over shell dir/ls.",
+    );
+    text
+}
+
+/// 已知目录提供方的默认端点（pi-ai 目录 adopt 时可省 baseURL，web 由目录
+/// 补全；宿主此处保持 1:1）。
+fn known_provider_base_url(id: &str) -> Option<&'static str> {
+    match id {
+        // 智谱 GLM Coding Plan（中国区）
+        "zai-coding-cn" => Some("https://open.bigmodel.cn/api/coding/paas/v4"),
+        // Z.ai Coding Plan（国际区）
+        "zai" => Some("https://api.z.ai/api/coding/paas/v4"),
+        _ => None,
+    }
+}
+
 /// AppView 的运行期依赖（打包传入以控制构造参数个数）。
 struct AppDeps {
     recorder: Arc<SessionRecorder>,
     llm: Arc<LlmRuntime>,
+    /// 系统提示词句柄（工作区切换时重建 workspace 相关 section）
+    prompt: Arc<dsh_system_prompt::SystemPrompt>,
+    /// tool:shell section 句柄（调用 = 移除；随工作区切换重建）
+    shell_section: std::cell::RefCell<Option<dsh_llm::Disposer>>,
+    /// 工作区指令（AGENTS.md）section 句柄（随工作区切换重建）
+    workspace_instructions: std::cell::RefCell<Option<dsh_llm::Disposer>>,
 }
 
 
@@ -1085,6 +1140,12 @@ struct AppView {
     subagent: Arc<dsh_subagent::SubagentTool>,
     /// fs 沙箱句柄（工作区切换时同步写根）
     fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
+    /// 系统提示词句柄（工作区切换时重建 workspace 相关 section）
+    prompt: Arc<dsh_system_prompt::SystemPrompt>,
+    /// tool:shell section 句柄（随工作区切换重建）
+    shell_section: std::cell::RefCell<Option<dsh_llm::Disposer>>,
+    /// 工作区指令（AGENTS.md）section 句柄（随工作区切换重建）
+    workspace_instructions: std::cell::RefCell<Option<dsh_llm::Disposer>>,
     /// 会话工作目录句柄（工具执行基准 + 模型可见上下文）
     workdir: dsh_tools::Workdir,
     /// 持久化 sink 的 cwd 槽（= current_cwd；草稿会话首次落盘的桶位）
@@ -1195,6 +1256,14 @@ struct AppView {
     stats_cache_write: u64,
     /// 本轮工具调用计时（call_id → 起始时刻）
     tool_starts: std::collections::HashMap<String, std::time::Instant>,
+    /// 流式文本渲染节流快照（(ei, bi, 时刻, 展示文本)）。gpui-component
+    /// TextView 的后台解析是"每条更新重置 200ms 防抖计时器"——连续 delta
+    /// 下计时器永不触发、解析一次不跑，正文冻结到流结束后一股脑出现。
+    /// 喂 TextView 的文本以 >200ms 间隔节流，防抖必然触发、渐进渲染。
+    stream_text_shown: std::cell::RefCell<Option<(usize, usize, std::time::Instant, String)>>,
+    /// 流式文本增长改了条目高度但没知会虚拟列表 → 按陈旧行高排布、行重叠；
+    /// 渲染路径置位（渲染中不能改列表），由 tick 消费后统一失效重测。
+    heights_dirty: std::cell::Cell<bool>,
     /// 本轮累计工具耗时（LLM 时间 = 轮用时 − 工具时间）
     turn_tool_time: std::time::Duration,
     /// 本轮 token 累计（TurnEnded 冻结进消息 footer 的统计快照）
@@ -1375,6 +1444,9 @@ impl AppView {
             agent,
             recorder: deps.recorder,
             llm: deps.llm,
+            prompt: deps.prompt,
+            shell_section: deps.shell_section,
+            workspace_instructions: deps.workspace_instructions,
             subagent,
             fs_sandbox,
             workdir,
@@ -1458,6 +1530,8 @@ impl AppView {
             stats_cache_write: 0,
             tool_starts: Default::default(),
             turn_tool_time: std::time::Duration::ZERO,
+            stream_text_shown: std::cell::RefCell::new(None),
+            heights_dirty: std::cell::Cell::new(false),
             session_llm_time: std::time::Duration::ZERO,
             session_tool_time: std::time::Duration::ZERO,
             tab: CenterTab::Conversation,
@@ -1670,13 +1744,69 @@ impl AppView {
                     cur_turn = *turn;
                     self.stats_turns += 1;
                 }
-                SessionEvent::AssistantMessage { usage, .. } => {
+                SessionEvent::TurnEnd { reason: TurnEndReason::Error { failure }, .. } => {
+                    // 失败轮次在历史里也要可见（实时路径由 AgentEvent::Error
+                    // 入列；回放此前只有用户气泡、轮次看起来凭空蒸发）
+                    self.entries.push(ChatEntry {
+                        role: Role::Error,
+                        blocks: vec![MsgBlock::Text(format!("[{}] {}", failure.code, failure.message))],
+                        done: true,
+                        elapsed: None, usage: None, ended_at_ms: None,
+                        turn: cur_turn,
+                        context: None,
+                        open: false,
+                    });
+                }
+                SessionEvent::AssistantMessage { usage, message, .. } => {
                     self.stats_steps += 1;
                     if let Some(u) = usage {
                         self.stats_input_tokens += u.input_tokens;
                         self.stats_output_tokens += u.output_tokens;
                         if let Some(cr) = u.cache_read_tokens { self.stats_cache_read += cr; }
                         if let Some(cw) = u.cache_write_tokens { self.stats_cache_write += cw; }
+                    }
+                    // 回放助手内容（文本/推理/工具调用行）。实时路径由 chunk 流
+                    // 增量入列，历史回放唯一来源就是这条完整消息——曾缺失此
+                    // 分支导致打开历史会话只剩用户气泡、轨迹无工具记录。
+                    let mut blocks: Vec<MsgBlock> = Vec::new();
+                    for b in &message.content {
+                        match b {
+                            ContentBlock::Text { text } => {
+                                if !text.is_empty() {
+                                    blocks.push(MsgBlock::Text(text.clone()));
+                                }
+                            }
+                            ContentBlock::Reasoning { text } => {
+                                blocks.push(MsgBlock::Reasoning { text: text.clone(), open: false });
+                            }
+                            ContentBlock::ToolCall { id, name, arguments } => {
+                                self.stats_tools += 1;
+                                blocks.push(MsgBlock::Tool(ToolBlock {
+                                    id: id.0.clone(),
+                                    name: name.clone(),
+                                    arguments: arguments.clone(),
+                                    result: None,
+                                    error: false,
+                                    open: false,
+                                    expanded: false,
+                                    collapsed_groups: Vec::new(),
+                                }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !blocks.is_empty() {
+                        self.entries.push(ChatEntry {
+                            role: Role::Assistant,
+                            blocks,
+                            done: true,
+                            elapsed: None,
+                            usage: None,
+                            ended_at_ms: None,
+                            turn: cur_turn,
+                            context: None,
+                            open: false,
+                        });
                     }
                 }
                 SessionEvent::ToolCall { .. } => { self.stats_tools += 1; }
@@ -1690,7 +1820,7 @@ impl AppView {
                         })
                         .collect();
                     if text.is_empty() {
-                        return;
+                        continue;
                     }
                     // 生产者注入的上下文 → ContextInjectionRow（非用户气泡）
                     if let MessageSource::Context { context_kind, plugin, form, summary, changes_paths, reference_labels, name } =
@@ -1706,7 +1836,7 @@ impl AppView {
                             context: Some(info),
                             open: false,
                         });
-                        return;
+                        continue;
                     }
                     self.entries.push(ChatEntry {
                         role: Role::User,
@@ -2007,6 +2137,16 @@ open: false,
         }
     }
 
+    /// 条目高度失效：内容高度不经 splice/reset 变化（展开收起、流式文本
+    /// 增长）时，列表按陈旧行高排布、行间重叠；标记全部 Unmeasured 重测，
+    /// 滚动锚点由 splice 自行调整。
+    fn invalidate_chat_heights(&self) {
+        let n = self.chat_item_count();
+        if n > 0 {
+            self.chat_list.splice(0..n, n);
+        }
+    }
+
     /// 消息流当前是否贴底（scroll handler 维护的可见范围判断）。
     fn chat_near_bottom(&self) -> bool {
         self.list_bottom.get()
@@ -2110,6 +2250,7 @@ open: false,
                 self.turn_usage = TurnUsage::default();
                 self.turn_first_token = None;
                 self.tool_starts.clear();
+                self.stream_text_shown.borrow_mut().take();
             }
             AgentEvent::TextDelta { text } => {
                 if self.turn_first_token.is_none() {
@@ -2559,7 +2700,36 @@ open: false,
         };
         self.fs_sandbox.set_roots(vec![std::path::PathBuf::from(root.clone())]);
         self.workdir.set(root.clone());
-        *self.persist_cwd.lock().unwrap() = root;
+        *self.persist_cwd.lock().unwrap() = root.clone();
+        self.refresh_workspace_sections(&root);
+    }
+
+    /// 工作区切换时重建 workspace 相关提示词节（dispose 旧节再注册）：
+    /// tool:shell（工作区根 + shell 纪律）与工作区指令（AGENTS.md 兼容文件，
+    /// 无指令源时置空）。
+    fn refresh_workspace_sections(&self, root: &str) {
+        if let Some(dispose) = self.shell_section.borrow_mut().take() {
+            dispose();
+        }
+        *self.shell_section.borrow_mut() = Some(self.prompt.add_section(dsh_system_prompt::PromptSection {
+            name: "tool:shell".into(),
+            order: self.prompt.get_section_order(dsh_system_prompt::PromptSectionOrderName::ToolBash),
+            text: shell_section_text(root),
+        }));
+        if let Some(dispose) = self.workspace_instructions.borrow_mut().take() {
+            dispose();
+        }
+        let instructions = dsh_system_prompt::agent_instructions::render_workspace_instructions(
+            std::path::Path::new(root),
+            &dsh_home(),
+        )
+        .unwrap_or_default();
+        *self.workspace_instructions.borrow_mut() =
+            Some(self.prompt.add_section(dsh_system_prompt::PromptSection {
+                name: "workspace:instructions".into(),
+                order: self.prompt.get_section_order(dsh_system_prompt::PromptSectionOrderName::WorkspaceInstructions),
+                text: instructions,
+            }));
     }
 
     /// 宿主路由切换：主 agent 与子 agent 工具同步。
@@ -2604,22 +2774,51 @@ open: false,
 
     fn block_element(&self, block: &MsgBlock, ei: usize, bi: usize, this: &Entity<AppView>, content_w: f32) -> AnyElement {
         match block {
-            MsgBlock::Text(t) => div()
-                .w_full()
-                .text_color(theme::t().text)
-                .child(MarkdownBlock { text: t.clone(), id: 1_000_000 + ei * 1000 + bi })
-                .into_any_element(),
+            MsgBlock::Text(t) => {
+                // 流式尾按 400ms 节流喂 TextView（间隔须 > 上游 200ms 防抖窗，
+                // 否则连续 delta 使解析永不触发）；非尾块（已完结）直接用现文
+                let is_stream_tail = self.running
+                    && ei + 1 == self.entries.len()
+                    && bi + 1 == self.entries.get(ei).map(|e| e.blocks.len()).unwrap_or(0);
+                let now = std::time::Instant::now();
+                let shown = if is_stream_tail {
+                    let cached = self.stream_text_shown.borrow().as_ref().and_then(
+                        |(ce, cb, at, txt)| {
+                            (*ce == ei && *cb == bi
+                                && now.duration_since(*at).as_millis() < 400)
+                                .then(|| txt.clone())
+                        },
+                    );
+                    match cached {
+                        Some(txt) => txt,
+                        None => {
+                            *self.stream_text_shown.borrow_mut() =
+                                Some((ei, bi, now, t.clone()));
+                            // 文本增长 → 该条目高度变化 → 待 tick 统一重测
+                            self.heights_dirty.set(true);
+                            t.clone()
+                        }
+                    }
+                } else {
+                    t.clone()
+                };
+                div()
+                    .w_full()
+                    .text_color(theme::t().text)
+                    .child(MarkdownBlock { text: shown, id: 1_000_000 + ei * 1000 + bi })
+                    .into_any_element()
+            }
 
             MsgBlock::Reasoning { text, open } => {
                 let open = *open;
                 let t = this.clone();
+                // web ReasoningRow 语义：running = 本块是**正在流式消息的
+                // 最后一个块**（streaming && i === last）。曾用 entry.done
+                // 判定——done 只在整轮结束时打给最后一条，导致历史步骤的
+                // Think 行整轮误扫。工具块一旦出现，本块即非尾，停止扫光。
                 let active = self.running
-                    && !self.entries.get(ei).map(|e| e.done).unwrap_or(true);
-                let sweep_ms = if active {
-                    self.turn_started_at.map(|t| t.elapsed().as_millis() as u64)
-                } else {
-                    None
-                };
+                    && ei + 1 == self.entries.len()
+                    && bi + 1 == self.entries.get(ei).map(|e| e.blocks.len()).unwrap_or(0);
                 // web 结构：root(v_flex) > row(24px header) + thinkBody(展开体)
                 // 展开体是 header 的兄弟节点，不在 24px 行内
                 let mut header = div()
@@ -2665,11 +2864,28 @@ open: false,
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
                             .text_color(theme::t().text_3)
-                            .child(first_line(text)),
+                            // web：运行时摘要跟随最新一行（latestLine +
+                            // scrollLeft 右贴），完成后回到首行
+                            .child(if active {
+                                text.lines().last().unwrap_or("").chars().take(120).collect::<String>()
+                            } else {
+                                first_line(text)
+                            }),
                     );
-                if let Some(ms) = sweep_ms {
-                    // web .row::after 运行扫光（行容器 relative + overflow_hidden）
-                    header = header.child(row_sweep(ms, content_w));
+                if active {
+                    // web .row::after 运行扫光（行容器 relative + overflow_hidden）；
+                    // with_animation 每帧驱动 left，替代曾用的 100ms 全局 tick
+                    header = header.child(
+                        widgets::row_sweep_band().with_animation(
+                            ("think-sweep", (ei * 1000 + bi) as u64),
+                            Animation::new(Duration::from_millis(widgets::SWEEP_PERIOD_MS))
+                                .repeat()
+                                .with_easing(widgets::row_sweep_easing),
+                            move |band, delta| {
+                                band.left(px(-widgets::SWEEP_BAND + (content_w + widgets::SWEEP_BAND) * delta))
+                            },
+                        ),
+                    );
                 }
                 let mut wrapper = div().w_full().v_flex().child(header);
                 if open {
@@ -2714,11 +2930,6 @@ open: false,
                 });
                 let t = this.clone();
                 let running = tool.result.is_none();
-                let sweep_ms = if running {
-                    self.turn_started_at.map(|t| t.elapsed().as_millis() as u64)
-                } else {
-                    None
-                };
                 // Inspect 跳转目标：该调用在轨迹列表中的行号（之前的工具块计数）
                 let mut traj_ix = 0usize;
                 'traj_count: for (i, e) in self.entries.iter().enumerate() {
@@ -2861,9 +3072,19 @@ open: false,
                             .child(summary_text.clone()),
                     );
                 }
-                if let Some(ms) = sweep_ms {
-                    // web .row::after 运行扫光（行容器 relative + overflow_hidden）
-                    header = header.child(row_sweep(ms, content_w));
+                if running {
+                    // web .row::after 运行扫光：with_animation 每帧驱动 left
+                    header = header.child(
+                        widgets::row_sweep_band().with_animation(
+                            ("tool-sweep", (ei * 1000 + bi) as u64),
+                            Animation::new(Duration::from_millis(widgets::SWEEP_PERIOD_MS))
+                                .repeat()
+                                .with_easing(widgets::row_sweep_easing),
+                            move |band, delta| {
+                                band.left(px(-widgets::SWEEP_BAND + (content_w + widgets::SWEEP_BAND) * delta))
+                            },
+                        ),
+                    );
                 }
                 // hover 显现 Inspect pill 的悬停域：标题行 + 展开体整体
                 let group: SharedString = format!("tool-blk-{ei}-{bi}").into();
@@ -2888,15 +3109,31 @@ open: false,
                         .and_then(|v| serde_json::to_string_pretty(&v).ok())
                         .unwrap_or_else(|| tool.arguments.clone());
                     let element = match tool.name.as_str() {
-                        "shell" => widgets::terminal_card(
-                            uid,
-                            &arg_str("command"),
-                            &self.current_cwd,
-                            tool.result.as_deref(),
-                            running,
-                            tool.error,
-                        )
-                        .into_any_element(),
+                        "shell" => {
+                            let t_fold = this.clone();
+                            widgets::terminal_card(
+                                uid,
+                                &arg_str("command"),
+                                &self.current_cwd,
+                                tool.result.as_deref(),
+                                running,
+                                tool.error,
+                                tool.expanded,
+                                move |_, _, cx| {
+                                    t_fold.update(cx, |v, cx| {
+                                        if let Some(MsgBlock::Tool(tool)) =
+                                            v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                        {
+                                            tool.expanded = !tool.expanded;
+                                        }
+                                        // 折叠/展开改了条目高度：列表须重测
+                                        v.invalidate_chat_heights();
+                                        cx.notify();
+                                    });
+                                },
+                            )
+                            .into_any_element()
+                        }
                         "fs" if !tool.error && tool.result.is_some() => {
                             let path = arg_str("path");
                             let shown = widgets::display_path(&path, &self.current_cwd);
@@ -2922,6 +3159,8 @@ open: false,
                                                 {
                                                     tool.expanded = !tool.expanded;
                                                 }
+                                                // 折叠/展开改了条目高度：列表须重测
+                                                v.invalidate_chat_heights();
                                                 cx.notify();
                                             });
                                         },
@@ -2943,6 +3182,8 @@ open: false,
                                                 {
                                                     tool.expanded = !tool.expanded;
                                                 }
+                                                // 折叠/展开改了条目高度：列表须重测
+                                                v.invalidate_chat_heights();
                                                 cx.notify();
                                             });
                                         },
@@ -2954,6 +3195,22 @@ open: false,
                                     &pretty_args,
                                     tool.result.as_deref(),
                                     tool.error,
+                                    tool.expanded,
+                                    {
+                                        let t_fold = this.clone();
+                                        move |_, _, cx| {
+                                            t_fold.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    tool.expanded = !tool.expanded;
+                                                }
+                                                // 折叠/展开改了条目高度：列表须重测
+                                                v.invalidate_chat_heights();
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
                                 )
                                 .into_any_element(),
                             }
@@ -2996,6 +3253,8 @@ open: false,
                                                 {
                                                     tool.expanded = !tool.expanded;
                                                 }
+                                                // 折叠/展开改了条目高度：列表须重测
+                                                v.invalidate_chat_heights();
                                                 cx.notify();
                                             });
                                         },
@@ -3008,6 +3267,22 @@ open: false,
                                     &pretty_args,
                                     tool.result.as_deref(),
                                     tool.error,
+                                    tool.expanded,
+                                    {
+                                        let t_fold = this.clone();
+                                        move |_, _, cx| {
+                                            t_fold.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    tool.expanded = !tool.expanded;
+                                                }
+                                                // 折叠/展开改了条目高度：列表须重测
+                                                v.invalidate_chat_heights();
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
                                 )
                                 .into_any_element(),
                             }
@@ -3028,6 +3303,8 @@ open: false,
                                                 {
                                                     tool.expanded = !tool.expanded;
                                                 }
+                                                // 折叠/展开改了条目高度：列表须重测
+                                                v.invalidate_chat_heights();
                                                 cx.notify();
                                             });
                                         },
@@ -3040,6 +3317,22 @@ open: false,
                                     &pretty_args,
                                     tool.result.as_deref(),
                                     tool.error,
+                                    tool.expanded,
+                                    {
+                                        let t_fold = this.clone();
+                                        move |_, _, cx| {
+                                            t_fold.update(cx, |v, cx| {
+                                                if let Some(MsgBlock::Tool(tool)) =
+                                                    v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                                {
+                                                    tool.expanded = !tool.expanded;
+                                                }
+                                                // 折叠/展开改了条目高度：列表须重测
+                                                v.invalidate_chat_heights();
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
                                 )
                                 .into_any_element(),
                             }
@@ -3055,6 +3348,22 @@ open: false,
                             &pretty_args,
                             tool.result.as_deref(),
                             tool.error,
+                            tool.expanded,
+                            {
+                                let t_fold = this.clone();
+                                move |_, _, cx| {
+                                    t_fold.update(cx, |v, cx| {
+                                        if let Some(MsgBlock::Tool(tool)) =
+                                            v.entries.get_mut(ei).and_then(|e| e.blocks.get_mut(bi))
+                                        {
+                                            tool.expanded = !tool.expanded;
+                                        }
+                                        // 折叠/展开改了条目高度：列表须重测
+                                        v.invalidate_chat_heights();
+                                        cx.notify();
+                                    });
+                                }
+                            },
                         )
                         .into_any_element(),
                     };
@@ -4656,7 +4965,7 @@ impl AppView {
             // web --dsh-chat-content-width：内容列随中栏宽度自适应
             let content_w = layout::chat_content_width(width);
             let chat_list_state = self.chat_list.clone();
-            let chat_list_el = gpui::list(chat_list_state, move |ix, _window, cx| {
+            let chat_list_el = gpui::list(chat_list_state.clone(), move |ix, _window, cx| {
                 let entry = list_this.read_with(cx, |v, _| v.entries.get(ix).cloned());
                 match entry {
                     Some(e) => {
@@ -4698,12 +5007,22 @@ impl AppView {
                                                         if !v.turn_expanded.remove(&e.turn) {
                                                             v.turn_expanded.insert(e.turn);
                                                         }
+                                                        // 成员从零高占位 ↔ 完整条目，
+                                                        // 高度大变：列表须重测，否则重叠
+                                                        v.invalidate_chat_heights();
                                                         cx.notify();
                                                     });
                                                 },
                                             );
                                             if expanded {
-                                                return control
+                                                // 控制行（固定 33px）与展开体必须是
+                                                // 兄弟节点（web 同构）：曾把整个条目
+                                                // 塞进控制行当 child，内容垂直溢出、
+                                                // 叠在后续行上
+                                                return div()
+                                                    .w_full()
+                                                    .v_flex()
+                                                    .child(control)
                                                     .child(v.render_entry(&e, ix, &this, content_w))
                                                     .into_any_element();
                                             }
@@ -4754,11 +5073,28 @@ impl AppView {
                         .relative()
                         .child(
                             if self.tab == CenterTab::Conversation {
+                                // 两侧空白：list hitbox 只覆盖内容列（padding
+                                // 区在命中链之外），由 wrapper 接住滚轮转发给
+                                // 列表；指针在列表 viewport 内时交给列表自身，
+                                // 避免双重滚动
                                 div()
                                     .id("chat-scroll")
                                     .h_full()
-                                    .px_8()
-                                    .child(chat_list_el)
+                                    .on_scroll_wheel({
+                                        let wheel_state = chat_list_state.clone();
+                                        let wheel_view = this.clone();
+                                        move |event: &ScrollWheelEvent, _window, cx| {
+                                            if !wheel_state.viewport_bounds().contains(&event.position)
+                                            {
+                                                let delta = event.delta.pixel_delta(px(20.0));
+                                                if !delta.y.is_zero() {
+                                                    wheel_state.scroll_by(-delta.y);
+                                                    wheel_view.update(cx, |_, cx| cx.notify());
+                                                }
+                                            }
+                                        }
+                                    })
+                                    .child(chat_list_el.px_8())
                                     .into_any_element()
                             } else {
                                 body.into_any_element()
@@ -6106,6 +6442,20 @@ fn main() {
         order: prompt.get_section_order(dsh_system_prompt::PromptSectionOrderName::ToolGlob),
         text: "Use the glob tool — not shell find — to discover files by path pattern. A pattern with no \"/\" matches basenames at any depth, so \"*\" matches every file in the tree rather than its top level. Results are files only, never directories, and include hidden and ignored files: a result that fits comes back in modification-time order, while a larger one keeps the modification-time-ordered head.".into(),
     });
+    // tool:shell section：cwd 已是工作区根（免 cd、Windows 路径风格）+ 长命令
+    // 先落盘再检视的纪律；随工作区切换经 AppView::sync_fs_sandbox 重建
+    let shell_section = std::cell::RefCell::new(Some(prompt.add_section(dsh_system_prompt::PromptSection {
+        name: "tool:shell".into(),
+        order: prompt.get_section_order(dsh_system_prompt::PromptSectionOrderName::ToolBash),
+        text: shell_section_text(&workdir.get().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
+    })));
+    // 工作区指令（AGENTS.md 兼容）section：随工作区切换重建；启动时尚无
+    // 工作区，先注册空壳位次，首次 sync_fs_sandbox 换成实际内容
+    let workspace_instructions = std::cell::RefCell::new(Some(prompt.add_section(dsh_system_prompt::PromptSection {
+        name: "workspace:instructions".into(),
+        order: prompt.get_section_order(dsh_system_prompt::PromptSectionOrderName::WorkspaceInstructions),
+        text: String::new(),
+    })));
     let demo_prompt = std::env::var("DSH_PROMPT").ok().filter(|s| !s.trim().is_empty());
 
     // --- 会话持久化：与 web 完全共享（--key--/sid/session.jsonl.zstd）---
@@ -6201,7 +6551,7 @@ fn main() {
         },
         Arc::clone(&llm),
         tools,
-        prompt,
+        Arc::clone(&prompt),
         Arc::clone(&projections),
         events,
     );
@@ -6235,36 +6585,36 @@ fn main() {
 
     // 注册用户声明的自定义提供方（OpenAI 兼容，复用 DeepSeek adapter）
     for p in &user_settings.providers {
-        if !p.base_url.is_empty() {
-            let adapter = DeepSeekAdapter::with_base_url(&p.api_key, &p.base_url);
-            let _ = llm.register_adapter(&[p.id.clone()], Arc::new(adapter));
+        // adopt 自 pi-ai 目录的提供方可省 baseURL（web 侧由目录补全）；
+        // 宿主按 id 兜底已知端点——曾因 baseURL 为空跳过注册，路由选中
+        // 该提供方后请求找不到 adapter
+        let base_url = if p.base_url.is_empty() {
+            known_provider_base_url(&p.id).unwrap_or_default().to_string()
+        } else {
+            p.base_url.clone()
+        };
+        if base_url.is_empty() {
+            continue;
         }
+        let adapter = DeepSeekAdapter::with_base_url(&p.api_key, base_url);
+        let _ = llm.register_adapter(&[p.id.clone()], Arc::new(adapter));
     }
-    let initial_route = if startup_active == "deepseek" {
+    let initial_model = std::env::var("DSH_MODEL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| if startup_desired.is_empty() { None } else { Some(startup_desired.clone()) })
+        .unwrap_or_else(|| "deepseek-chat".to_string());
+    // 初始路由：**用户持久化的选择优先**（settings 的 active provider +
+    // agent-default-model）——UI 显示什么模型就必须用什么模型。曾有回归：
+    // deepseek key（env/.credentials）存在时强制短路回 deepseek/deepseek-chat，
+    // UI 显示 glm 实际请求却打在 deepseek 上（402 余额不足无人察觉）。
+    // key 只决定 key 来源，不覆盖用户选择；无有效持久化选择时才回退
+    // deepseek key → 自定义首个 → mock。
+    let effective_startup = if startup_active == "deepseek" {
         "deepseek".to_string()
     } else if user_settings.providers.iter().any(|p| p.id == startup_active) {
         startup_active.clone()
-    } else {
-        "deepseek".to_string()
-    };
-    let initial_model = if startup_desired.is_empty() {
-        "deepseek-chat".to_string()
-    } else {
-        startup_desired.clone()
-    };
-    // 初始路由：环境变量 key > 自定义提供方 > mock
-    // agent 初始路由优先级：
-    //   1. 环境变量 DEEPSEEK_KEY（显式意图，最优先）
-    //   2. settings.yaml 的 agent-default-model 所指 provider（web 里选定的当前模型）
-    //   3. .credentials.yaml 有 DEEPSEEK key
-    //   4. 声明的第一个 provider / 5. mock
-    let effective_startup = if provider == "deepseek" {
-        "deepseek".to_string()
-    } else if initial_route != "deepseek"
-        && user_settings.providers.iter().any(|p| p.id == initial_route)
-    {
-        initial_route.clone()
-    } else if !stored_deepseek_key.is_empty() {
+    } else if provider != "mock" {
         "deepseek".to_string()
     } else if user_settings.providers.is_empty() {
         "mock".to_string()
@@ -6275,20 +6625,24 @@ fn main() {
             .map(|p| p.id.clone())
             .unwrap_or_default()
     };
-    if effective_startup != "mock"
-        && let Some(p) = user_settings.providers.iter().find(|p| p.id == effective_startup)
-    {
+    // deepseek 分支同样要应用路由（模型用持久化选择/DSH_MODEL，而非构造默认）
+    let startup_model = if effective_startup == "deepseek" || effective_startup == "mock" {
+        initial_model.clone()
+    } else if let Some(p) = user_settings.providers.iter().find(|p| p.id == effective_startup) {
         // 尊重 agent-default-model/DSH_MODEL 指定的模型（initial_model）；
         // 仅当该提供方不提供此模型时才回退列表首个
-        let model = if p.models.iter().any(|m| m.id == initial_model) {
+        if p.models.iter().any(|m| m.id == initial_model) {
             initial_model.clone()
         } else {
-            p.models.first().map(|m| m.id.clone()).unwrap_or(initial_model.clone())
-        };
-        agent.set_provider_and_model(p.id.clone(), model.clone());
-        subagent_tool.set_route(&p.id, &model);
+            p.models.first().map(|m| m.id.clone()).unwrap_or_else(|| initial_model.clone())
+        }
+    } else {
+        initial_model.clone()
+    };
+    if effective_startup != "mock" {
+        agent.set_provider_and_model(effective_startup.clone(), startup_model.clone());
+        subagent_tool.set_route(&effective_startup, &startup_model);
     }
-    let _ = initial_model;
 
     Application::new()
         .with_assets(assets::AppAssets)
@@ -6348,10 +6702,17 @@ fn main() {
                 let edit_base = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).placeholder("提供方默认")
                 });
-                let desired_model = std::env::var("DSH_MODEL")
-                    .unwrap_or_else(|_| user_settings.model.clone());
+                // 显示与路由必须同源：UI 展示的就是 agent 实际路由的模型
+                //（曾各算各的，UI 显示 glm 实际走 deepseek-chat）
+                let desired_model = startup_model.clone();
                 let app = cx.new(|cx| {
-                    let deps = AppDeps { recorder: Arc::clone(&recorder), llm: Arc::clone(&llm) };
+                let deps = AppDeps {
+                    recorder: Arc::clone(&recorder),
+                    llm: Arc::clone(&llm),
+                    prompt: Arc::clone(&prompt),
+                    shell_section,
+                    workspace_instructions,
+                };
                     AppView::new(
                         Arc::clone(&agent),
                         deps,
@@ -6409,7 +6770,16 @@ fn main() {
                                 return;
                             };
                             if running {
-                                let _ = tick_view.update(&mut cx, |_, cx| cx.notify());
+                                let need_notify = tick_view.update(&mut cx, |v, _| {
+                                    let dirty = v.heights_dirty.replace(false);
+                                    if dirty {
+                                        v.invalidate_chat_heights();
+                                    }
+                                    dirty
+                                });
+                                if matches!(need_notify, Ok(true)) {
+                                    let _ = tick_view.update(&mut cx, |_, cx| cx.notify());
+                                }
                             }
                         }
                     }

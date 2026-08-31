@@ -157,7 +157,9 @@ fn run(pattern: &str, path: Option<String>, include: Option<String>, workdir: &d
         None => None,
     };
     let root: PathBuf = match &path {
-        Some(p) => PathBuf::from(shell_expand(p)),
+        // 相对路径按会话工作区解析（与工具描述承诺一致；曾直接按进程
+        // cwd 解析，shell 在工作区根落的文件 grep 却"找不到"）
+        Some(p) => workdir.resolve(Path::new(&shell_expand(p))),
         // web：session cwd 优先，进程 cwd 兜底
         None => workdir.get().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
     };
@@ -348,7 +350,9 @@ fn run_glob(pattern: &str, path: Option<String>, workdir: &dsh_tools::Workdir) -
         Err(e) => return ToolExecutionResult::error(format!("invalid pattern: {e}")),
     };
     let root: PathBuf = match &path {
-        Some(p) => PathBuf::from(shell_expand(p)),
+        // 相对路径按会话工作区解析（与工具描述承诺一致；曾直接按进程
+        // cwd 解析，shell 在工作区根落的文件 grep 却"找不到"）
+        Some(p) => workdir.resolve(Path::new(&shell_expand(p))),
         None => workdir.get().unwrap_or_else(|| std::env::current_dir().unwrap_or_default()),
     };
     if !root.is_dir() {
@@ -543,6 +547,40 @@ mod tests {
             .unwrap_or_default();
         assert!(text.contains("src/a.rs") && text.contains("src/nested.rs"), "{text}");
         assert!(!text.contains("top.txt"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod workdir_tests {
+    use super::*;
+    use dsh_llm::CallId;
+    use dsh_tools::ToolExecutionInput;
+
+    #[tokio::test]
+    async fn grep_relative_path_resolves_against_workdir() {
+        // 回归：真实会话里 shell 在工作区根落了文件，grep 传相对路径却按
+        // 进程 cwd 解析报"找不到"——必须相对会话工作目录。
+        let dir = std::env::temp_dir().join(format!("dsh-search-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("merges.txt"), "Merge pull request #1\nnoise\n").unwrap();
+        let tool = GrepTool::default().with_workdir(dsh_tools::Workdir::with_value(dir.clone()));
+        let input = ToolExecutionInput::with_raw_arguments(
+            CallId("t".into()),
+            "grep".into(),
+            r#"{"pattern": "Merge pull request", "path": "merges.txt"}"#.into(),
+        );
+        let result = tool.execute(&input).await;
+        assert!(!result.is_error, "{result:?}");
+        let text = result
+            .content
+            .iter()
+            .find_map(|b| match b {
+                dsh_llm::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(text.contains("Merge pull request #1"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

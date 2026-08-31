@@ -10,7 +10,7 @@
 use dsh_llm::{
     CallId, ContentBlock, Message, MessageId, MessageSource, SessionId,
 };
-use dsh_session::{Session, SessionEvent};
+use dsh_session::{EpochHeader, HeaderReason, Session, SessionEvent};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -546,7 +546,10 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
         "turn/start" => Some(SessionEvent::TurnStart { turn: num(data, "turn") }),
         "turn/end" => Some(SessionEvent::TurnEnd {
             turn: num(data, "turn"),
-            reason: dsh_session::TurnEndReason::Completed,
+            reason: data
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| serde_json::from_value(r.clone()).ok())
+                .unwrap_or(dsh_session::TurnEndReason::Completed),
         }),
         "step/start" => Some(SessionEvent::StepStart { turn: num(data, "turn"), step: num(data, "step") }),
         "user/message" => {
@@ -699,6 +702,17 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
             step: num(data, "step"),
             retry: num(data, "retry") as u32,
         }),
+        // 请求纪元（event_to_web_line 的对称读回；reason 缺省按 Change 解释）
+        "request/header" => {
+            let d = data?;
+            let header: EpochHeader = serde_json::from_value(d.get("header").cloned().unwrap_or(serde_json::Value::Null))
+                .ok()?;
+            let reason: HeaderReason = d
+                .get("reason")
+                .and_then(|r| serde_json::from_value(r.clone()).ok())
+                .unwrap_or(HeaderReason::Change);
+            Some(SessionEvent::RequestHeader { header, reason })
+        }
         _ => None,
     }
 }
@@ -801,7 +815,13 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
     };
     match ev {
         SessionEvent::TurnStart { turn } => Some(row("turn/start", serde_json::json!({"turn": turn}))),
-        SessionEvent::TurnEnd { turn, .. } => Some(row("turn/end", serde_json::json!({"turn": turn, "reason": {"kind": "completed"}}))),
+        SessionEvent::TurnEnd { turn, reason } => Some(row(
+            "turn/end",
+            serde_json::json!({
+                "turn": turn,
+                "reason": serde_json::to_value(reason).unwrap_or(serde_json::json!({"kind": "completed"})),
+            }),
+        )),
         SessionEvent::StepStart { turn, step } => Some(row("step/start", serde_json::json!({"turn": turn, "step": step}))),
         SessionEvent::UserMessage(m) => {
             // source 按真实词汇序列化（web merge-extensible sum）：
@@ -916,6 +936,16 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
             "llm/retry-started",
             serde_json::json!({"retryId": retry_id, "turn": turn, "step": step, "retry": retry}),
         )),
+        // 请求纪元（web request/header：config + 实际下发的 system/tools +
+        // 变更原因）——审计「模型实际看到什么」的唯一凭据，必须落盘；
+        // 首次 Initial、此后仅变更时追加，体量有界
+        SessionEvent::RequestHeader { header, reason } => Some(row(
+            "request/header",
+            serde_json::json!({
+                "header": serde_json::to_value(header).unwrap_or(serde_json::Value::Null),
+                "reason": serde_json::to_value(reason).unwrap_or(serde_json::Value::Null),
+            }),
+        )),
         _ => None,
     }
 }
@@ -944,6 +974,41 @@ mod tests {
         assert_eq!(row["identity"]["cwd"], "/tmp/ws");
         assert_eq!(row["rows"]["title"]["val"], "你好");
         assert_eq!(row["rows"]["title"]["ver"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn request_header_round_trips_to_disk() {
+        // 回归：event_to_web_line 曾把 RequestHeader 落进 `_ => None`，
+        // 「模型实际看到的 system/tools/config」从未写盘——会话审计
+        // （用-查-改-用的「查」）无从验证 prompt 修复是否生效。
+        let dir = std::env::temp_dir().join(format!("dsh-persist-header-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = SessionRecorder::new(dir.join("sessions"));
+        let id = SessionId::new("session-header");
+        rec.create(&id, "/tmp/ws", "standard").unwrap();
+        let header = EpochHeader {
+            config: serde_json::from_value(serde_json::json!({
+                "provider": "deepseek", "model": "test-model", "maxTokens": 1024
+            }))
+            .unwrap(),
+            system: Some("You are DeepSeek Harness (Rust).".into()),
+            tools: None,
+        };
+        rec.append(&id, "/tmp/ws", &SessionEvent::RequestHeader { header, reason: HeaderReason::Initial }).unwrap();
+
+        // 落盘行形：request/header + header.system + reason=initial
+        let file = rec.session_file(&id, "/tmp/ws");
+        let raw_bytes = zstd::stream::decode_all(std::fs::File::open(&file).unwrap()).unwrap();
+        let raw = String::from_utf8(raw_bytes).unwrap();
+        assert!(raw.contains("\"request/header\""), "{raw}");
+        assert!(raw.contains("You are DeepSeek Harness (Rust)."), "{raw}");
+        assert!(raw.contains("\"initial\""), "{raw}");
+
+        // 读回：typed 事件还原
+        let (session, _) = rec.load(&id, Some("/tmp/ws")).unwrap();
+        let restored = session.request_header().expect("header should survive load");
+        assert_eq!(restored.system.as_deref(), Some("You are DeepSeek Harness (Rust)."));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1094,5 +1159,92 @@ mod tests {
         assert!(list.iter().any(|e| e.id == a && e.cwd.as_deref() == Some("/tmp/ws-a")));
         assert!(list.iter().any(|e| e.id == b && e.cwd.as_deref() == Some("/tmp/ws-b")));
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use dsh_session::SessionEvent;
+
+    #[test]
+    fn turn_end_error_reason_round_trips() {
+        // 回归：turn/end 的 reason 曾被硬编码为 "completed"，失败轮次
+        // （LLM 余额不足/超时/中止）在日志里永远"成功"——审计与历史
+        // 回放都无法区分。真实 reason 必须双向保真。
+        let failure = dsh_llm::LlmFailure {
+            message: "Insufficient Balance".into(),
+            code: "QUOTA".into(),
+            status: Some(402),
+            provider_retry_after_ms: None,
+            request_id: None,
+        };
+        let event = SessionEvent::TurnEnd { turn: 3, reason: dsh_session::TurnEndReason::Error { failure } };
+        let row = event_to_web_line(&event, 9, 5678).expect("turn/end must map");
+        assert_eq!(row["data"]["reason"]["kind"], "error", "{row}");
+        assert_eq!(row["data"]["reason"]["failure"]["code"], "QUOTA");
+        match web_line_to_event(&row).expect("turn/end must parse back") {
+            SessionEvent::TurnEnd { turn, reason } => {
+                assert_eq!(turn, 3);
+                match reason {
+                    dsh_session::TurnEndReason::Error { failure } => {
+                        assert_eq!(failure.code, "QUOTA");
+                        assert_eq!(failure.message, "Insufficient Balance");
+                    }
+                    other => panic!("expected Error reason, got {other:?}"),
+                }
+            }
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+        // 旧格式（硬编码 completed）仍可读
+        let legacy: serde_json::Value = serde_json::json!({
+            "type": "turn/end", "seq": 1, "time": 1, "data": {"turn": 1, "reason": {"kind": "completed"}}
+        });
+        match web_line_to_event(&legacy).unwrap() {
+            SessionEvent::TurnEnd { reason: dsh_session::TurnEndReason::Completed, .. } => {}
+            other => panic!("expected Completed for legacy row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_tool_call_blocks_survive_disk_round_trip() {
+        // 回归：历史会话回放（gpui rebuild_from_session）依赖 assistant/
+        // message 里的 tool-call 块渲染工具轨迹——落盘/读回任一侧丢块，
+        // 打开历史会话就只剩用户气泡。
+        let message = Message::assistant(
+            vec![
+                ContentBlock::text("让我看一下。"),
+                ContentBlock::ToolCall { id: CallId("call_1".into()), name: "fs".into(), arguments: r#"{"op":"list","path":"E:\x"}"#.into() },
+            ],
+            "deepseek",
+            "test-model",
+        );
+        let event = SessionEvent::AssistantMessage { turn: 1, step: 1, message, interrupted: false, usage: None };
+        let row = event_to_web_line(&event, 7, 1234).expect("assistant/message must map");
+        assert_eq!(row["type"], "assistant/message");
+        let back = web_line_to_event(&row).expect("assistant/message must parse back");
+        match back {
+            SessionEvent::AssistantMessage { message, .. } => {
+                let kinds: Vec<&str> = message
+                    .content
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text { .. } => "text",
+                        ContentBlock::ToolCall { .. } => "tool-call",
+                        _ => "other",
+                    })
+                    .collect();
+                assert_eq!(kinds, vec!["text", "tool-call"]);
+                match &message.content[1] {
+                    ContentBlock::ToolCall { id, name, arguments } => {
+                        assert_eq!(id.0, "call_1");
+                        assert_eq!(name, "fs");
+                        assert!(arguments.contains("\"op\":\"list\""));
+                    }
+                    other => panic!("expected tool-call, got {other:?}"),
+                }
+            }
+            other => panic!("expected AssistantMessage, got {other:?}"),
+        }
     }
 }

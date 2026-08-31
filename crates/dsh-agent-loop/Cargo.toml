@@ -23,6 +23,7 @@ flume.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+dsh-persist = { path = "../dsh-persist" }
 dsh-fs = { path = "../dsh-fs" }
 dsh-shell = { path = "../dsh-shell" }
 dsh-web = { path = "../dsh-web" }

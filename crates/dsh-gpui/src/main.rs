@@ -4274,11 +4274,14 @@ impl AppView {
                             .child({
                                 let t_add_ws = this.clone();
                                 icon_btn("sb-add-workspace", IconName::Plus, theme::t().text_2, "添加工作区", move |_, window, cx| {
-                                    // 异步目录拾取：Task 丢弃即取消，必须 detach；
-                                    // set_parent 挂到点击所在窗口（rfd 缺省取
-                                    // windows().firstObject()，GPUI 下可能挂错窗）
+                                    // 异步目录拾取：Task 丢弃即取消，必须 detach。
+                                    // 不挂父窗：rfd set_parent 会调 gpui Window 的
+                                    // display_handle()，0.2.2 Windows 后端是
+                                    // unimplemented!()，点击即崩（panic 绕过 rfd
+                                    // 的 .ok() 容错）；无主对话框在 Windows 上安全。
+                                    let _ = window;
                                     let t = t_add_ws.clone();
-                                    let dialog = rfd::AsyncFileDialog::new().set_parent(window);
+                                    let dialog = rfd::AsyncFileDialog::new();
                                     cx.spawn(async move |cx| {
                                         let picked = dialog.pick_folder().await;
                                         eprintln!("[ws-pick] resolved: {:?}", picked.as_ref().map(|f| f.path().to_string_lossy().to_string()));
@@ -5211,11 +5214,13 @@ impl AppView {
                                             t_add.update(cx, |v, _cx| {
                                                 v.hero_ws_menu = false;
                                             });
-                                            // 异步目录拾取 + 显式父窗（缺省 rfd 取
-                                            // NSApp.windows().firstObject()，GPUI 下
-                                            // 可能挂到不可见窗口导致面板永不出现）
+                                            // 异步目录拾取。不挂父窗：rfd set_parent
+                                            // 会调 gpui Window 的 display_handle()，
+                                            // 0.2.2 Windows 后端是 unimplemented!()，
+                                            // 点击即崩；无主对话框在 Windows 上安全。
+                                            let _ = window;
                                             let t = t_add.clone();
-                                            let dialog = rfd::AsyncFileDialog::new().set_parent(window);
+                                            let dialog = rfd::AsyncFileDialog::new();
                                             cx.spawn(async move |cx| {
                                                 let picked = dialog.pick_folder().await;
                                                 if let Some(folder) = picked {

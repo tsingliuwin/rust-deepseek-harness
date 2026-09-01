@@ -2314,7 +2314,9 @@ impl Render for ChatView {
                     }
                 }
             })
-            .child(chat_list_el.px_8())
+            // web .scroll { padding: 16px … }：滚动区顶部留 16px，首条消息
+            // 不与 header 分隔线贴合（曾缺失导致用户气泡顶死分隔线）
+            .child(chat_list_el.pt(px(16.0)).px_8())
             .children(rail)
             .when(show_jump, |d| {
                 d.child(

@@ -20,7 +20,10 @@ enum MdSegment {
     Code { lang: String, code: String },
 }
 
-/// 按 ``` 围栏拆分（粗粒度但稳定；未闭合围栏回退为文本）。
+/// 按 ``` 围栏拆分（粗粒度但稳定）。未闭合围栏按 CommonMark 语义「延伸到
+/// 文档末尾」直接渲染为代码卡——流式期间 web 的增量解析器同样把尾部未闭
+/// 合围栏作为 code 块增量渲染（0.1.2-alpha.3 openFence：已完成行冻结、只
+/// 重析最后一行 + 当前行），闭合前后同一张卡，不再回退成正文文本。
 fn split_markdown(md: &str) -> Vec<MdSegment> {
     let newline = "
 ";
@@ -36,25 +39,17 @@ fn split_markdown(md: &str) -> Vec<MdSegment> {
             }
             let lang = trimmed.trim_start_matches("```").trim().to_string();
             let mut code = String::new();
-            let mut closed = false;
             for inner in lines.by_ref() {
                 if inner.trim_start().starts_with("```") {
-                    closed = true;
                     break;
                 }
                 code.push_str(inner);
                 code.push_str(newline);
             }
-            if !closed {
-                text_buf.push_str(line);
-                text_buf.push_str(newline);
-                text_buf.push_str(&code);
-                continue;
-            }
-            segments.push(MdSegment::Code {
-                lang: if lang.is_empty() { "text".into() } else { lang },
-                code: code.trim_end_matches(newline).to_string(),
-            });
+            let lang = if lang.is_empty() { "text".into() } else { lang };
+            let code = code.trim_end_matches(newline).to_string();
+            // 未闭合（流式中）：照常出代码卡（内容随后续 chunk 增长）。
+            segments.push(MdSegment::Code { lang, code });
         } else {
             text_buf.push_str(line);
             text_buf.push_str(newline);

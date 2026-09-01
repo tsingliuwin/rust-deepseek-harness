@@ -3356,6 +3356,10 @@ fn main() {
     // 会话投影注册表（0.1.2-alpha.2）：turnBoundary 由 agent-loop 注册，
     // llmRetry 由重试执行器注册；重试进度持久进会话日志后从这里读取。
     let projections = Arc::new(dsh_session_projection::SessionProjections::default());
+    // turnOutline（0.1.2-alpha.3）：全日志轮次大纲，ChatView 轮次导航栏
+    // 渲染「每一条已开始的轮次」并按 turn/start seq 定位。
+    let _turn_outline_disposer = projections
+        .register(dsh_session_projection::turn_outline::turn_outline_projection_definition());
     // agent/request-error 退避重试（参考 dsh-llm-retry 的角色）；重试监听者
     // 经 agent 槽拿到会话句柄后再持久化 llm/retry 事件。
     let retry_agent_slot: Arc<std::sync::OnceLock<Arc<dsh_agent_loop::ReactLoopAgent>>> =

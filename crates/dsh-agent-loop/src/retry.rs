@@ -98,6 +98,8 @@ fn llm_retry_projection_definition() -> ProjectionDefinition<LlmRetryState> {
                 _ => state,
             }
         },
+        // llmRetry 无客户端 wire 面（重试执行器内消费）。
+        view: None,
     }
 }
 

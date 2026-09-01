@@ -100,6 +100,8 @@ pub fn turn_boundary_projection_definition() -> ProjectionDefinition<TurnBoundar
             }
             next
         },
+        // turnBoundary 无客户端 wire 面（宿主内消费）。
+        view: None,
     }
 }
 

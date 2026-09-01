@@ -16,6 +16,9 @@ use crate::{
     TranscriptView, TurnUsage, format_latency_seconds, format_message_clock, format_run_duration,
     format_tokens_compact, format_tokens_exact, format_tps, now_ms,
 };
+use dsh_session_projection::turn_outline::{
+    PROMPT_PREVIEW_LIMIT, RESPONSE_PREVIEW_LIMIT, preview_parts,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::ButtonVariants;
@@ -61,6 +64,16 @@ pub(crate) struct ChatView {
     chat_items: usize,
     /// 列表当前是否贴底（scroll handler 维护）
     list_bottom: Rc<Cell<bool>>,
+    /// 轮次导航栏激活轮（web activeTurn：滚动读位 + 贴底取最新）
+    active_turn: Option<u64>,
+    /// 导航栏 hover 预览轮（web previewTurn）
+    preview_turn: Option<u64>,
+    /// 导航梯内部滚动柄（固定行距梯溢出滚动，web .scroller）
+    rail_scroll: gpui::UniformListScrollHandle,
+    /// 指针在导航栏内：active 跟随暂停（web pointerInsideRef）
+    rail_pointer_inside: bool,
+    /// 上次 active 跟随目标（跟随只在离屏时下发一次滚动指令）
+    rail_follow: Cell<Option<u64>>,
     /// 下一次 sync 强制 reset（会话切换/重建：内容整体替换）
     chat_reset_pending: bool,
     /// 流式文本渲染节流快照。gpui-component TextView 的后台解析是"每条更新
@@ -122,6 +135,11 @@ impl ChatView {
             chat_list: ListState::new(0, ListAlignment::Top, px(100.0)),
             chat_items: 0,
             list_bottom: Rc::new(Cell::new(true)),
+            active_turn: None,
+            preview_turn: None,
+            rail_scroll: gpui::UniformListScrollHandle::new(),
+            rail_pointer_inside: false,
+            rail_follow: Cell::new(None),
             chat_reset_pending: false,
             stream_text_shown: RefCell::new(None),
             heights_dirty: Cell::new(false),
@@ -142,13 +160,32 @@ impl ChatView {
             cwd: String::new(),
             transcript_view,
         };
-        // 贴底状态跟踪：滚动事件更新可见范围是否含末尾
+        // 贴底状态跟踪 + 激活轮跟踪：滚动事件更新可见范围是否含末尾；
+        // 激活轮按 web 规则取「读位条目」（可视区首条）所属轮次，贴底取
+        // 最新轮（web turnAtLine / 贴底覆盖的同语义）。
         {
             let list = view.chat_list.clone();
             let bottom = Rc::clone(&view.list_bottom);
-            list.set_scroll_handler(move |ev, _window, _cx| {
+            let this = cx.entity().downgrade();
+            list.set_scroll_handler(move |ev, _window, cx| {
                 // visible_range.end 是后半开区间：末项可见 ⟺ end > last
-                bottom.set(ev.visible_range.end >= ev.count);
+                let at_bottom = ev.visible_range.end >= ev.count;
+                bottom.set(at_bottom);
+                let Some(view) = this.upgrade() else { return };
+                let read_ix = ev.visible_range.start;
+                view.update(cx, |v, cx| {
+                    let next = if at_bottom || v.entries.is_empty() {
+                        v.entries.last().map(|e| e.turn)
+                    } else {
+                        v.entries
+                            .get(read_ix.min(v.entries.len() - 1))
+                            .map(|e| e.turn)
+                    };
+                    if v.active_turn != next {
+                        v.active_turn = next;
+                        cx.notify();
+                    }
+                });
             });
         }
         // 流式期间 100ms tick：heights_dirty 消费（统一重测行高）+ 状态行
@@ -208,6 +245,8 @@ impl ChatView {
             // 已测高度。曾用 scroll_to_reveal_item(n-1)：它按陈旧高度和算
             // 底部位置，流式时最后一条持续长高，目标偏移反复偏差 → 上下闪
             self.chat_list.scroll_to(ListOffset { item_ix: n, offset_in_item: px(0.) });
+            // 贴底时最新轮持有导航栏激活标记（web toBottom → setActiveTurn）
+            self.active_turn = self.entries.last().map(|e| e.turn);
         }
     }
 
@@ -1772,6 +1811,365 @@ open: false,
     }
 }
 
+// --- 轮次导航栏（web TurnNavigator，上游 0.1.2-alpha.3） ---------------------
+
+/// 固定行距：相邻标记间距（web TURN_SPACING_PX）；溢出在框架内滚动。
+const TURN_SPACING_PX: f32 = 10.0;
+/// 梯顶/梯底各留白（web RAIL_INSET_PX）。
+const RAIL_INSET_PX: f32 = 6.0;
+/// 可滚动端留出的渐隐带（web FADE_PX）。
+const RAIL_FADE_PX: f32 = 24.0;
+/// 导航栏框架宽度（web .frame width: 28px）。
+const RAIL_WIDTH_PX: f32 = 28.0;
+/// 框架最大高（web height: min(…, 420px)；band-64 由外层 py 近似）。
+const RAIL_MAX_HEIGHT_PX: f32 = 420.0;
+/// 预览卡宽（web .preview width: min(300px, 100cqw-120px)）。
+const RAIL_PREVIEW_WIDTH_PX: f32 = 300.0;
+/// 预览卡最大高（web --turn-preview-height: 100px）。
+const RAIL_PREVIEW_HEIGHT_PX: f32 = 100.0;
+/// 中栏窄于此宽整条隐藏（web @container max-width: 900px）。
+const RAIL_MIN_COLUMN_PX: f32 = 900.0;
+
+/// 一条导航梯标记（web TurnRailItem）。已加载轮点击滚动到对应行；
+/// rustdsh 全量加载会话，outline-only 标记只出现在「无可见条目」的轮次
+/// （web 的 unloaded load-and-jump 在此退化为不可点，标记照常可 hover）。
+#[derive(Clone)]
+struct TurnRailItem {
+    turn: u64,
+    /// 有界 prompt 预览（已加载窗口优先，outline 补空）。
+    prompt: String,
+    /// 有界 response 预览（已加载窗口优先，outline 补空）。
+    response: String,
+    /// 已加载锚（该轮用户条目，缺席时取首条可见条目）；None = outline-only。
+    anchor_ix: Option<usize>,
+}
+
+impl ChatView {
+    /// 合并宿主 `turnOutline` 投影与已加载条目为完整导航梯（web
+    /// mergeTurnRailItems：已加载轮保留其锚，outline 只补空预览与缺席轮；
+    /// 结果按轮次号升序）。
+    fn rail_items(&self) -> Vec<TurnRailItem> {
+        struct Loaded {
+            first_ix: Option<usize>,
+            user_ix: Option<usize>,
+            prompt: String,
+            response: String,
+        }
+        impl Loaded {
+            fn new() -> Self {
+                Self { first_ix: None, user_ix: None, prompt: String::new(), response: String::new() }
+            }
+        }
+        // 条目按轮时序连续（轮次号单调），按 run 分组即每轮一组。
+        let mut turns: Vec<(u64, Loaded)> = Vec::new();
+        for (ix, e) in self.entries.iter().enumerate() {
+            if turns.last().map(|(t, _)| *t) != Some(e.turn) {
+                turns.push((e.turn, Loaded::new()));
+            }
+            let loaded = &mut turns.last_mut().unwrap().1;
+            if loaded.first_ix.is_none() {
+                loaded.first_ix = Some(ix);
+            }
+            match e.role {
+                // 首条用户条目：锚 + prompt 预览（同轮更晚的人类消息不改）
+                Role::User if loaded.user_ix.is_none() => {
+                    loaded.user_ix = Some(ix);
+                    loaded.prompt = preview_parts(
+                        e.blocks.iter().filter_map(|b| match b {
+                            MsgBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        }),
+                        PROMPT_PREVIEW_LIMIT,
+                    );
+                }
+                // 最新带文本的助手条目胜出（web findLast non-empty）
+                Role::Assistant => {
+                    let parts: Vec<&str> = e
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            MsgBlock::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !parts.is_empty() {
+                        loaded.response = preview_parts(parts, RESPONSE_PREVIEW_LIMIT);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut merged: Vec<TurnRailItem> = turns
+            .into_iter()
+            .map(|(turn, l)| TurnRailItem {
+                turn,
+                prompt: l.prompt,
+                response: l.response,
+                anchor_ix: l.user_ix.or(l.first_ix),
+            })
+            .collect();
+        // outline：投影缺席 = 无该单元（仅已加载侧成梯）；在则补空预览与
+        // 缺席轮。预览预算两侧一致（50/120），轮次加载前后显示同样的文字。
+        for entry in self.rail_outline() {
+            match merged.iter_mut().find(|i| i.turn == entry.turn) {
+                Some(item) => {
+                    if item.prompt.is_empty() {
+                        item.prompt = entry.prompt;
+                    }
+                    if item.response.is_empty() {
+                        item.response = entry.response;
+                    }
+                }
+                None => merged.push(TurnRailItem {
+                    turn: entry.turn,
+                    prompt: entry.prompt,
+                    response: entry.response,
+                    anchor_ix: None,
+                }),
+            }
+        }
+        merged.sort_by_key(|i| i.turn);
+        merged
+    }
+
+    /// 宿主 `turnOutline` wire 视图（身份门控缓存：轮内 draft-only 变化
+    /// 返回同一个 Arc，这里的反序列化结果随之稳定）。
+    fn rail_outline(&self) -> Vec<dsh_session_projection::turn_outline::TurnOutlineEntry> {
+        let session = self.agent.session();
+        let session = session.lock().unwrap();
+        self.agent
+            .projections()
+            .view_of(&session, "turnOutline")
+            .and_then(|v| serde_json::from_value((*v).clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// 渲染导航栏：右缘竖直居中的 28px 框架内放固定行距标记梯；梯溢出
+    /// 框架时在框内滚动（无滚动条，可滚端 24px 渐隐）；hover 出预览卡；
+    /// 点击已加载标记滚动到该轮。条目 <2 或中栏 <900px 时整条缺席。
+    fn render_turn_rail(
+        &mut self,
+        this: &Entity<Self>,
+        items: &[TurnRailItem],
+        column_w: f32,
+    ) -> Option<AnyElement> {
+        if items.len() < 2 || column_w < RAIL_MIN_COLUMN_PX {
+            return None;
+        }
+        let natural_h = (items.len() - 1) as f32 * TURN_SPACING_PX + 2.0 * RAIL_INSET_PX;
+        let frame_h = natural_h.min(RAIL_MAX_HEIGHT_PX);
+        let scroll_top = f32::from(self.rail_scroll.0.borrow().base_handle.offset().y);
+
+        // active 跟随：激活标记离开滚动视口（渐隐带算离屏）时居中；指针
+        // 在栏内工作时暂停（web pointerInside 同语义）。
+        let active_ix = self.active_turn.and_then(|t| items.iter().position(|i| i.turn == t));
+        if let (Some(a_ix), Some(a_turn)) = (active_ix, self.active_turn) {
+            if !self.rail_pointer_inside {
+                let mark_mid = a_ix as f32 * TURN_SPACING_PX + RAIL_INSET_PX;
+                let offscreen = mark_mid < scroll_top + RAIL_FADE_PX
+                    || mark_mid > scroll_top + frame_h - RAIL_FADE_PX;
+                if offscreen {
+                    if self.rail_follow.get() != Some(a_turn) {
+                        self.rail_follow.set(Some(a_turn));
+                        self.rail_scroll.scroll_to_item(a_ix, ScrollStrategy::Center);
+                    }
+                } else {
+                    self.rail_follow.set(None);
+                }
+            }
+        }
+
+        let items_rc: Rc<Vec<TurnRailItem>> = Rc::new(items.to_vec());
+        let row_this = this.downgrade();
+        let list_items = Rc::clone(&items_rc);
+        let marks = gpui::uniform_list("turn-rail-marks", items.len(), move |range, _window, cx| {
+            let (active_turn, preview_turn) = row_this
+                .read_with(cx, |v, _| (v.active_turn, v.preview_turn))
+                .unwrap_or((None, None));
+            range
+                .map(|ix| {
+                    let item = &list_items[ix];
+                    let active = Some(item.turn) == active_turn;
+                    let previewing = Some(item.turn) == preview_turn;
+                    // tick 状态序：active 20px 蓝 > hover 18px 灰 > 常态
+                    // 12px 边框色（web .markActive/.markPreview/::before）。
+                    let (tick_w, tick_color): (f32, Hsla) = if active {
+                        (20.0, theme::t().accent.into())
+                    } else if previewing {
+                        (18.0, theme::t().text_3.into())
+                    } else {
+                        (12.0, theme::t().border_l4)
+                    };
+                    let t = row_this.clone();
+                    let t_click = row_this.clone();
+                    let turn = item.turn;
+                    let anchor_ix = item.anchor_ix;
+                    div()
+                        .id(("rail-mark", ix as u64))
+                        .h(px(TURN_SPACING_PX))
+                        .w_full()
+                        .relative()
+                        .when(item.anchor_ix.is_none(), |d| d.opacity(0.6))
+                        .cursor_pointer()
+                        .on_hover(move |hovered, _, cx| {
+                            let _ = t.update(cx, |v, cx| {
+                                let next = hovered.then_some(turn);
+                                if v.preview_turn != next {
+                                    v.preview_turn = next;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .on_click(move |_, _, cx| {
+                            let Some(ix) = anchor_ix else { return };
+                            let _ = t_click.update(cx, |v, cx| {
+                                // 跳入历史即离开贴底：先交出贴底所有权，
+                                // 否则钉底跟随会把跳转拽回尾部（web 点击
+                                // 释放 bottom ownership）
+                                v.list_bottom.set(false);
+                                // 行顶落在视口顶下 24px（web flowTop - 24）
+                                v.chat_list
+                                    .scroll_to(ListOffset { item_ix: ix, offset_in_item: px(-24.0) });
+                                v.active_turn = Some(turn);
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .absolute()
+                                .right_0()
+                                .top(px((TURN_SPACING_PX - 2.0) / 2.0))
+                                .h(px(2.0))
+                                .w(px(tick_w))
+                                .rounded(px(2.0))
+                                .bg(tick_color),
+                        )
+                        .into_any_element()
+                })
+                .collect()
+        })
+        .track_scroll(self.rail_scroll.clone())
+        .h(px(frame_h))
+        .w_full();
+
+        let can_up = scroll_top > 1.0;
+        let can_down = scroll_top < natural_h - frame_h - 1.0;
+        let hover_this = this.downgrade();
+        let wheel_this = this.downgrade();
+        let mut frame = div()
+            .id("turn-rail-frame")
+            .relative()
+            .w(px(RAIL_WIDTH_PX))
+            .h(px(frame_h))
+            .flex_none()
+            .cursor_pointer()
+            .on_hover(move |hovered, _, cx| {
+                let _ = hover_this.update(cx, |v, cx| {
+                    v.rail_pointer_inside = *hovered;
+                    if !hovered && v.preview_turn.is_some() {
+                        v.preview_turn = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .on_scroll_wheel(move |_, _, cx| {
+                // 梯滚动改变渐隐带/预览卡位置：下一帧重取偏移
+                if let Some(v) = wheel_this.upgrade() {
+                    v.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .child(marks);
+        if can_up {
+            frame = frame.child(rail_fade(true));
+        }
+        if can_down {
+            frame = frame.child(rail_fade(false));
+        }
+        if let Some(p_ix) = self.preview_turn.and_then(|t| items.iter().position(|i| i.turn == t)) {
+            let item = &items[p_ix];
+            // 预览卡对中于标记（标记位置在滚动梯内：减去滚动偏移），并
+            // 夹持在框架两端内（web .preview top clamp）。
+            let mark_mid = p_ix as f32 * TURN_SPACING_PX + RAIL_INSET_PX;
+            let top = (mark_mid - scroll_top - RAIL_PREVIEW_HEIGHT_PX / 2.0)
+                .clamp(0.0, (frame_h - RAIL_PREVIEW_HEIGHT_PX).max(0.0));
+            frame = frame.child(
+                div()
+                    .absolute()
+                    .right(px(RAIL_WIDTH_PX + 10.0))
+                    .top(px(top))
+                    .w(px(RAIL_PREVIEW_WIDTH_PX))
+                    .max_h(px(RAIL_PREVIEW_HEIGHT_PX))
+                    .overflow_hidden()
+                    .v_flex()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .border_1()
+                    .border_color(theme::t().border_l2)
+                    .rounded(px(10.0))
+                    .bg(theme::t().layer1)
+                    .shadow_md()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::t().text)
+                            .text_ellipsis()
+                            .child(item.prompt.clone()),
+                    )
+                    .when(!item.response.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .mt(px(4.0))
+                                .text_size(px(12.0))
+                                .line_height(px(18.0))
+                                .text_color(theme::t().caption)
+                                // 3×18px 行夹持（web line-clamp: 3）
+                                .max_h(px(54.0))
+                                .overflow_hidden()
+                                .child(item.response.clone()),
+                        )
+                    }),
+            );
+        }
+
+        // 外层铺满滚动区做竖直居中（web top: band/2 + translateY(-50%)）；
+        // py 32px 对应 web band-64 的框架高度让步。无监听者，不拦列表事件。
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .flex()
+                .items_center()
+                .justify_end()
+                .pr(px(12.0))
+                .py(px(32.0))
+                .child(frame)
+                .into_any_element(),
+        )
+    }
+}
+
+/// 梯可滚端的渐隐带（web mask-image 线性渐隐的近似：向背景色过渡）。
+fn rail_fade(top: bool) -> Div {
+    let bg = theme::t().bg_base;
+    let transparent = Hsla { a: 0.0, ..Hsla::from(bg) };
+    let (from, to) = if top {
+        (linear_color_stop(transparent, 0.0), linear_color_stop(bg, 1.0))
+    } else {
+        (linear_color_stop(bg, 0.0), linear_color_stop(transparent, 1.0))
+    };
+    let d = div().absolute().left_0().w_full().h(px(RAIL_FADE_PX));
+    if top {
+        d.top_0().bg(linear_gradient(180.0, from, to))
+    } else {
+        d.bottom_0().bg(linear_gradient(0.0, from, to))
+    }
+}
+
 impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 内容列宽（AppView 布局产物；读取经 accessed-entities 跟踪，
@@ -1890,6 +2288,10 @@ impl Render for ChatView {
         .mx_auto();
 
         let show_jump = !self.chat_near_bottom();
+        // 轮次导航栏（0.1.2-alpha.3 turn rail）：全日志 outline + 已加载
+        // 锚合并成梯，右缘悬浮。轨迹 tab 在上方分支提前返回。
+        let rail_items = self.rail_items();
+        let rail = self.render_turn_rail(&this, &rail_items, width);
         let t_jump = this.clone();
         let chat_list_state_for_wheel = self.chat_list.clone();
         let wheel_view = this.clone();
@@ -1910,6 +2312,7 @@ impl Render for ChatView {
                 }
             })
             .child(chat_list_el.px_8())
+            .children(rail)
             .when(show_jump, |d| {
                 d.child(
                     div()

@@ -80,6 +80,12 @@ cargo run -p dsh-agent-loop --example tools_demo
     - **web_search 失败指引**（web-search-deepseek provider）：dispatch 之后的失败统一带 endpoint 与恢复指引（Settings > Plugins > Web search / `DEEPSEEK_SEARCH_BASE_URL`，"只有用户本人应选择或更改端点"），HTTP 错误消息改为「基础状态 + detail 追加」形状。
     - 上游同版其余变更经评估不适用或无对应物：vendor cordis 仅版本号；`brandString` 运行时品牌（Rust newtype 本就名义类型）；settings `installSection` 注入式重构（无 settings 服务）；`RemoteError` 词汇收敛（无 typert remote 面）；连接恢复指示器（原生直连无网关 websocket）；插件清单/agent-preset/权限预设 UI（无插件与权限系统）；@ 菜单 stale-while-revalidate 与 CSS 修版。
 
+20. **同步 web 0.1.2-alpha.3**（dsh-v0.1.2-alpha.2 → dsh-v0.1.2-alpha.3，2026-09-01 分析落地）：
+    - **轮次导航栏**（web `session-turn-outline` 新包 + `TurnNavigator` 特性族）：新投影单元 `turnOutline`（stateVersion 2）——`turn/start` 边界锚定条目（其 seq 即跳转落点）、首条 User 源 `user/message` 填 prompt 预览（预算 50 字符/一行）、最新带文本 `assistant/message` 进草稿、`turn/end` 提交 response 预览（120 字符/三行）、不推进轮次号的边界被顺序守卫忽略；预览规则（空格拼接、空白折叠、截断加省略号）与导航卡钳一致，轮次在加载前后显示同样文字。UI 右缘 28px 框架内固定行距（10px）标记梯：溢出在框内滚动（最高 420px，无滚动条，可滚端 24px 渐隐）、激活 tick 20px 蓝 / hover 18px 灰 / 常态 12px 边框色、hover 预览卡（300px、prompt 13/20 wt500 一行截断 + response 12/18 caption 三行夹持、对中标记并夹持框内）、点击已加载标记滚动行顶至视口顶下 24px、激活轮按读位条目跟随（贴底取最新、指针在栏内暂停跟随）、条目 <2 或中栏 <900px 整条缺席。outline-only 标记（无可见条目的轮次）降级为半透明不可点。
+    - **session-projection wire 面 + 身份门控变更流**：`ProjectionDefinition` 增加可选 `view`（wire 视图：状态 → 客户端载荷，无 wire 面的单元变更流永不发布）；registry 增加 `view_of`（raw 结果双槽缓存，与上次发布相同则返回同一 Arc——上游「view 复用引用压制 Object.is 发布」的 pull 对应物）与 `on_changed`/`drive`（逐事件推进、raw view 变化才发布；一轮「边界+prompt+回复」恰好三次推送，draft-only 安静）。
+    - **流式未闭合围栏渲染为代码卡**：`split_markdown` 不再把未闭合围栏回退为正文文本——CommonMark 语义下未闭合围栏延伸到文档末尾，web 流式期间同样把它作为 code 块增量渲染（alpha.3 openFence：已完成行冻结、只重析最后一行 + 当前行；d8e2ac5052「保留已完成行」），闭合前后同一张卡。
+    - **上游同版其余变更经评估不落地**（rustdsh 无对应载体）：`loadThrough` 深历史分页与跳转装载（桌面端全量加载日志，所有轮次恒为 loaded 锚）；QueueDock 排队图片缩略图/回显 placement（无队列停靠条与图片附件）；connection 心跳容忍停滞宿主（无 WebSocket 网关，直连 HTTP 已有读超时）；subagent steer/follow-up 图片投递与 `subagent/attachment-invalid`（subagent 工具只收 prompt 文本）；`read_image` 无扩展名附件路径嗅探（尚无该工具）；Schedule 目录视口对齐 / Tab 补全 / 空白会话视图激活（无对应 UI 面）；`admitPromptContent` 附件准入（无附件服务）；SQLite 持久化后端移除（本就未实现）；组件级 perf（工具体延迟格式化、视口外高亮延迟——本仓代码块本就无 shiki 级高亮）。
+
 **下一步**（可选细化）：subagent 后台运行/持久化子会话（web 的 continuation 服务）；glob 超上限的顶层轮询采样（web sampleAcrossTopLevel）；压缩的 TokenMeter 精确计价与 compaction-tool-result-pruner；PTY 会话（参考实现同样推迟）；搜索卡 paths 形态的 UI 与 glob 输出已落地，结构化元数据通道（web presentationMeta）待 dsh-tools 增设 meta 缝后切换。
 
 ## 备注

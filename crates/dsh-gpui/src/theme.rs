@@ -82,6 +82,8 @@ pub struct Tokens {
     pub border_l2: Hsla,
     /// `--dsw-alias-border-l3`。
     pub border_l3: Hsla,
+    /// `--dsw-alias-border-l4`（轮次导航梯常态 tick）。
+    pub border_l4: Hsla,
     /// `--dsw-alias-interactive-bg-hover`。
     pub hover: Hsla,
     /// `--dsw-alias-interactive-bg-active`。
@@ -119,6 +121,7 @@ pub const DARK: Tokens = Tokens {
     border_l1: hsla_const(0.0, 0.0, 1.0, 0.06),
     border_l2: hsla_const(0.0, 0.0, 1.0, 0.12),
     border_l3: hsla_const(0.0, 0.0, 1.0, 0.16),
+    border_l4: hsla_const(0.0, 0.0, 1.0, 0.20),
     hover: hsla_const(0.0, 0.0, 1.0, 0.08),
     active: hsla_const(0.0, 0.0, 1.0, 0.14),
     mask: hsla_const(0.0, 0.0, 0.0, 0.5),
@@ -152,6 +155,7 @@ pub const LIGHT: Tokens = Tokens {
     border_l1: hsla_const(0.0, 0.0, 0.0, 0.04),
     border_l2: hsla_const(0.0, 0.0, 0.0, 0.10),
     border_l3: hsla_const(0.0, 0.0, 0.0, 0.12),
+    border_l4: hsla_const(0.0, 0.0, 0.0, 0.16),
     hover: hsla_const(0.625, 0.31, 0.216, 0.06),  // rgba(38,49,72,.06)
     active: hsla_const(0.625, 0.31, 0.216, 0.10), // rgba(38,49,72,.10)
     mask: hsla_const(0.0, 0.0, 0.0, 0.24),

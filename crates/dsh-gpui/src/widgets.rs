@@ -135,13 +135,20 @@ pub(crate) struct MarkdownBlock {
 impl RenderOnce for MarkdownBlock {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let mut style = TextViewStyle::default().paragraph_gap(rems(1.0));
-        style.heading_base_font_size = px(16.0);
+        // 标题标尺对齐 web --dsw-font-markdown-h*：h1 21/30、h2 19/28、
+        // h3 18/26、h4-h6 正文 14/24（600 字重在 vendor 主题内对齐）。
+        style.heading_base_font_size = px(theme::FONT_MARKDOWN_BASE);
         style.heading_font_size = Some(Arc::new(|level, base| match level {
-            1 => px(24.0),
-            2 => px(22.0),
-            3 => px(20.0),
-            4 => px(16.0),
+            1 => px(21.0),
+            2 => px(19.0),
+            3 => px(18.0),
             _ => base,
+        }));
+        style.heading_line_height = Some(Arc::new(|level, _base| match level {
+            1 => px(30.0),
+            2 => px(28.0),
+            3 => px(26.0),
+            _ => px(theme::FONT_MARKDOWN_BASE_LEADING),
         }));
         style.is_dark = true;
 

@@ -90,6 +90,8 @@ cargo run -p dsh-agent-loop --example tools_demo
 
 ## 备注
 
+**gpui-component vendor 补丁**：`[patch.crates-io]` 把 `gpui-component` 指向 `vendor/gpui-component`（0.5.1 原样拷贝 + `[dsh]` 注释标记的改动），因为 TextView 的 markdown 排版有多处与 web 契约不符且 `TextViewStyle` 不暴露：`strong` 700→**600**（web `.markdown strong`；Segoe UI 有真实 Semibold 面）、列表项间距 0→**6px**（web `li+li`）、marker `▪`→**`•` 且次级色**（web disc + `li::marker` label-secondary）、标题边距 pb 0.3rem→**h1-h3 32/16、h4-h6 16/16**（web `.markdown h*` margin）+ h2/h3 字重 600→700、新增 `heading_line_height`（30/28/26px）；另 hr 1px/上下 32px、blockquote 2px 左线 14px 内边距不压暗。工作区其余部分保持 registry 版本语义，升级 gpui-component 时需重新比对这份 diff。
+
 **会话单写者约束**：与 web 共享 `~/.dsh` 的会话文件遵循参考实现的"一个会话一个宿主"模型——同一个会话不要同时在桌面端与 web 端继续对话（两宿主并发追加同一日志在双方实现里都不安全）。桌面端现在把写入锚定到会话自身的桶（按日志头 cwd 规范解析，漂移的 cwd 口径不再产生跨桶副本；已存在的日志拒绝被 header 覆盖、解不开的内容拒绝静默重建）。
 
 沙箱内 cargo 依赖拉取需 `danger-full-access`（Windows schannel 在降权上下文无法取 TLS 凭据）；已抓取的依赖之后可离线构建。

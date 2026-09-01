@@ -20,6 +20,12 @@ members = [
   "crates/dsh-persist",
 ]
 
+# vendor 补丁版：markdown 渲染排版对齐 web（li 6px 间距、圆点次级色 marker、
+# strong 600、标题边距/字重/行高、hr、blockquote），改动见 vendor/gpui-component
+# 内 [dsh] 注释。
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

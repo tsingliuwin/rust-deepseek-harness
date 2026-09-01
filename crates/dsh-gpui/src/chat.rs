@@ -1432,7 +1432,10 @@ open: false,
                         div()
                             .max_w(px(layout::user_bubble_max(content_w)))
                             .rounded(px(22.0))
-                            .bg(theme::t().surface)
+                            // web --dsw-specific-bubble（亮=deepseek-50 淡蓝 /
+                            // 暗=bluish-850）：不能用 surface——亮色下是纯
+                            // 白，白底白泡等于没有展示效果。
+                            .bg(theme::t().bubble)
                             .px_4()
                             .py(px(10.0))
                             .text_size(px(theme::FONT_BUBBLE))

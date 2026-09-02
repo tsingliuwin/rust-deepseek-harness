@@ -11,8 +11,7 @@
 
 use std::sync::RwLock;
 
-use gpui::{hsla, Hsla, Rgba};
-use gpui_component::highlighter::HighlightTheme;
+use gpui::{px, hsla, Hsla, Rgba};use gpui_component::highlighter::HighlightTheme;
 use gpui_component::theme::{Theme, ThemeMode};
 
 /// `rgb()`/`hsla()` 非 const，这里提供 const 版本。
@@ -244,6 +243,75 @@ pub fn apply(mode: ThemeMode, cx: &mut gpui::App) {
     c.tab_foreground = tk.text_3.into();
     c.tab_active_foreground = tk.accent.into();
     c.window_border = tk.bg_base.into();
+}
+
+// --- Elevation（web gradient-shadow-text.css 的 --dsw-elevation-* 三件套） ---
+//
+// web 0.1.2-alpha.4 起浮层一律 border:0，改用 box-shadow 画 0.5px 发丝描边
+// （不占布局）+ 两层极淡柔光；描边色经 --dsw-elevation-stroke-color 逐组件
+// 重绑（菜单面 l1、输入卡 l2、悬浮件默认 l4）。GPUI 用 spread 圆环等价
+// `0 0 0 0.5px color`；柔光暗色下几乎不可见（web 注释同），数值照抄。
+
+const fn elevation_stroke(stroke_color: Hsla) -> gpui::BoxShadow {
+    gpui::BoxShadow {
+        color: stroke_color,
+        offset: gpui::point(px(0.0), px(0.0)),
+        blur_radius: px(0.0),
+        spread_radius: px(0.5),
+    }
+}
+
+const fn elevation_glow(x: f32, y: f32, blur: f32, alpha: f32) -> gpui::BoxShadow {
+    gpui::BoxShadow {
+        color: hsla_const(0.0, 0.0, 0.0, alpha),
+        offset: gpui::point(px(x), px(y)),
+        blur_radius: px(blur),
+        spread_radius: px(0.0),
+    }
+}
+
+/// `--dsw-elevation-panel`（描边取默认 l4）：悬浮按钮、轮次预览卡、tooltip。
+pub fn elevation_panel() -> Vec<gpui::BoxShadow> {
+    elevation_panel_with(t().border_l4)
+}
+
+/// `--dsw-elevation-panel` + 重绑描边色（web `.scroll` 重绑 l3）。
+pub fn elevation_panel_with(stroke_color: Hsla) -> Vec<gpui::BoxShadow> {
+    vec![
+        elevation_stroke(stroke_color),
+        elevation_glow(0.0, 3.0, 8.0, 0.03),
+        elevation_glow(0.0, 0.0, 16.0, 0.02),
+    ]
+}
+
+/// `--dsw-elevation-prominent`（描边重绑 l1）：菜单/弹窗等浮层面板。
+pub fn elevation_prominent() -> Vec<gpui::BoxShadow> {
+    let tk = t();
+    vec![
+        elevation_stroke(tk.border_l1),
+        elevation_glow(0.0, 3.0, 8.0, 0.04),
+        elevation_glow(0.0, 0.0, 20.0, 0.05),
+    ]
+}
+
+/// `--dsw-elevation-soft`（描边重绑 l2）：输入卡。
+pub fn elevation_soft() -> Vec<gpui::BoxShadow> {
+    let tk = t();
+    vec![
+        elevation_stroke(tk.border_l2),
+        elevation_glow(0.0, 4.0, 16.0, 0.03),
+        elevation_glow(0.0, 0.0, 24.0, 0.03),
+    ]
+}
+
+/// `--dsw-elevation-soft` + workspace-trigger 态（web `.cardWorkspaceTrigger`）：
+/// 描边置 transparent，只保留柔光。
+pub fn elevation_soft_inert() -> Vec<gpui::BoxShadow> {
+    vec![
+        elevation_stroke(hsla_const(0.0, 0.0, 0.0, 0.0)),
+        elevation_glow(0.0, 4.0, 16.0, 0.03),
+        elevation_glow(0.0, 0.0, 24.0, 0.03),
+    ]
 }
 
 // --- 字号标尺（`--dsw-font-*`，主题无关） -----------------------------------

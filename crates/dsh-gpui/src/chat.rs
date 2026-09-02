@@ -842,10 +842,18 @@ open: false,
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(theme::FONT_ROW_LEADING))
                             .text_color(theme::t().text_3)
-                            // web：运行时摘要跟随最新一行（latestLine +
-                            // scrollLeft 右贴），完成后回到首行
+                            // web：运行时摘要跟随最新一行且尾部贴右（alpha.4
+                            // data-follow-end 的 CSS 右贴 = 显示行尾、左侧
+                            // 被裁），完成后回到首行
                             .child(if active {
-                                text.lines().last().unwrap_or("").chars().take(120).collect::<String>()
+                                let line = text.lines().last().unwrap_or("");
+                                let chars: Vec<char> = line.chars().collect();
+                                let tail: String = if chars.len() > 120 {
+                                    chars[chars.len() - 120..].iter().collect()
+                                } else {
+                                    line.to_string()
+                                };
+                                tail
                             } else {
                                 widgets::first_line(text)
                             }),
@@ -1367,8 +1375,10 @@ open: false,
                                 .px(px(8.0))
                                 .py(px(2.0))
                                 .rounded_full()
-                                .border_1()
-                                .border_color(theme::t().border_l2)
+                                // web ToolRow .chip（alpha.4）：0.5px 发丝 + 色
+                                // 阶升到 l4 补偿细线
+                                .border(px(0.5))
+                                .border_color(theme::t().border_l4)
                                 .bg(theme::t().bg_base)
                                 .text_color(theme::t().text_2)
                                 .text_size(px(11.0))
@@ -1409,6 +1419,13 @@ open: false,
                 let bubble_text = text.clone();
                 let group: SharedString = format!("user-msg-{ei}").into();
                 let group_copy = group.clone();
+                // web MessageIconActions（alpha.4）：最新一条 user 行操作
+                // 常显，更早的行 hover 才显现（:has(~ ) 后继兄弟选择器语义）
+                let latest_user = self
+                    .entries
+                    .iter()
+                    .rposition(|e| e.role == Role::User)
+                    .is_some_and(|ix| ix == ei);
                 div()
                     .w_full()
                     .flex()
@@ -1433,7 +1450,8 @@ open: false,
                             .child(bubble_text),
                     )
                     .child(
-                        // 气泡下方的复制按钮（web MessageIconActions：悬停显现）
+                        // 气泡下方的复制按钮（web MessageIconActions：最新
+                        // user 行常显，更早的行悬停显现）
                         div()
                             .id(("copy-user", ei as u64))
                             .size(px(20.0))
@@ -1443,7 +1461,7 @@ open: false,
                             .rounded(px(4.0))
                             .cursor_pointer()
                             .text_color(theme::t().caption)
-                            .opacity(0.0)
+                            .opacity(if latest_user { 1.0 } else { 0.0 })
                             .group_hover(group_copy, |s| s.opacity(1.0))
                             .hover(|s| s.text_color(theme::t().text_2).bg(theme::t().hover))
                             .tooltip(tip("复制"))
@@ -1468,7 +1486,16 @@ open: false,
                     col = col.child(self.block_element(block, ei, bi, this, content_w));
                 }
                 if entry.done && let Some(elapsed) = entry.elapsed {
-                    col = col.child(render_entry_footer(elapsed, entry.usage.clone(), entry.ended_at_ms, this, ei));
+                    // web TurnTailNodeView：最新一轮 'always'，更早的轮 'hover'
+                    let latest_turn = self.entries.last().is_some_and(|last| last.turn == entry.turn);
+                    col = col.child(render_entry_footer(
+                        elapsed,
+                        entry.usage.clone(),
+                        entry.ended_at_ms,
+                        this,
+                        ei,
+                        latest_turn,
+                    ));
                 }
                 div().w_full().child(col)
             }
@@ -1656,14 +1683,15 @@ open: false,
                 div().w_full().v_flex().child(wrap)
             }
             Role::Notice => {
-                // 压缩分隔条：居中 hairline + 说明文字（web compaction 提示行）
+                // 压缩分隔条：居中 hairline + 说明文字（web compaction 提示行；
+                // alpha.4 全局 hairline 化，线宽随 0.5px）
                 div()
                     .w_full()
                     .flex()
                     .items_center()
                     .gap_3()
                     .py(px(4.0))
-                    .child(div().flex_1().h(px(1.0)).bg(theme::t().border_l2))
+                    .child(div().flex_1().h(px(0.5)).bg(theme::t().border_l2))
                     .child(
                         div()
                             .flex_none()
@@ -1672,7 +1700,7 @@ open: false,
                             .text_color(theme::t().text_3)
                             .child("上下文已压缩 · 已生成摘要检查点"),
                     )
-                    .child(div().flex_1().h(px(1.0)).bg(theme::t().border_l2))
+                    .child(div().flex_1().h(px(0.5)).bg(theme::t().border_l2))
             }
         }
     }
@@ -2094,11 +2122,11 @@ impl ChatView {
                     .v_flex()
                     .px(px(12.0))
                     .py(px(10.0))
-                    .border_1()
-                    .border_color(theme::t().border_l2)
+                    // web alpha.4：border 撤掉，发丝描边画进 elevation-panel
+                    // （描边取默认 l4）
                     .rounded(px(10.0))
                     .bg(theme::t().layer1)
-                    .shadow_md()
+                    .shadow(theme::elevation_panel())
                     .child(
                         div()
                             .text_size(px(13.0))
@@ -2318,12 +2346,12 @@ impl Render for ChatView {
                         .items_center()
                         .justify_center()
                         .rounded_full()
-                        .border_1()
-                        .border_color(theme::t().border_l2)
+                        // web alpha.4 .scroll：border 撤掉，发丝描边重绑 l3
+                        // 画进 elevation-panel
                         .bg(theme::t().surface)
                         .text_color(theme::t().text_2)
                         .cursor_pointer()
-                        .shadow_md()
+                        .shadow(theme::elevation_panel_with(theme::t().border_l3))
                         .hover(|s| s.bg(theme::t().surface_2).text_color(theme::t().text))
                         .tooltip(tip("回到底部"))
                         .on_click(move |_, _, cx| {
@@ -2397,6 +2425,7 @@ fn render_entry_footer(
     ended_at_ms: Option<u64>,
     this: &Entity<ChatView>,
     ei: usize,
+    latest_turn: bool,
 ) -> Div {
     let t = this.clone();
     let group: SharedString = format!("assistant-msg-{ei}").into();
@@ -2434,7 +2463,16 @@ fn render_entry_footer(
 
     let plain_time = format!("用时 {}", format_run_duration(elapsed.as_millis() as u64));
 
-    let mut row = div().w_full().flex().items_center().gap_2().child(
+    // web MessageIconActions：整行（复制 + 用量/用时药丸 + 时钟）按轮次
+    // 新旧显隐——最新一轮常驻，更早的轮悬停条目时显现（opacity 保持布局）
+    let mut row = div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .opacity(if latest_turn { 1.0 } else { 0.0 })
+        .group_hover(group_copy, |s| s.opacity(1.0))
+        .child(
         div()
             .id(("copy-assistant", ei as u64))
             .size(px(20.0))
@@ -2444,8 +2482,6 @@ fn render_entry_footer(
             .rounded(px(4.0))
             .cursor_pointer()
             .text_color(theme::t().caption)
-            .opacity(0.0)
-            .group_hover(group_copy, |s| s.opacity(1.0))
             .hover(|s| s.text_color(theme::t().text_2).bg(theme::t().hover))
             .tooltip(tip("复制"))
             .on_click(move |_, _, cx| {
@@ -2522,14 +2558,14 @@ fn turn_stat_panel(
     let mut panel = div()
         .w(px(300.0))
         .bg(theme::t().surface)
-        .border_1()
-        .border_color(theme::t().border_l2)
-        .rounded(px(10.0))
+        // web alpha.4 TurnUsagePanel 弹出卡：border 撤掉，r12，描边重绑 l1
+        // 画进 elevation-prominent
+        .rounded(px(12.0))
         .p(px(12.0))
         .flex()
         .flex_col()
         .gap(px(8.0))
-        .shadow_lg();
+        .shadow(theme::elevation_prominent());
     let mut title_row = div()
         .flex()
         .items_center()
@@ -2559,7 +2595,8 @@ fn turn_stat_panel(
         );
     }
     panel = panel.child(title_row);
-    panel = panel.child(div().w_full().h(px(1.0)).bg(theme::t().border_l1));
+    // web .titleRule：标题下横线 0.5px l2（alpha.4 hairline 化并校正色阶）
+    panel = panel.child(div().w_full().h(px(0.5)).bg(theme::t().border_l2));
     for (label, value) in rows {
         panel = panel.child(
             div()

@@ -140,7 +140,8 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
                 .rounded(px(24.0))
                 .overflow_hidden()
                 .bg(tk.surface)
-                .shadow_lg()
+                // web Modal 卡（alpha.4）：描边 l1 画进 elevation-prominent
+                .shadow(theme::elevation_prominent())
                 .child(nav)
                 .child(
                     div()
@@ -168,11 +169,11 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
                                     .v_flex()
                                     .gap_3()
                                     .p_4()
-                                    .rounded(px(16.0))
+                                    // web Modal 卡（alpha.4）：r24、border 撤
+                                    // 掉、描边 l1 画进 elevation-prominent
+                                    .rounded(px(24.0))
                                     .bg(tk.surface)
-                                    .border_1()
-                                    .border_color(tk.border_l2)
-                                    .shadow_lg()
+                                    .shadow(theme::elevation_prominent())
                                     .child(
                                         div()
                                             .text_size(px(theme::FONT_ROW))
@@ -241,7 +242,8 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
                 .rounded(px(24.0))
                 .overflow_hidden()
                 .bg(tk.surface)
-                .shadow_lg()
+                // web Modal 卡（alpha.4）：描边 l1 画进 elevation-prominent
+                .shadow(theme::elevation_prominent())
 }
 
 /// 导航格（web .navCell：40px、r12、pad(9,16,9,12)、14/22、active 填充）。
@@ -306,7 +308,8 @@ fn settings_row(label: &str, desc: &str, control: impl IntoElement, last: bool) 
         )
         .child(control);
     if !last {
-        row = row.border_b_1().border_color(tk.border_l2);
+        // web 设置行（alpha.4）：底线 0.5px 发丝
+        row = row.border_b(px(0.5)).border_color(tk.border_l2);
     }
     row
 }
@@ -623,7 +626,8 @@ fn provider_row(
             div()
                 .px(px(6.0))
                 .py(px(1.0))
-                .border_1()
+                // web .rowTag（alpha.4）：0.5px 发丝
+                .border(px(0.5))
                 .border_color(tk.border_l3)
                 .rounded(px(4.0))
                 .text_size(px(11.0))
@@ -684,9 +688,10 @@ fn provider_row(
     let mut card = div()
         .v_flex()
         .gap_3()
-        .rounded(px(12.0))
-        .border_1()
-        .border_color(tk.border_l2)
+        // web ModelsSection .rowCard（alpha.4）：r16、0.5px、色阶 l2→l4
+        .rounded(px(16.0))
+        .border(px(0.5))
+        .border_color(tk.border_l4)
         .px(px(14.0))
         .py_3()
         .child(head);
@@ -754,8 +759,9 @@ fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str) -> Div
                             .items_center()
                             .px(px(10.0))
                             .rounded(px(8.0))
-                            .border_1()
-                            .border_color(tk.border_l2)
+                            // web Input 原语（alpha.4）：0.5px，色阶 l2→l4
+                            .border(px(0.5))
+                            .border_color(tk.border_l4)
                             .bg(tk.layer1)
                             .text_size(px(theme::FONT_ROW))
                             .line_height(px(22.0))
@@ -874,8 +880,9 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
                 .pl(px(10.0))
                 .h(px(32.0))
                 .rounded(px(8.0))
-                .border_1()
-                .border_color(tk.border_l2)
+                // web Input 原语（alpha.4）：0.5px，色阶 l2→l4
+                .border(px(0.5))
+                .border_color(tk.border_l4)
                 .bg(tk.layer1)
                 .text_size(px(theme::FONT_ROW))
                 .line_height(px(22.0))
@@ -983,11 +990,11 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
                 .overflow_y_scroll()
                 .v_flex()
                 .p(px(4.0))
-                .rounded(px(8.0))
-                .border_1()
-                .border_color(tk.border_l2)
-                .bg(tk.surface)
-                .shadow_lg();
+                // web MenuDropdown 卡（alpha.4）：r20、border 撤掉、menu
+                // 底、描边重绑 l1 画进 elevation-prominent
+                .rounded(px(20.0))
+                .bg(tk.menu)
+                .shadow(theme::elevation_prominent());
             for ci in &candidates {
                 let t = this.clone();
                 let idx = *ci;
@@ -1049,8 +1056,9 @@ fn declare_card(app: &AppView, this: &Entity<AppView>, cx: &App) -> Div {
                 .items_center()
                 .gap_2()
                 .rounded(px(8.0))
-                .border_1()
-                .border_color(tk.border_l2)
+                // web ModelsSection .modelEntry（alpha.4）：0.5px，色阶 l2→l4
+                .border(px(0.5))
+                .border_color(tk.border_l4)
                 .px(px(10.0))
                 .py(px(6.0))
                 .child(
@@ -1129,7 +1137,8 @@ fn declare_card(app: &AppView, this: &Entity<AppView>, cx: &App) -> Div {
                 .v_flex()
                 .gap(px(10.0))
                 .pt_3()
-                .border_t_1()
+                // web .customized（alpha.4）：0.5px 发丝
+                .border_t(px(0.5))
                 .border_color(tk.border_l2)
                 .child(
                     div()
@@ -1252,8 +1261,9 @@ fn protocol_field(value: &'static str) -> Div {
         .justify_between()
         .px(px(10.0))
         .rounded(px(8.0))
-        .border_1()
-        .border_color(tk.border_l2)
+        // web Input 原语（alpha.4）：0.5px，色阶 l2→l4
+        .border(px(0.5))
+        .border_color(tk.border_l4)
         .bg(tk.layer1)
         .text_size(px(theme::FONT_ROW))
         .line_height(px(22.0))
@@ -1312,8 +1322,9 @@ fn action_button(
                     .text_color(tk.bg_base)
                     .hover(|s| s.opacity(0.9))
             } else {
-                d.border_1()
-                    .border_color(tk.border_l2)
+                // web Button .outline（alpha.4）：0.5px，色阶 l2→l3
+                d.border(px(0.5))
+                    .border_color(tk.border_l3)
                     .text_color(tk.text)
                     .hover(|s| s.bg(tk.hover))
             }
@@ -1364,7 +1375,8 @@ fn add_button(
         .items_center()
         .justify_center()
         .gap_1p5()
-        .rounded(px(12.0))
+        // web .addCard（alpha.4）：r12→16（虚线描边保持 1px l3）
+        .rounded(px(16.0))
         .border_1()
         .border_dashed()
         .border_color(tk.border_l3)

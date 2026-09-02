@@ -33,10 +33,11 @@ impl Tool for WebTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "web_fetch".into(),
-            description: "Fetch a URL and return its text content.".into(),
+            // 描述对齐 alpha.4 web_fetch schema（sdk-default-web-fetch）
+            description: "Fetch the content of a specific HTTP(S) URL and return it decoded to text.".into(),
             parameters: json!({
                 "type": "object",
-                "properties": { "url": { "type": "string", "description": "The URL to fetch." } },
+                "properties": { "url": { "type": "string", "description": "The HTTP(S) URL to fetch." } },
                 "required": ["url"]
             }),
         }

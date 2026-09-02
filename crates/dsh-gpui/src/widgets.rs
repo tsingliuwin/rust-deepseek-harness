@@ -411,7 +411,8 @@ pub(crate) fn turn_process_control(
         .pb(px(8.0))
         .flex()
         .items_center()
-        .border_b_1()
+        // web TurnProcessNodeView（alpha.4）：底线 0.5px 发丝
+        .border_b(px(0.5))
         .border_color(theme::t().border_l2)
         .text_color(theme::t().text_2)
         .cursor_pointer()
@@ -566,7 +567,8 @@ pub(crate) fn terminal_card(
             .child(state_dot(dot_color)),
     );
     if !running {
-        card = card.child(div().h(px(1.0)).w_full().bg(theme::t().border_l2));
+        // web .ioDivider（alpha.4）：0.5px 发丝
+card = card.child(div().h(px(0.5)).w_full().bg(theme::t().border_l2));
         let empty = output.map(|o| o.trim().is_empty()).unwrap_or(true);
         if empty {
             card = card.child(
@@ -1226,12 +1228,14 @@ pub(crate) fn io_card(
         .mb_1()
         .v_flex()
         .rounded(px(12.0))
-        .border_1()
+        // web ToolRow .ioCard（alpha.4）：0.5px 发丝
+        .border(px(0.5))
         .border_color(theme::t().border_l1)
         .bg(theme::t().code_bg);
     card = card.child(io_section(uid * 2, "输入", input, false, expanded, on_toggle.clone()));
     if let Some(out) = output {
-        card = card.child(div().h(px(1.0)).w_full().bg(theme::t().border_l2));
+        // web .ioDivider（alpha.4）：0.5px 发丝
+card = card.child(div().h(px(0.5)).w_full().bg(theme::t().border_l2));
         card = card.child(io_section(uid * 2 + 1, "输出", out, error, expanded, on_toggle));
     }
     card

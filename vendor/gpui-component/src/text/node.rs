@@ -1037,7 +1037,8 @@ impl Node {
                     div()
                         .id("table")
                         .w_full()
-                        .border_1()
+                        // [dsh] alpha.4 hairline 化：web 表格线 0.5px
+                        .border(px(0.5))
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
                         .children({
@@ -1048,7 +1049,8 @@ impl Node {
                                         .id("row")
                                         .w_full()
                                         .when(row_ix < table.children.len() - 1, |this| {
-                                            this.border_b_1()
+                                            // [dsh] alpha.4：行分隔 0.5px 发丝
+                                            this.border_b(px(0.5))
                                         })
                                         .border_color(cx.theme().border)
                                         .flex()
@@ -1265,11 +1267,11 @@ impl Node {
             Node::CodeBlock(code_block) => code_block.render(&options, node_cx, window, cx),
             Node::Table { .. } => Self::render_table(self, node_cx, window, cx).into_any_element(),
             Node::Divider => div()
-                // [dsh] 对齐 web .markdown hr { margin: 32px 0; height: 1px }
-                // （上方 16px 补足前块的 16px，合计 32px）。
+                // [dsh] 对齐 web .markdown hr { margin: 32px 0 }；alpha.4
+                // hr 高度 hairline 化为 0.5px（上方 16px 补足前块的 16px）。
                 .pt(mb)
                 .pb(rems(2.))
-                .child(div().id("divider").bg(cx.theme().border).h(px(1.)))
+                .child(div().id("divider").bg(cx.theme().border).h(px(0.5)))
                 .into_any_element(),
             Node::Break { .. } => div().id("break").into_any_element(),
             Node::Unknown | Node::Definition { .. } => div().into_any_element(),

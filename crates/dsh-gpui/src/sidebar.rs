@@ -136,8 +136,9 @@ impl Render for SidebarView {
             .w(px(width))
             .flex_none()
             .bg(theme::t().sidebar_bg)
-            .border_r_1()
-            .border_color(theme::t().border_l1);
+            // web AppFrame 侧栏右边线（alpha.4）：0.5px，色阶 l1→l3
+            .border_r(px(0.5))
+            .border_color(theme::t().border_l3);
         if collapsed {
             let t_expand = this.clone();
             let t_new = this.clone();
@@ -542,8 +543,9 @@ impl Render for SidebarView {
                         .mx_0p5()
                         .mb_2()
                         .rounded(px(12.0))
-                        .border_1()
-                        .border_color(theme::t().border_l2)
+                        // web SidebarRoot .newChat（alpha.4）：0.5px，色阶 l2→l3
+                        .border(px(0.5))
+                        .border_color(theme::t().border_l3)
                         .bg(theme::t().surface)
                         .text_size(px(theme::FONT_ROW))
                         .line_height(px(22.0))
@@ -609,8 +611,9 @@ impl Render for SidebarView {
                                             .overflow_hidden()
                                             .pr(px(4.0))
                                             .rounded(px(10.0))
-                                            .border_1()
-                                            .border_color(theme::t().border_l2)
+                                            // web Input 原语（alpha.4）：0.5px，色阶 l2→l4
+                                            .border(px(0.5))
+                                            .border_color(theme::t().border_l4)
                                             .child(
                                                 div()
                                                     .w(px(28.0))
@@ -837,11 +840,11 @@ impl Render for SidebarView {
                             .max_w(px(360.0))
                             .v_flex()
                             .p(px(4.0))
-                            .rounded(px(12.0))
-                            .border_1()
-                            .border_color(theme::t().border_inverted)
+                            // web MenuDropdown 卡（alpha.4）：r20、border 撤
+                            // 掉、描边重绑 l1 画进 elevation-prominent
+                            .rounded(px(20.0))
                             .bg(theme::t().menu)
-                            .shadow_lg()
+                            .shadow(theme::elevation_prominent())
                             .children(if kind == "view" {
                                 // 视图选项（web ViewOptionsMenu：分组 label + 单选 + 分隔 + 排序）
                                 let t1 = sb.clone();

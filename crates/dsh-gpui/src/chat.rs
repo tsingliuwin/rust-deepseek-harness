@@ -76,12 +76,8 @@ pub(crate) struct ChatView {
     rail_follow: Cell<Option<u64>>,
     /// 下一次 sync 强制 reset（会话切换/重建：内容整体替换）
     chat_reset_pending: bool,
-    /// 流式文本渲染节流快照。gpui-component TextView 的后台解析是"每条更新
-    /// 重置 200ms 防抖计时器"——连续 delta 下计时器永不触发、正文冻结到流结
-    /// 束；喂 TextView 的文本以 >200ms 间隔节流，防抖必然触发、渐进渲染。
-    stream_text_shown: RefCell<Option<(usize, usize, Instant, String)>>,
-    /// 流式文本增长改了条目高度但没知会虚拟列表 → 按陈旧行高排布、行重叠；
-    /// 渲染路径置位（渲染中不能改列表），由 tick 消费后统一失效重测。
+    /// 流式文本增长改了条目高度但没知会虚拟列表 → 按陈旧行高排布、行重叠。
+    /// 事件路径置位（渲染中不能改列表），由 tick 消费后统一失效重测。
     heights_dirty: Cell<bool>,
     /// 本轮工具调用计时（call_id → 起始时刻）
     tool_starts: HashMap<String, Instant>,
@@ -141,7 +137,6 @@ impl ChatView {
             rail_pointer_inside: false,
             rail_follow: Cell::new(None),
             chat_reset_pending: false,
-            stream_text_shown: RefCell::new(None),
             heights_dirty: Cell::new(false),
             tool_starts: Default::default(),
             turn_tool_time: Duration::ZERO,
@@ -188,23 +183,31 @@ impl ChatView {
                 });
             });
         }
-        // 流式期间 100ms tick：heights_dirty 消费（统一重测行高）+ 状态行
-        // 耗时跳动。只在 running 时动手，delta 级 notify 不出本视图。
+        // 流式期间 33ms tick（≈每帧一次）：heights_dirty 消费（统一重测
+        // 行高）+ 状态行耗时跳动。停流后再守 ~264ms 宽限，兜住最后一次
+        // 解析发布（TextView 后台解析晚于最后 delta 落地）。delta 级
+        // notify 不出本视图。
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            const GRACE_TICKS: u32 = 8;
             let mut cx = cx.clone();
+            let mut grace = 0u32;
             loop {
-                Timer::after(Duration::from_millis(100)).await;
+                Timer::after(Duration::from_millis(33)).await;
                 let Some(tick) = this.upgrade() else { return; };
                 let Ok(running) = tick.update(&mut cx, |v, _| v.running) else {
                     return;
                 };
-                if !running {
+                if running {
+                    grace = GRACE_TICKS;
+                } else if grace == 0 {
                     continue;
+                } else {
+                    grace -= 1;
                 }
                 let Ok(dirty) = tick.update(&mut cx, |v, _| v.heights_dirty.replace(false)) else {
                     return;
                 };
-                if dirty {
+                if dirty || !running {
                     let _ = tick.update(&mut cx, |v, _| {
                         v.invalidate_stream_tail();
                         // splice 对 old_range 内的滚动锚会回拽到范围头，
@@ -493,6 +496,7 @@ open: false,
             Some(MsgBlock::Text(t)) => t.push_str(text),
             _ => blocks.push(MsgBlock::Text(text.to_string())),
         }
+        self.heights_dirty.set(true);
     }
 
     fn push_reasoning(&mut self, text: &str) {
@@ -501,6 +505,7 @@ open: false,
             Some(MsgBlock::Reasoning { text: t, .. }) => t.push_str(text),
             _ => blocks.push(MsgBlock::Reasoning { text: text.to_string(), open: false }),
         }
+        self.heights_dirty.set(true);
     }
 
     /// 用户消息入列（标题逻辑在 AppView：sessions/recorder 是宿主职责）。
@@ -552,7 +557,7 @@ open: false,
                 self.turn_usage = TurnUsage::default();
                 self.turn_first_token = None;
                 self.tool_starts.clear();
-                self.stream_text_shown.borrow_mut().take();
+                self.heights_dirty.set(false);
             }
             AgentEvent::TextDelta { text } => {
                 if self.turn_first_token.is_none() {
@@ -765,37 +770,20 @@ open: false,
     fn block_element(&self, block: &MsgBlock, ei: usize, bi: usize, this: &Entity<Self>, content_w: f32) -> AnyElement {
         match block {
             MsgBlock::Text(t) => {
-                // 流式尾按 400ms 节流喂 TextView（间隔须 > 上游 200ms 防抖窗，
-                // 否则连续 delta 使解析永不触发）；非尾块（已完结）直接用现文
+                // 流式尾喂活文本 + 50ms 稳态解析窗（vendor [dsh] 补丁：节流
+                // 不因连续 delta 重置，约 20 次/秒渐进发布，对齐 web 每
+                // 2-3 帧一次的流式节奏）；非尾块（已完结）直接用现文。
                 let is_stream_tail = self.running
                     && ei + 1 == self.entries.len()
                     && bi + 1 == self.entries.get(ei).map(|e| e.blocks.len()).unwrap_or(0);
-                let now = std::time::Instant::now();
-                let shown = if is_stream_tail {
-                    let cached = self.stream_text_shown.borrow().as_ref().and_then(
-                        |(ce, cb, at, txt)| {
-                            (*ce == ei && *cb == bi
-                                && now.duration_since(*at).as_millis() < 400)
-                                .then(|| txt.clone())
-                        },
-                    );
-                    match cached {
-                        Some(txt) => txt,
-                        None => {
-                            *self.stream_text_shown.borrow_mut() =
-                                Some((ei, bi, now, t.clone()));
-                            // 文本增长 → 该条目高度变化 → 待 tick 统一重测
-                            self.heights_dirty.set(true);
-                            t.clone()
-                        }
-                    }
-                } else {
-                    t.clone()
-                };
                 div()
                     .w_full()
                     .text_color(theme::t().text)
-                    .child(widgets::MarkdownBlock { text: shown, id: 1_000_000 + ei * 1000 + bi })
+                    .child(widgets::MarkdownBlock {
+                        text: t.clone(),
+                        id: 1_000_000 + ei * 1000 + bi,
+                        parse_delay: is_stream_tail.then(|| Duration::from_millis(50)),
+                    })
                     .into_any_element()
             }
 

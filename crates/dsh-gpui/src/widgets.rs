@@ -130,6 +130,8 @@ fn code_block_card(uid: usize, lang: &str, code: &str) -> Div {
 pub(crate) struct MarkdownBlock {
     pub(crate) text: String,
     pub(crate) id: usize,
+    /// 流式尾的解析节流窗（vendor 稳态节流）；None = 默认 200ms
+    pub(crate) parse_delay: Option<std::time::Duration>,
 }
 
 impl RenderOnce for MarkdownBlock {
@@ -160,9 +162,13 @@ impl RenderOnce for MarkdownBlock {
                     if text.trim().is_empty() {
                         continue;
                     }
+                    let view = TextView::markdown(self.id * 1000 + i * 2, text, window, cx);
+                    let view = match self.parse_delay {
+                        Some(d) => view.parse_delay(d),
+                        None => view,
+                    };
                     col = col.child(
-                        TextView::markdown(self.id * 1000 + i * 2, text, window, cx)
-                            .text_size(px(theme::FONT_MARKDOWN_BASE))
+                        view.text_size(px(theme::FONT_MARKDOWN_BASE))
                             .line_height(px(theme::FONT_MARKDOWN_BASE_LEADING))
                             .style(style.clone()),
                     );

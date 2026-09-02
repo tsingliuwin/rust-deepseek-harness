@@ -125,6 +125,8 @@ struct UpdateFuture {
     current_style: TextViewStyle,
     current_text: SharedString,
     timer: Timer,
+    /// [dsh] 计时器是否已排程：稳态节流的标志位
+    timer_armed: bool,
     rx: Pin<Box<smol::channel::Receiver<Update>>>,
     tx_result: smol::channel::Sender<Result<ParsedContent, SharedString>>,
     delay: Duration,
@@ -149,6 +151,7 @@ impl UpdateFuture {
             current_style: style,
             current_text: text,
             timer: Timer::never(),
+            timer_armed: false,
             rx: Box::pin(rx),
             tx_result,
             delay,
@@ -176,8 +179,14 @@ impl Future for UpdateFuture {
                         _ => false,
                     };
                     if changed {
-                        let delay = self.delay;
-                        self.timer.set_after(delay);
+                        // [dsh] 稳态节流：只在计时器空闲时排程下一次解析，
+                        // 到点解析最新全文。原实现每次变更都重置计时器，
+                        // 高频流式 delta（间隔 < delay）会令解析永不触发。
+                        if !self.timer_armed {
+                            let delay = self.delay;
+                            self.timer.set_after(delay);
+                            self.timer_armed = true;
+                        }
                     }
                     continue;
                 }
@@ -187,6 +196,7 @@ impl Future for UpdateFuture {
 
             match self.timer.poll_next(cx) {
                 Poll::Ready(Some(_)) => {
+                    self.timer_armed = false;
                     let res = parse_content(
                         self.type_,
                         &self.current_text,
@@ -210,6 +220,8 @@ enum InitState {
         text: SharedString,
         style: Box<TextViewStyle>,
         highlight_theme: Arc<HighlightTheme>,
+        /// [dsh] 解析节流窗（markdown/html 构造时定型）
+        parse_delay: Duration,
     },
     Initialized {
         tx: smol::channel::Sender<Update>,
@@ -382,6 +394,7 @@ impl TextView {
         type_: TextViewType,
         text: &SharedString,
         highlight_theme: &Arc<HighlightTheme>,
+        parse_delay: Duration,
         state: &Entity<TextViewState>,
         cx: &mut App,
     ) -> InitState {
@@ -394,6 +407,7 @@ impl TextView {
                 text: text.clone(),
                 style: Default::default(),
                 highlight_theme: highlight_theme.clone(),
+                parse_delay,
             }
         }
     }
@@ -416,6 +430,7 @@ impl TextView {
             TextViewType::Markdown,
             &markdown,
             &highlight_theme,
+            Duration::from_millis(200),
             &state,
             cx,
         );
@@ -448,8 +463,14 @@ impl TextView {
             window.use_keyed_state(SharedString::from(format!("{}/state", id)), cx, |_, cx| {
                 TextViewState::new(cx)
             });
-        let init_state =
-            Self::create_init_state(TextViewType::Html, &html, &highlight_theme, &state, cx);
+        let init_state = Self::create_init_state(
+            TextViewType::Html,
+            &html,
+            &highlight_theme,
+            Duration::from_millis(200),
+            &state,
+            cx,
+        );
         if let Some(tx) = &state.read(cx).tx {
             let _ = tx.try_send(Update::Text(html.clone()));
         }
@@ -463,6 +484,16 @@ impl TextView {
             scrollable: false,
             code_block_actions: None,
         }
+    }
+
+    /// [dsh] 设置解析节流窗（默认 200ms）。配合稳态节流使用：流式场景给
+    /// 小窗口（如 50ms）即可获得接近逐帧的渐进渲染，且解析不被连续 delta
+    /// 饿死。仅对首次初始化该 TextView 的实例生效（state 按幂等 key 复用）。
+    pub fn parse_delay(mut self, delay: Duration) -> Self {
+        if let Some(InitState::Initializing { parse_delay, .. }) = &mut self.init_state {
+            *parse_delay = delay;
+        }
+        self
     }
 
     /// Set the source text of the text view.
@@ -572,6 +603,7 @@ impl Element for TextView {
             text,
             style,
             highlight_theme,
+            parse_delay,
         }) = self.init_state.take()
         {
             let style = *style;
@@ -625,7 +657,7 @@ impl Element for TextView {
                 highlight_theme,
                 rx,
                 tx_result,
-                Duration::from_millis(200),
+                parse_delay,
                 code_block_actions,
             ))
             .detach();

@@ -2982,7 +2982,55 @@ impl AppView {
                     );
                 }
             }
-            model_menu_el = Some(menu.into_any_element());
+            // 点击外部关闭（同 hero-ws 菜单模式）：定位壳捕获菜单 bounds，
+            // canvas 在 paint 阶段注册窗口级 mousedown——只认 Bubble 相，
+            // 落点在菜单 bounds 外即收起
+            let menu_bounds = Arc::new(std::sync::Mutex::new(None::<Bounds<Pixels>>));
+            let t_dismiss = this.clone();
+            let mut overlay = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .on_children_prepainted({
+                    let mb = menu_bounds.clone();
+                    move |children, _, _| {
+                        *mb.lock().unwrap() = children.first().cloned();
+                    }
+                })
+                .child(menu);
+            overlay = overlay.child(
+                // canvas 必须脱流：文档流里的 0 高子元素也会多出一条 gap
+                div().absolute().child(canvas(
+                    move |_, _, _| {},
+                    move |_, _, window, _| {
+                        let bounds = menu_bounds
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_default();
+                        window.on_mouse_event(
+                            move |event: &MouseDownEvent,
+                                  phase: DispatchPhase,
+                                  _,
+                                  cx| {
+                                if phase == DispatchPhase::Bubble
+                                    && !bounds.contains(&event.position)
+                                {
+                                    t_dismiss.update(cx, |v, cx| {
+                                        if v.model_menu {
+                                            v.model_menu = false;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            },
+                        );
+                    },
+                )),
+            );
+            model_menu_el = Some(overlay.into_any_element());
         }
 
         let left = div()
@@ -3029,8 +3077,13 @@ impl AppView {
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         t_model_menu.update(cx, |v, cx| {
-                            v.model_menu = !v.model_menu;
-                            cx.notify();
+                            // 只开不关：开着时点模型牌由菜单壳的窗口级
+                            // mousedown（down 相先到）关闭，这里再 toggle
+                            // 会回弹
+                            if !v.model_menu {
+                                v.model_menu = true;
+                                cx.notify();
+                            }
                         });
                     })
                     .child(

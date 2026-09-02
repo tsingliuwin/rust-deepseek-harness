@@ -891,8 +891,13 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
                 .hover(|s| s.border_color(tk.border_l3))
                 .on_click(move |_, _, cx| {
                     t_toggle.update(cx, |v, cx| {
-                        v.adopt_dropdown_open = !v.adopt_dropdown_open;
-                        cx.notify();
+                        // 只开不关：开着时点触发器的"关"由下拉壳的窗口级
+                        // mousedown 处理（先于本 click 到达），双路都动会
+                        // toggle 回弹
+                        if !v.adopt_dropdown_open {
+                            v.adopt_dropdown_open = true;
+                            cx.notify();
+                        }
                     });
                 })
                 .child(entry_name)
@@ -1025,7 +1030,54 @@ fn adopt_card(app: &AppView, this: &Entity<AppView>, _cx: &App) -> Div {
                         .child(e.name),
                 );
             }
-            card.child(menu)
+            // 点击外部关闭：定位壳捕获菜单 bounds，canvas（paint 阶段）注册
+            // 窗口级 mousedown——只认 Bubble 相，落点在菜单 bounds 外即收起
+            let menu_bounds = std::sync::Arc::new(std::sync::Mutex::new(None::<Bounds<Pixels>>));
+            let t_dismiss = this.clone();
+            let mut overlay = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .on_children_prepainted({
+                    let mb = menu_bounds.clone();
+                    move |children, _, _| {
+                        *mb.lock().unwrap() = children.first().cloned();
+                    }
+                })
+                .child(menu);
+            overlay = overlay.child(
+                // canvas 必须脱流：文档流里的 0 高子元素也会多出一条 gap
+                div().absolute().child(canvas(
+                    move |_, _, _| {},
+                    move |_, _, window, _| {
+                        let bounds = menu_bounds
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_default();
+                        window.on_mouse_event(
+                            move |event: &MouseDownEvent,
+                                  phase: DispatchPhase,
+                                  _,
+                                  cx| {
+                                if phase == DispatchPhase::Bubble
+                                    && !bounds.contains(&event.position)
+                                {
+                                    t_dismiss.update(cx, |v, cx| {
+                                        if v.adopt_dropdown_open {
+                                            v.adopt_dropdown_open = false;
+                                            cx.notify();
+                                        }
+                                    });
+                                }
+                            },
+                        );
+                    },
+                )),
+            );
+            card.child(overlay)
         })
 }
 

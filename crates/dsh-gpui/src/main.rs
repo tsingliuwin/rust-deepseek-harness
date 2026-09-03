@@ -475,30 +475,10 @@ pub(crate) fn save_workspaces(workspaces: &[WorkspaceInfo]) {
     }
 }
 
-/// 读 web 会话投影缓存（storages/session_projcache.json）：标题兜底。
+/// 读 web 会话投影缓存标题兜底（dsh-persist 双布局读取：per-record 树
+/// 优先、旧整档按 session 回退——web 0.1.2-alpha.5 起写侧只落 per-record）。
 pub(crate) fn load_web_session_metas() -> Vec<(String, String)> {
-    let path = dsh_home().join("storages").join("session_projcache.json");
-    let Ok(raw) = std::fs::read_to_string(&path) else { return Vec::new() };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
-    let Some(sess) = doc
-        .get("tables")
-        .and_then(|tt| tt.get("sessions"))
-        .and_then(|s| s.as_object())
-    else {
-        return Vec::new();
-    };
-    sess.iter()
-        .filter_map(|(id, row)| {
-            let title = row
-                .get("rows")
-                .and_then(|r| r.get("title"))
-                .and_then(|tt| tt.get("val"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .filter(|s| !s.trim().is_empty())?;
-            Some((id.clone(), title))
-        })
-        .collect()
+    dsh_persist::load_projcache_titles(&dsh_home().join("storages"))
 }
 
 /// 新建会话 id 对齐 web 会话 id 形态（session-<uuid>）。

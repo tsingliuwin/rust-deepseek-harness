@@ -9,5 +9,7 @@
 //! total.
 
 mod adapter;
+mod discovery;
 
 pub use adapter::DeepSeekAdapter;
+pub use discovery::{DiscoveredModel, DiscoveryError, discover_models};

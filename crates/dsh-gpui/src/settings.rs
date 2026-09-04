@@ -7,7 +7,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{Icon, IconName, StyledExt, input::{Input, InputState}};
 
-use crate::{AppView, AppearanceMode, AddingMode, EnterBehavior, SettingsTab, TranscriptView, PROVIDER_CATALOG, valid_route_id};
+use crate::{AppView, AppearanceMode, AddingMode, EnterBehavior, FetchTarget, SettingsTab, TranscriptView, PROVIDER_CATALOG, valid_route_id};
 use crate::theme;
 
 /// 设置弹层（挂在根视图最上层）。
@@ -234,6 +234,9 @@ pub(crate) fn render_settings(app: &AppView, this: Entity<AppView>, window: &mut
                                     ),
                             ),
                     )
+                })
+                .when_some(app.fetch_target.clone(), |col, target| {
+                    col.child(fetch_modal(app, &this, &target, cx))
                 }),
         );
 
@@ -500,6 +503,7 @@ fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, cx: 
         false, // 自定义 tag
         app.llm_configured,
         Some(()), // 可编辑，不可删除（内置路由）
+        cx,
     );
 
     let custom_rows: Vec<Div> = app
@@ -518,6 +522,7 @@ fn models_page(app: &AppView, this: &Entity<AppView>, _window: &mut Window, cx: 
                 custom,
                 !p.api_key.is_empty(),
                 None, // 可编辑 + 可删除
+                cx,
             )
         })
         .collect();
@@ -589,6 +594,7 @@ fn provider_row(
     custom: bool,
     has_key: bool,
     _builtin: Option<()>,
+    cx: &App,
 ) -> Div {
     let tk = theme::t();
     let is_deepseek = id == "deepseek";
@@ -698,13 +704,13 @@ fn provider_row(
 
     // 展开的编辑卡（web rowCard 内嵌 ProviderEditor）
     if editing {
-        card = card.child(edit_card(app, this, id, name));
+        card = card.child(edit_card(app, this, id, name, cx));
     }
     card
 }
 
 /// 编辑卡（web ProviderEditor：密钥 + 自定义设置折叠 + 保存/取消）。
-fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str) -> Div {
+fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str, cx: &App) -> Div {
     let tk = theme::t();
     let t_save = this.clone();
     let models: Vec<String> = if id == "deepseek" {
@@ -798,12 +804,25 @@ fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str) -> Div
                             .v_flex()
                             .gap_1()
                             .child(
+                                // web ModelListEditor 的 modelListHead：标题 +
+                                // 获取按钮（pi-ai 家族才有端点探测；DeepSeek
+                                // 用内置目录编辑器，无此动作）
                                 div()
-                                    .text_size(px(theme::FONT_CAPTION))
-                                    .line_height(px(theme::FONT_CAPTION_LEADING))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(tk.text_2)
-                                    .child("模型目录"),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(theme::FONT_CAPTION))
+                                            .line_height(px(theme::FONT_CAPTION_LEADING))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(tk.text_2)
+                                            .child("模型目录"),
+                                    )
+                                    .when(id != "deepseek", |d| {
+                                        let target = FetchTarget::Edit(id.to_string());
+                                        d.child(fetch_link(app, this, &target, cx))
+                                    }),
                             )
                             .child(
                                 div()
@@ -812,6 +831,12 @@ fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str) -> Div
                                     .text_color(tk.text_3)
                                     .child(models.join(" · ")),
                             ),
+                    )
+                    .when_some(
+                        app.fetch_error.clone().filter(|(t, _)| {
+                            matches!(t, FetchTarget::Edit(owner) if owner == id)
+                        }),
+                        |d, (_, message)| d.child(fetch_error_line(&message)),
                     )
                     .child(hint("其余字段在 settings.json 中，请直接编辑对应段。")),
                 {
@@ -1184,41 +1209,53 @@ fn declare_card(app: &AppView, this: &Entity<AppView>, cx: &App) -> Div {
         .child(field("API 协议", protocol_field("openai")))
         .child(field("API 密钥", Input::new(&app.dc_key).w_full()))
         // 模型目录
-        .child(
-            div()
-                .v_flex()
-                .gap(px(10.0))
-                .pt_3()
-                // web .customized（alpha.4）：0.5px 发丝
-                .border_t(px(0.5))
-                .border_color(tk.border_l2)
                 .child(
                     div()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .line_height(px(theme::FONT_CAPTION_LEADING))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(tk.text_2)
-                        .child("模型目录"),
+                        .v_flex()
+                        .gap(px(10.0))
+                        .pt_3()
+                        // web .customized（alpha.4）：0.5px 发丝
+                        .border_t(px(0.5))
+                        .border_color(tk.border_l2)
+                        .child(
+                            // web ModelListEditor 的 modelListHead：标题 + 获取按钮
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(theme::FONT_CAPTION))
+                                        .line_height(px(theme::FONT_CAPTION_LEADING))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(tk.text_2)
+                                        .child("模型目录"),
+                                )
+                                .child(fetch_link(app, this, &FetchTarget::Declare, cx)),
+                        )
+                        .child(model_list)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Input::new(&app.dc_new_model).w(px(240.0)))
+                                .child(link_button("dc-add-model", "添加模型", move |_, window, cx| {
+                                    let entities = t_add_model.read_with(cx, |v, _| v.dc_new_model.clone());
+                                    t_add_model.update(cx, |v, cx| {
+                                        v.dc_push_model(cx);
+                                        cx.notify();
+                                    });
+                                    entities.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                                })),
+                        )
+                        .children(needs_hint.map(hint)),
                 )
-                .child(model_list)
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(Input::new(&app.dc_new_model).w(px(240.0)))
-                        .child(link_button("dc-add-model", "添加模型", move |_, window, cx| {
-                            let entities = t_add_model.read_with(cx, |v, _| v.dc_new_model.clone());
-                            t_add_model.update(cx, |v, cx| {
-                                v.dc_push_model(cx);
-                                cx.notify();
-                            });
-                            entities.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
-                        })),
+                .when_some(
+                    app.fetch_error.clone().filter(|(t, _)| matches!(t, FetchTarget::Declare)),
+                    |d, (_, message)| d.child(fetch_error_line(&message)),
                 )
-                .children(needs_hint.map(hint)),
-        )
-        .when_some(app.declare_error.clone(), |d, e| {
+                .when_some(app.declare_error.clone(), |d, e| {
             d.child(
                 div()
                     .text_size(px(theme::FONT_CAPTION))
@@ -1465,5 +1502,233 @@ fn placeholder_page(title: &str, desc: &str) -> Div {
                 .line_height(px(22.0))
                 .text_color(tk.text_3)
                 .child(desc.to_string()),
+        )
+}
+
+// --- 获取可用模型（web ModelListEditor 的 fetch 流程） -----------------------
+
+/// 卡内失败行（web ModelListEditor 的 p.error）：Host 诊断按原样展示。
+fn fetch_error_line(message: &str) -> Div {
+    let tk = theme::t();
+    div()
+        .text_size(px(theme::FONT_CAPTION))
+        .line_height(px(theme::FONT_CAPTION_LEADING))
+        .text_color(tk.error)
+        .child(message.to_string())
+}
+
+/// web ModelListEditor 的 fetch linkButton：busy 显「正在询问提供方…」；
+/// 不可探测（API 地址为空）时禁用——web 以 title 提示 fetchNeedsBaseUrl，
+/// 此处无 tooltip 通道，禁用态同款置灰。
+fn fetch_link(app: &AppView, this: &Entity<AppView>, target: &FetchTarget, cx: &App) -> Stateful<Div> {
+    let tk = theme::t();
+    let busy = app.fetch_pending.as_ref() == Some(target);
+    let askable = app.fetch_askable(target, cx);
+    let key = match target {
+        FetchTarget::Declare => "declare".to_string(),
+        FetchTarget::Edit(id) => format!("edit-{id}"),
+    };
+    let base = div()
+        .id(SharedString::from(format!("fetch-models-{key}")))
+        .h(px(28.0))
+        .px(px(10.0))
+        .flex()
+        .items_center()
+        .rounded(px(14.0))
+        .text_size(px(theme::FONT_CAPTION))
+        .line_height(px(theme::FONT_CAPTION_LEADING))
+        .child(if busy { "正在询问提供方…" } else { "获取可用模型" });
+    if busy || !askable {
+        base.text_color(tk.text_3)
+    } else {
+        let t = this.clone();
+        let target = target.clone();
+        base.text_color(tk.text_3)
+            .cursor_pointer()
+            .hover(|s| s.bg(tk.hover).text_color(tk.text_2))
+            .on_click(move |_, window, cx| {
+                t.update(cx, |v, cx| v.fetch_models(target.clone(), cx));
+                // web fetchModels 前 setCandidateQuery('')：搜索词清空。
+                let query = t.read_with(cx, |v, _| v.fetch_query.clone());
+                query.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+            })
+    }
+}
+
+/// 候选行勾选框（web 原生 checkbox 的等价物：14px 圆角方，勾选填充反色）。
+fn fetch_check(picked: bool) -> Div {
+    let tk = theme::t();
+    let base = div()
+        .flex_none()
+        .w(px(14.0))
+        .h(px(14.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.0));
+    if picked {
+        base.bg(tk.text)
+            .child(Icon::new(IconName::Check).size(px(10.0)).text_color(tk.bg_base))
+    } else {
+        base.border(px(0.5)).border_color(tk.border_l4)
+    }
+}
+
+/// 候选弹层（web ModelListEditor 的 fetchDialog Modal）：标题/描述/搜索 +
+/// 全选切换/勾选列表（上限 320px 滚动）/取消 + 添加所选。
+fn fetch_modal(app: &AppView, this: &Entity<AppView>, _target: &FetchTarget, cx: &App) -> Div {
+    let tk = theme::t();
+    let visible = app.fetch_visible(cx);
+    let any_visible = !visible.is_empty();
+    let all_picked = any_visible
+        && visible
+            .iter()
+            .all(|i| app.fetch_picked.contains(&app.fetch_candidates[*i].id));
+
+    // 候选行（web .candidate：r6 行 + 原生 checkbox + id）
+    let mut list = div().v_flex().gap(px(2.0));
+    for i in visible {
+        let model = app.fetch_candidates[i].clone();
+        let picked = app.fetch_picked.contains(&model.id);
+        let t = this.clone();
+        let cid = model.id.clone();
+        list = list.child(
+            div()
+                .id(SharedString::from(format!("fetch-cand-{i}")))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(tk.hover))
+                .on_click(move |_, _, cx| {
+                    t.update(cx, |v, cx| v.fetch_toggle(&cid, cx));
+                })
+                .child(fetch_check(picked))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(20.0))
+                        .text_color(tk.text)
+                        .child(model.id.clone()),
+                ),
+        );
+    }
+
+    div()
+        .absolute()
+        .size_full()
+        .top_0()
+        .left_0()
+        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.3))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .w(px(520.0))
+                .v_flex()
+                .gap(px(10.0))
+                .p(px(20.0))
+                // web Modal 卡（alpha.4）：r24、描边 l1 画进 elevation-prominent
+                .rounded(px(24.0))
+                .bg(tk.surface)
+                .shadow(theme::elevation_prominent())
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(22.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tk.text)
+                        .child("选择要添加的模型"),
+                )
+                .child(
+                    div()
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(theme::FONT_CAPTION_LEADING))
+                        .text_color(tk.text_3)
+                        .child("以下是模型提供方的可用模型，勾选要添加的模型。"),
+                )
+                .child(
+                    // web .candidateToolbar：搜索框（flex-1）+ 全选切换
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .mb_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&app.fetch_query).w_full()),
+                        )
+                        .child({
+                            let t = this.clone();
+                            let toggle = div()
+                                .id("fetch-toggle-all")
+                                .h(px(28.0))
+                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .rounded(px(14.0))
+                                .text_size(px(theme::FONT_CAPTION))
+                                .line_height(px(theme::FONT_CAPTION_LEADING))
+                                .child(if all_picked { "取消全选" } else { "全选" });
+                            if !any_visible {
+                                toggle.text_color(tk.text_3)
+                            } else {
+                                toggle
+                                    .text_color(tk.text_2)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(tk.hover).text_color(tk.text))
+                                    .on_click(move |_, _, cx| {
+                                        t.update(cx, |v, cx| v.fetch_toggle_visible(cx));
+                                    })
+                            }
+                        }),
+                )
+                .child(if !any_visible {
+                    div()
+                        .id("fetch-empty")
+                        .text_size(px(theme::FONT_CAPTION))
+                        .line_height(px(theme::FONT_CAPTION_LEADING))
+                        .text_color(tk.text_3)
+                        .child("没有匹配的模型。")
+                } else {
+                    div()
+                        .id("fetch-cand-list")
+                        .max_h(px(320.0))
+                        .overflow_y_scroll()
+                        .child(list)
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child({
+                            let t = this.clone();
+                            action_button("fetch-cancel", "取消", false, move |_, window, cx| {
+                                let query = t.read_with(cx, |v, _| v.fetch_query.clone());
+                                t.update(cx, |v, cx| v.fetch_close(cx));
+                                query.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                            })
+                        })
+                        .child({
+                            let t = this.clone();
+                            action_button("fetch-adopt", "添加所选", false, move |_, window, cx| {
+                                let query = t.read_with(cx, |v, _| v.fetch_query.clone());
+                                t.update(cx, |v, cx| v.fetch_adopt(cx));
+                                query.update(cx, |s: &mut InputState, cx| s.set_value("", window, cx));
+                            })
+                        }),
+                ),
         )
 }

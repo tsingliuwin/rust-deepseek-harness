@@ -174,6 +174,15 @@ pub(crate) enum AddingMode {
     Declare,
 }
 
+/// 「获取可用模型」弹层的采纳去向（web：ModelListEditor 挂在哪张卡）。
+#[derive(Clone, PartialEq)]
+pub(crate) enum FetchTarget {
+    /// declare 卡（web CustomProviderCard）：采纳进草稿模型行。
+    Declare,
+    /// 编辑卡（web ProviderEditor pi-ai 家族）：采纳进已存提供方。
+    Edit(String),
+}
+
 /// 外观模式（通用设置 → 外观分段）。
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum AppearanceMode {
@@ -1199,6 +1208,15 @@ struct AppView {
     // 编辑卡输入
     edit_key: Entity<InputState>,
     edit_base: Entity<InputState>,
+    // 获取可用模型（web ModelListEditor 的 fetch 流程；rc.1 master 语义）。
+    // target 同时是弹层开关；pending/error 记归属卡（web 两卡各有本地状态，
+    // rustdsh 共享一份）；picked 初始 = 全部候选减已配置行。
+    fetch_target: Option<FetchTarget>,
+    fetch_pending: Option<FetchTarget>,
+    fetch_error: Option<(FetchTarget, String)>,
+    fetch_candidates: Vec<dsh_llm_deepseek::DiscoveredModel>,
+    fetch_picked: std::collections::HashSet<String>,
+    fetch_query: Entity<InputState>,
     pending_clear: bool,
     _input_subscription: Subscription,
     /// 对话/轨迹主体（独立 entity：流式 delta 的失效只打它；侧栏/详情经
@@ -1290,6 +1308,7 @@ impl AppView {
         dc_new_model: Entity<InputState>,
         edit_key: Entity<InputState>,
         edit_base: Entity<InputState>,
+        fetch_query: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
         let this = cx.entity();
@@ -1374,6 +1393,12 @@ impl AppView {
             dc_new_model,
             edit_key,
             edit_base,
+            fetch_target: None,
+            fetch_pending: None,
+            fetch_error: None,
+            fetch_candidates: Vec::new(),
+            fetch_picked: std::collections::HashSet::new(),
+            fetch_query,
             pending_clear: false,
             _input_subscription: subscription,
             chat,
@@ -2068,12 +2093,207 @@ impl AppView {
     }
 
     /// 向 declare 卡追加一行模型（查重）。
-    fn dc_push_model(&mut self, cx: &App) {
+    fn dc_push_model(&mut self, cx: &mut Context<Self>) {
         let id = self.dc_new_model.read_with(cx, |s, _| s.value().trim().to_string());
         if !id.is_empty() && !self.dc_models.contains(&id) {
             self.dc_models.push(id);
         }
     }
+
+    // --- 获取可用模型（web ModelListEditor 的 fetch 流程） -------------------
+
+    /// 发起探测（web fetchModels）：busy → 询问端点 → 候选弹层或行内失败。
+    /// 表单里键入的 key 优先于已存凭据（可能正在失败的那个）。
+    fn fetch_models(&mut self, target: FetchTarget, cx: &mut Context<Self>) {
+        let (base, key, api) = match &target {
+            FetchTarget::Declare => (
+                self.dc_base.read_with(cx, |s, _| s.value().trim().to_string()),
+                self.dc_key.read_with(cx, |s, _| s.value().trim().to_string()),
+                Some("openai".to_string()),
+            ),
+            FetchTarget::Edit(id) => {
+                let stored = self.settings.providers.iter().find(|p| p.id == *id);
+                let typed_key = self.edit_key.read_with(cx, |s, _| s.value().trim().to_string());
+                let stored_key = stored.map(|p| p.api_key.clone()).unwrap_or_default();
+                let typed_base = self.edit_base.read_with(cx, |s, _| s.value().trim().to_string());
+                // 目录型提供方的 baseURL 在内置目录里（yaml 不写），表单与
+                // 已存皆空时回退目录地址。仍无地址不拦按钮——web 的编辑卡
+                // askable 恒真（适配器已描述的路由），点了由错误行解释。
+                let stored_base = stored
+                    .map(|p| p.base_url.clone())
+                    .filter(|b| !b.is_empty())
+                    .or_else(|| {
+                        PROVIDER_CATALOG
+                            .iter()
+                            .find(|e| e.id == *id)
+                            .map(|e| e.base_url.to_string())
+                            .filter(|b| !b.is_empty())
+                    })
+                    .unwrap_or_default();
+                (if typed_base.is_empty() { stored_base } else { typed_base },
+                 if typed_key.is_empty() { stored_key } else { typed_key },
+                 stored.map(|p| p.protocol.clone()))
+            }
+        };
+        // web 编辑卡对无目录且无端点的路由点击后的同款诊断（完整上游文案）。
+        let edit_id = match &target {
+            FetchTarget::Edit(id) if base.is_empty() => Some(id.clone()),
+            _ => None,
+        };
+        if let Some(id) = edit_id {
+            self.fetch_error = Some((
+                target,
+                format!(
+                    "pi-ai ships no catalog for provider \"{id}\", so its models can only come from its endpoint; set a baseURL, or enter this provider's models by hand"
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+        self.fetch_pending = Some(target.clone());
+        self.fetch_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = dsh_llm_deepseek::discover_models(
+                &base,
+                api.as_deref(),
+                if key.is_empty() { None } else { Some(&key) },
+            )
+            .await;
+            let _ = this.update(cx, |v, cx| {
+                v.fetch_pending = None;
+                match result {
+                    Ok(models) if models.is_empty() => {
+                        v.fetch_error = Some((target, "该提供方没有列出任何模型，请手动添加。".into()));
+                    }
+                    Ok(models) => {
+                        // 已配置行默认不勾选（web：勾选采纳不会悄悄改写
+                        // 用户已调过的容量），其余候选默认全勾。
+                        let known: Vec<String> = match &target {
+                            FetchTarget::Declare => v.dc_models.clone(),
+                            FetchTarget::Edit(id) => v
+                                .settings
+                                .providers
+                                .iter()
+                                .find(|p| p.id == *id)
+                                .map(|p| p.models.iter().map(|m| m.id.clone()).collect())
+                                .unwrap_or_default(),
+                        };
+                        v.fetch_picked = models
+                            .iter()
+                            .filter(|m| !known.iter().any(|k| k == &m.id))
+                            .map(|m| m.id.clone())
+                            .collect();
+                        v.fetch_candidates = models;
+                        v.fetch_target = Some(target);
+                    }
+                    Err(e) => {
+                        // Host 诊断按原样给失败行（web：the Host's own diagnostic）。
+                        v.fetch_error = Some((target, e.message));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 关闭候选弹层（web closePicker：清候选与勾选；失败行保留到下次探测）。
+    fn fetch_close(&mut self, cx: &mut Context<Self>) {
+        self.fetch_target = None;
+        self.fetch_candidates.clear();
+        self.fetch_picked.clear();
+        cx.notify();
+    }
+
+    /// 过滤后的可见候选下标（web visibleCandidates：id 或 name 含搜索词）。
+    fn fetch_visible(&self, cx: &App) -> Vec<usize> {
+        let query = self.fetch_query.read_with(cx, |s, _| s.value().trim().to_lowercase());
+        self.fetch_candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                query.is_empty()
+                    || m.id.to_lowercase().contains(&query)
+                    || m.name.to_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// 单条候选勾选切换（web toggle）。
+    fn fetch_toggle(&mut self, id: &str, cx: &mut Context<Self>) {
+        if !self.fetch_picked.remove(id) {
+            self.fetch_picked.insert(id.to_string());
+        }
+        cx.notify();
+    }
+
+    /// 全选/取消全选切换（web toggleVisibleCandidates，rc.1 语义：全部可见
+    /// 已勾选 → 清空**整个**勾选集，不只移除可见的；否则把所有可见的加入）。
+    fn fetch_toggle_visible(&mut self, cx: &mut Context<Self>) {
+        let visible = self.fetch_visible(cx);
+        let all_picked = !visible.is_empty()
+            && visible.iter().all(|i| self.fetch_picked.contains(&self.fetch_candidates[*i].id));
+        if all_picked {
+            self.fetch_picked.clear();
+        } else {
+            for i in visible {
+                self.fetch_picked.insert(self.fetch_candidates[i].id.clone());
+            }
+        }
+        cx.notify();
+    }
+
+    /// 采纳勾选（web adoptPicked）：已调过的行以 id 胜出；勾选的候选各自
+    /// 成行，端点披露的容量随行保留。
+    fn fetch_adopt(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.fetch_target.clone() else { return };
+        let picked: Vec<dsh_llm_deepseek::DiscoveredModel> = self
+            .fetch_candidates
+            .iter()
+            .filter(|m| self.fetch_picked.contains(&m.id))
+            .cloned()
+            .collect();
+        match target {
+            FetchTarget::Declare => {
+                for m in picked {
+                    if !self.dc_models.contains(&m.id) {
+                        self.dc_models.push(m.id);
+                    }
+                }
+            }
+            FetchTarget::Edit(id) => {
+                if let Some(p) = self.settings.providers.iter_mut().find(|p| p.id == id) {
+                    for m in picked {
+                        if !p.models.iter().any(|row| row.id == m.id) {
+                            p.models.push(CustomModel {
+                                id: m.id.clone(),
+                                display_name: m.name,
+                                context_window: m.context_window.map(fmt_capacity).unwrap_or_default(),
+                                max_tokens: m.max_tokens.map(fmt_capacity).unwrap_or_default(),
+                            });
+                        }
+                    }
+                }
+                self.persist_settings();
+            }
+        }
+        self.fetch_close(cx);
+    }
+
+    /// 编辑卡/declare 卡当前是否可探测。declare 卡（web probe 无 provider）
+    /// 按 web 以 API 地址为门槛；编辑卡（web probe.provider 恒存在，适配器
+    /// 已描述的路由可无端点应答）恒可点，点了由错误行解释缺什么。
+    fn fetch_askable(&self, target: &FetchTarget, cx: &App) -> bool {
+        match target {
+            FetchTarget::Declare => {
+                !self.dc_base.read_with(cx, |s, _| s.value().trim().is_empty())
+            }
+            FetchTarget::Edit(_) => true,
+        }
+    }
+
 
     /// 编辑卡保存（web ProviderEditor apply：换 key / 改 API 地址）。
     fn save_edit(&mut self, cx: &App) {
@@ -3756,6 +3976,9 @@ fn main() {
                 let edit_base = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).placeholder("提供方默认")
                 });
+                let fetch_query = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("搜索模型")
+                });
                 // 显示与路由必须同源：UI 展示的就是 agent 实际路由的模型
                 //（曾各算各的，UI 显示 glm 实际走 deepseek-chat）
                 let desired_model = startup_model.clone();
@@ -3795,6 +4018,7 @@ fn main() {
                         dc_new_model.clone(),
                         edit_key.clone(),
                         edit_base.clone(),
+                        fetch_query.clone(),
                         cx,
                     )
                 });
@@ -3844,6 +4068,19 @@ fn valid_route_id(route: &str) -> bool {
         .split('-')
         .all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()))
         && !route.ends_with('-')
+}
+
+/// 容量拼法（web formatCapacity：K=1000、M=1000000，整除才缩写）。
+fn fmt_capacity(value: u64) -> String {
+    const K: u64 = 1000;
+    const M: u64 = 1000 * 1000;
+    if value % M == 0 {
+        format!("{}M", value / M)
+    } else if value % K == 0 {
+        format!("{}K", value / K)
+    } else {
+        value.to_string()
+    }
 }
 
 

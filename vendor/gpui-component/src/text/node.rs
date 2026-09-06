@@ -619,6 +619,18 @@ impl Paragraph {
                                 })
                                 .on_click(move |_, _, cx| {
                                     cx.stop_propagation();
+                                    // [dsh] 空 href / 不存在路径不交给系统打开
+                                    // （同 inline.rs 的 dsh_openable）
+                                    let u = link.url.trim();
+                                    if u.is_empty() {
+                                        return;
+                                    }
+                                    if !(u.contains("://")
+                                        || u.starts_with("mailto:")
+                                        || std::path::Path::new(u).exists())
+                                    {
+                                        return;
+                                    }
                                     cx.open_url(&link.url);
                                 })
                         })

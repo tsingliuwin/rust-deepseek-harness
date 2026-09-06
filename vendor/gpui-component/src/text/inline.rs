@@ -35,6 +35,20 @@ pub(crate) struct InlineState {
     pub(super) selection: Option<Selection>,
 }
 
+// [dsh] 空 href 或不存在路径不交给系统打开：LLM 常输出引用式链接
+// （[text][1] 无定义 → url 为空）与相对路径——Windows ShellExecute
+// 会弹「找不到文件」错误框。有 scheme 的 URL 放行。
+fn dsh_openable(url: &str) -> bool {
+    let u = url.trim();
+    if u.is_empty() {
+        return false;
+    }
+    if u.contains("://") || u.starts_with("mailto:") {
+        return true;
+    }
+    std::path::Path::new(u).exists()
+}
+
 impl InlineState {
     /// Save actually rendered text for selected text to use.
     pub(crate) fn set_text(&mut self, text: SharedString) {
@@ -356,6 +370,9 @@ impl Element for Inline {
                         Self::link_for_position(&text_layout, &links, event.position)
                     {
                         cx.stop_propagation();
+                        if !dsh_openable(&link.url) {
+                            return;
+                        }
                         cx.open_url(&link.url);
                     }
                 }

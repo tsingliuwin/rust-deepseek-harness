@@ -907,6 +907,16 @@ pub(crate) fn web_fetch_card(uid: u64, url: &str, truncated: bool) -> Div {
                 .text_color(theme::t().accent)
                 .hover(|s| s.underline())
                 .on_click(move |_, _, cx| {
+                    // 空/无 scheme 且非真实路径的 URL 不交给系统打开
+                    //（避免 Windows「找不到文件」错误框）
+                    let u = open_url.trim();
+                    let openable = !u.is_empty()
+                        && (u.contains("://")
+                            || u.starts_with("mailto:")
+                            || std::path::Path::new(u).exists());
+                    if !openable {
+                        return;
+                    }
                     cx.open_url(&open_url);
                 })
                 .child(url.to_string()),

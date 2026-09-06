@@ -3,7 +3,7 @@
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
 > **当前同步点：dsh-v0.1.3-alpha.1（d347e70390）**——2026-09-06 同步。此前 76fda729（0.1.2-rc.1，对 alpha.5 零功能变更）。
 > 0.1.3-alpha.1 主面：会话日志格式 v2（breaking）+ 通用文件附件 + 可点击链接语言 + skill 芯片（rustdsh 面外）。
-> **最近检查：2026-09-06（定时轮 #1）**——上游 pull 后 HEAD 仍 d347e70390（= master HEAD = 发布点），五段 diff 全空，零功能变更，无动作。
+> **最近检查：2026-09-07（定时轮 #2）**——上游 pull 后 HEAD 仍 d347e70390（= master HEAD = 发布点），五段 diff 全空，零功能变更，无动作。
 
 ## 1. 一键差异分析
 

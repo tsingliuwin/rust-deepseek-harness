@@ -108,6 +108,7 @@ async fn main() {
             system_prompt: Some("You are a concise assistant.".into()),
             compaction: Default::default(),
             workdir: Default::default(),
+            attachments_root: None,
         },
         llm,
         tools,

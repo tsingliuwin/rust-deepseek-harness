@@ -11,6 +11,8 @@ const LOCAL: &[(&str, &[u8])] = &[
     ("brands/fish.svg", include_bytes!("../assets/brands/fish.svg")),
     ("brands/hero-glow.png", include_bytes!("../assets/brands/hero-glow.png")),
     ("icons/context-injection.svg", include_bytes!("../assets/icons/context-injection.svg")),
+    ("icons/paperclip.svg", include_bytes!("../assets/icons/paperclip.svg")),
+    ("icons/document-file.svg", include_bytes!("../assets/icons/document-file.svg")),
     ("icons/clock.svg", include_bytes!("../assets/icons/clock.svg")),
     ("icons/database.svg", include_bytes!("../assets/icons/database.svg")),
 ];

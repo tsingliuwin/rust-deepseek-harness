@@ -84,6 +84,7 @@ async fn main() {
             system_prompt: None,
             compaction: Default::default(),
             workdir: Default::default(),
+            attachments_root: None,
         },
         llm,
         Arc::new(ToolRegistry::new()),

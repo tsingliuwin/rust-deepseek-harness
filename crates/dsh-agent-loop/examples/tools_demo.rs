@@ -70,7 +70,7 @@ async fn main() {
 
     let agent = ReactLoopAgent::new(
         SessionId::new("fs-demo"),
-        AgentOptions { provider: "mock".into(), model: "mock".into(), max_tokens: None, system_prompt: None, compaction: Default::default(), workdir: Default::default() },
+        AgentOptions { provider: "mock".into(), model: "mock".into(), max_tokens: None, system_prompt: None, compaction: Default::default(), workdir: Default::default(), attachments_root: None },
         llm,
         tools,
         Arc::new(SystemPrompt::new()),

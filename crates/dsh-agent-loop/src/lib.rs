@@ -118,6 +118,10 @@ pub struct AgentOptions {
     /// 会话工作目录（web session.header.cwd → 模型可见的运行时上下文 +
     /// 工具执行基准；宿主切换工作区时更新同一句柄）。
     pub workdir: dsh_tools::Workdir,
+    /// 附件存储根（`DSH_HOME/attachments/v1`）：请求组装把 FileBlock 投影
+    /// 为 handle 文本时解析只读保存路径；None = 无可用路径（handle 落
+    /// 「无法访问」分支）。
+    pub attachments_root: Option<std::path::PathBuf>,
 }
 
 /// A live event emitted to UI/observers as the loop progresses.
@@ -148,6 +152,15 @@ enum StepEnd {
 }
 
 /// The default `Agent` implementation: a turn/step driver over an inbox.
+/// 简单唯一 id（时间纳秒 hex；compactionId 这类不透明标识够用）。
+fn uuid_simple() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:032x}")
+}
+
 pub struct ReactLoopAgent {
     options: Arc<RwLock<AgentOptions>>,
     session: Arc<Mutex<Session>>,
@@ -419,7 +432,18 @@ impl ReactLoopAgent {
         .await
         {
             Ok(summary) => {
-                self.append_event(SessionEvent::Compaction { before_seq, summary });
+                // v2 富形：影子区边界/清单/token 估算/路由（上游
+                // compaction/summary 必填七件套）
+                self.append_event(SessionEvent::compaction(
+                    before_seq,
+                    summary,
+                    format!("cp-{}", uuid_simple()),
+                    pairs.first().map(|(s, _)| *s).unwrap_or(0),
+                    pairs[..boundary].iter().map(|(s, _)| *s).collect(),
+                    dsh_compaction::estimate_tokens(&shadowed) as u64,
+                    provider.clone(),
+                    model.clone(),
+                ));
                 self.emit_ui(AgentEvent::Compacted { shadowed_messages: boundary });
             }
             Err(_) => {}
@@ -452,7 +476,7 @@ impl ReactLoopAgent {
         loop {
             let signal = self.abort.lock().unwrap().clone();
             if signal.aborted() {
-                turn_ends = Some(TurnEndReason::Aborted);
+                turn_ends = Some(TurnEndReason::Aborted { cancel_cause: dsh_session::CancelCause::Legacy });
                 break;
             }
 
@@ -552,7 +576,7 @@ impl ReactLoopAgent {
                             usage: assembler.usage().cloned(),
                         });
                     }
-                    return StepEnd::Concluded(TurnEndReason::Aborted);
+                    return StepEnd::Concluded(TurnEndReason::Aborted { cancel_cause: dsh_session::CancelCause::Legacy });
                 }
 
                 self.append_event(SessionEvent::AssistantChunk {
@@ -724,6 +748,23 @@ impl ReactLoopAgent {
         let (boundary, session_id) = {
             let s = self.session.lock().unwrap();
             (s.derive_messages(), s.id.clone())
+        };
+        // 请求组装：FileBlock → 确定性 handle 文本（上游
+        // projectFilesToText 在所有 provider 路由前无条件执行——provider
+        // 永远收不到文件字节，模型按需用现有文件工具读存储副本）
+        let boundary = {
+            let root = self.options.read().unwrap().attachments_root.clone();
+            match root {
+                Some(root) => {
+                    let store = dsh_persist::AttachmentStore::new(root);
+                    dsh_llm::project_files_to_text(boundary, &|ref_: &dsh_llm::FileAttachmentRef| -> Option<String> {
+                        store
+                            .file_host_path(ref_)
+                            .map(|p| p.to_string_lossy().into_owned())
+                    })
+                }
+                None => dsh_llm::project_files_to_text(boundary, &|_| None),
+            }
         };
 
         let header = EpochHeader {

@@ -66,11 +66,67 @@ struct ToolBlock {
     collapsed_groups: Vec<usize>,
 }
 
+/// 附件视图块（用户消息混合附件；上游 PresentedAttachment：64px 图片
+/// tile 与 240×64 文件卡）
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ChatAttachment {
+    FileCard { name: String, bytes: u64 },
+    /// path = 附件对象落盘路径（图片块经附件存储根反查；取不到字节则 None 占位）
+    ImageTile { path: Option<std::path::PathBuf> },
+}
+
 #[derive(Clone)]
 enum MsgBlock {
     Text(String),
     Reasoning { text: String, open: bool },
     Tool(ToolBlock),
+    Attachment(ChatAttachment),
+}
+
+/// composer 附件草稿的上传态（上游 DraftFileUpload：uploading/ready/error）
+#[derive(Clone, Debug, PartialEq)]
+enum DraftUpload {
+    Uploading,
+    Ready { reference: dsh_llm::FileAttachmentRef },
+    Failed { message: String },
+}
+
+/// composer 文件附件草稿（有序；本地内容寻址存储一次完成，Uploading 仅瞬态）
+#[derive(Clone, Debug)]
+struct DraftFile {
+    id: String,
+    path: std::path::PathBuf,
+    name: String,
+    bytes: u64,
+    state: DraftUpload,
+}
+
+/// 附件大小文案（上游 ui-primitives file-size.ts：B/KB/MB/GB，<10 一位小数）
+pub(crate) fn file_size_text(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}B")
+    } else if value < 10.0 {
+        format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.0}{}", UNITS[unit])
+    }
+}
+
+/// 文件卡 meta 左段：扩展名大写、最长 8 字符（上游 extensionOf）
+pub(crate) fn extension_of(name: &str) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => {
+            name[dot + 1..].to_uppercase().chars().take(8).collect()
+        }
+        _ => String::new(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1172,6 +1228,12 @@ struct AppView {
     model_menu: bool,
     rename_input: Entity<InputState>,
     input: Entity<InputState>,
+    /// composer 附件草稿（有序；上游 DraftFileUploads）
+    attachments: Vec<DraftFile>,
+    /// 附件内容寻址存储（DSH_HOME/attachments/v1）
+    attachment_store: Arc<dsh_persist::AttachmentStore>,
+    /// 发送拦截提示（文件还在上传等；web file.stillUploading toast 的行内形）
+    upload_notice: Option<&'static str>,
     #[allow(dead_code)] // 被 DeepSeek 卡引用
     api_input: Entity<InputState>,
     desired_model: String,
@@ -1316,7 +1378,9 @@ impl AppView {
             if matches!(event, InputEvent::PressEnter { secondary: false }) {
                 let text: String = input.read_with(cx, |s, _| s.value().to_string());
                 let text = text.trim().to_string();
-                if !text.is_empty() {
+                // 附件-only 发送合法（上游：draft 空 + 有附件 → commitSend；
+                // 未就绪附件由 send_user_turn 拦截并提示）
+                if !text.is_empty() || !chat.attachments.is_empty() {
                     if chat.workspace_locked(cx) {
                         // web inert 态：回车不发送，引导选择工作区
                         chat.hero_ws_menu = true;
@@ -1336,6 +1400,9 @@ impl AppView {
                 this.clone(),
                 format!("{}/{}", active_provider, desired_model),
                 settings.transcript_view,
+                Some(dsh_persist::attachments_root_from_sessions_root(
+                    &sessions_dir(),
+                )),
                 cx,
             )
         });
@@ -1375,6 +1442,11 @@ impl AppView {
             hero_ws_menu: false,
             model_menu: false,
             rename_input,
+            attachments: Vec::new(),
+            attachment_store: Arc::new(dsh_persist::AttachmentStore::new(
+                dsh_persist::attachments_root_from_sessions_root(&sessions_dir()),
+            )),
+            upload_notice: None,
             adding: AddingMode::None,
             adopt_pick: 0,
             adopt_dropdown_open: false,
@@ -1879,6 +1951,110 @@ impl AppView {
 
     /// 发送统一入口（发送按钮与回车共用）：先派生 @ 引用的上下文注入，
     /// 再走普通用户消息。entries 入列走 ChatView；标题/落盘是宿主职责。
+    /// 回形针多选后逐个加入附件栏：立即后台写入内容寻址存储
+    /// （上游为带进度/取消的后台上传队列；本地无传输，Uploading 仅瞬态）。
+    fn add_attachment_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        self.upload_notice = None;
+        for path in paths {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let id = format!("draft-{nanos}-{}", self.attachments.len());
+            self.attachments.push(DraftFile {
+                id: id.clone(),
+                path: path.clone(),
+                name: name.clone(),
+                bytes: meta.len(),
+                state: DraftUpload::Uploading,
+            });
+            let store = Arc::clone(&self.attachment_store);
+            let display = name;
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        std::fs::read(&path)
+                            .map_err(|e| e.to_string())
+                            .and_then(|bytes| {
+                                store
+                                    .save_file_verbatim(&bytes, Some(&display))
+                                    .map_err(|e| e.to_string())
+                            })
+                    })
+                    .await;
+                let _ = this.update(cx, |v, cx| {
+                    if let Some(d) = v.attachments.iter_mut().find(|d| d.id == id) {
+                        d.state = match result {
+                            Ok(reference) => DraftUpload::Ready { reference },
+                            Err(message) => DraftUpload::Failed { message },
+                        };
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// 重试失败的附件存储（web file.retry）
+    fn retry_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(draft) = self.attachments.iter().find(|d| d.id == id) else {
+            return;
+        };
+        let draft = draft.clone();
+        if let Some(d) = self.attachments.iter_mut().find(|d| d.id == id) {
+            d.state = DraftUpload::Uploading;
+        }
+        let store = Arc::clone(&self.attachment_store);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::read(&draft.path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| {
+                            store
+                                .save_file_verbatim(&bytes, Some(&draft.name))
+                                .map_err(|e| e.to_string())
+                        })
+                })
+                .await;
+            let _ = this.update(cx, |v, cx| {
+                if let Some(d) = v.attachments.iter_mut().find(|d| d.id == draft.id) {
+                    d.state = match result {
+                        Ok(reference) => DraftUpload::Ready { reference },
+                        Err(message) => DraftUpload::Failed { message },
+                    };
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 移除附件卡（跳过排队/中止传输——本地即丢弃草稿；已发布对象由
+    /// 后续附件 GC 处理，上游同）
+    fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.attachments.retain(|d| d.id != id);
+        if self.attachments.is_empty() {
+            self.upload_notice = None;
+        }
+        cx.notify();
+    }
+
     fn dispatch_user_text(&mut self, text: &str, cx: &mut Context<Self>) {
         for (path, content) in self.resolve_file_references(text) {
             let name = std::path::Path::new(&path)
@@ -1928,11 +2104,181 @@ impl AppView {
             let _ = self.recorder.append(&current, &cwd, &SessionEvent::SessionTitle { title });
             self.refresh_sidebar(cx);
         }
+        self.send_user_turn(text, cx);
+    }
+
+    /// composer 附件栏：文件卡 240×64（r16、0.5px l2 描边、图标座 28×28
+    /// 蓝渐变文档形、名称 14/22 w500、meta = 扩展名大写 + 大小）、失败态
+    /// 红边整卡重试、移除钮 18×18 圆（web .card/.remove；移除钮常显——
+    /// GPUI 无兄弟 hover 选择器，偏差记录）。
+    fn attachment_rail(&self, this: &Entity<AppView>) -> AnyElement {
+        let mut rail = div()
+            .id("attach-rail")
+            .flex()
+            .items_start()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .pt(px(4.0))
+            .overflow_x_scroll();
+        for draft in &self.attachments {
+            let (name, meta_text, border_color, meta_color): (String, String, gpui::Hsla, gpui::Hsla) =
+                match &draft.state {
+                    DraftUpload::Uploading => (
+                        draft.name.clone(),
+                        "上传中…".to_string(),
+                        theme::t().border_l2.into(),
+                        theme::t().text_3.into(),
+                    ),
+                    DraftUpload::Ready { reference } => (
+                        reference.name.clone(),
+                        format!(
+                            "{} {}",
+                            extension_of(&reference.name),
+                            file_size_text(reference.bytes)
+                        ),
+                        theme::t().border_l2.into(),
+                        theme::t().text_3.into(),
+                    ),
+                    DraftUpload::Failed { .. } => (
+                        draft.name.clone(),
+                        "上传失败，点击重试".to_string(),
+                        theme::t().error.into(),
+                        theme::t().error.into(),
+                    ),
+                };
+            let failed = matches!(draft.state, DraftUpload::Failed { .. });
+            let t_retry = this.clone();
+            let rid_retry = draft.id.clone();
+            let t_remove = this.clone();
+            let rid_remove = draft.id.clone();
+            rail = rail.child(
+                div()
+                    .id(SharedString::from(format!("draft-{}", draft.id)))
+                    .flex_none()
+                    .w(px(240.0))
+                    .h(px(64.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .rounded(px(16.0))
+                    .bg(theme::t().surface)
+                    .border(px(0.5))
+                    .border_color(border_color)
+                    .when(failed, |d| {
+                        d.cursor_pointer().on_click(move |_, _, cx| {
+                            t_retry.update(cx, |v, cx| v.retry_attachment(&rid_retry, cx));
+                        })
+                    })
+                    .child(
+                        // 图标座 28×28（蓝渐变文档形，web DocumentFileIcon）
+                        div()
+                            .flex_none()
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(svg().path("icons/document-file.svg").size(px(24.0))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .line_height(px(22.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::t().text)
+                                    .truncate()
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .line_height(px(15.0))
+                                    .text_color(meta_color)
+                                    .truncate()
+                                    .child(meta_text),
+                            ),
+                    )
+                    .child(
+                        // 移除钮 18×18 圆（web .remove hover 显形；桌面端
+                        // 常显即可命中）
+                        div()
+                            .id(SharedString::from(format!("draft-x-{}", draft.id)))
+                            .flex_none()
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg({
+                                let mut c = gpui::Hsla::from(theme::t().text);
+                                c.a = 0.72;
+                                c
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::t().error))
+                            .tooltip(tip("移除"))
+                            .on_click(move |_, _, cx| {
+                                t_remove.update(cx, |v, cx| v.remove_attachment(&rid_remove, cx));
+                            })
+                            .child(
+                                Icon::new(IconName::Close)
+                                    .size(px(10.0))
+                                    .text_color(theme::t().bg_base),
+                            ),
+                    ),
+            );
+        }
+        rail.into_any_element()
+    }
+
+    /// 组装并发送本轮用户消息：附件块在前、文本在后（上游 sendSession 的
+    /// content 顺序），附件-only 发送合法。v2 落盘：FileBlock 随 user/
+    /// message 进日志，请求组装投影为带只读路径的 handle 文本。
+    fn send_user_turn(&mut self, text: &str, cx: &mut Context<Self>) {
+        // 未就绪附件拦发送（web：file.stillUploading toast + 发送钮 disabled）
+        if self
+            .attachments
+            .iter()
+            .any(|d| !matches!(d.state, DraftUpload::Ready { .. }))
+        {
+            self.upload_notice = Some("文件还在上传，请等待上传完成后发送");
+            cx.notify();
+            return;
+        }
+        self.upload_notice = None;
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        let mut cards: Vec<ChatAttachment> = Vec::new();
+        for d in &self.attachments {
+            if let DraftUpload::Ready { reference } = &d.state {
+                blocks.push(ContentBlock::File { attachment: reference.clone() });
+                cards.push(ChatAttachment::FileCard {
+                    name: reference.name.clone(),
+                    bytes: reference.bytes,
+                });
+            }
+        }
+        let has_text = !text.is_empty();
+        if has_text {
+            blocks.push(ContentBlock::text(text));
+        }
+        if blocks.is_empty() {
+            return;
+        }
+        let msg = Message::user(blocks);
+        let cards_for_chat = cards;
         self.chat.update(cx, |c, cx| {
-            c.push_user_entry(text.to_string());
+            c.push_user_entry_with(has_text.then(|| text.to_string()), cards_for_chat);
             cx.notify();
         });
-        self.agent.followup(text);
+        // followup 语义 = send(user_message, NextTurn)；这里携带混合内容块
+        self.agent.send(msg, InboxTarget::NextTurn);
+        self.attachments.clear();
+        cx.notify();
     }
 
     fn send_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1944,7 +2290,8 @@ impl AppView {
         }
         let text: String =
             self.input.read_with(cx, |s, _| s.value().to_string()).trim().to_string();
-        if text.is_empty() {
+        // 附件-only 发送合法（上游：draft 为空但有附件直接 commitSend）
+        if text.is_empty() && self.attachments.is_empty() {
             return;
         }
         if self.running(cx) {
@@ -1955,7 +2302,10 @@ impl AppView {
             }
         }
         self.dispatch_user_text(&text, cx);
-        self.input.update(cx, |state, cx| state.set_value("", window, cx));
+        // 附件未就绪被拦截时保留草稿与附件卡（上游：失败保留，供重试）
+        if self.upload_notice.is_none() {
+            self.input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
         cx.notify();
     }
 
@@ -3238,6 +3588,27 @@ impl AppView {
             .items_center()
             .gap_4()
             .child(icon_btn("composer-add", IconName::Plus, theme::t().text, "添加附件", |_, _, _| {}))
+            .child(svg_icon_btn("composer-attach", "icons/paperclip.svg", theme::t().text, "添加附件", {
+                let t_attach = this.downgrade();
+                move |_, _, cx| {
+                    let t_attach = t_attach.clone();
+                    // 回形针 → 多选文件对话框（上游隐藏 <input type=file multiple>）
+                    let rx = cx.prompt_for_paths(PathPromptOptions {
+                        files: true,
+                        directories: false,
+                        multiple: true,
+                        prompt: None,
+                    });
+                    cx.spawn(async move |cx| {
+                        if let Ok(Ok(Some(paths))) = rx.await {
+                            let _ = t_attach.update(cx, |v, cx| {
+                                v.add_attachment_paths(paths, cx);
+                            });
+                        }
+                    })
+                    .detach();
+                }
+            }))
             .child(
                 div()
                     .id("composer-mode")
@@ -3363,6 +3734,23 @@ impl AppView {
                     t_card.update(cx, |v, cx| { v.hero_ws_menu = true; cx.notify(); });
                 })
                 .shadow(theme::elevation_soft_inert())
+            })
+            // 附件栏（上游 AttachmentRail + ComposerAttachments：文件卡
+            // 240×64 / 图片 64×64，横排 gap10 溢出横滚）
+            .when(!self.attachments.is_empty(), |d| {
+                d.child(self.attachment_rail(&this))
+            })
+            // 发送拦截提示（web file.stillUploading toast 的行内形态）
+            .when(self.upload_notice.is_some(), |d| {
+                d.child(
+                    div()
+                        .px(px(16.0))
+                        .pb(px(2.0))
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
+                        .text_color(theme::t().error)
+                        .child(self.upload_notice.unwrap_or_default()),
+                )
             })
             .child(if locked {
                 // web：inert 态编辑器不挂载，占位文案即引导。高度必须
@@ -3822,6 +4210,11 @@ fn main() {
             system_prompt: Some("You are DeepSeek Harness (Rust), a helpful coding agent.".into()),
             compaction: dsh_compaction::CompactionConfig::default(),
             workdir: workdir.clone(),
+            // 附件存储根：DSH_HOME/attachments/v1（与 web 同布局；请求
+            // 组装把 FileBlock 投影为带只读路径的 handle 文本）
+            attachments_root: Some(dsh_persist::attachments_root_from_sessions_root(
+                &sessions_dir(),
+            )),
         },
         Arc::clone(&llm),
         tools,

@@ -210,6 +210,32 @@ pub(crate) fn icon_btn(
         .child(Icon::new(icon).size(px(16.0)))
 }
 
+/// icon_btn 的自定义资产版（官方 icons 目录之外的 svg 走自有资产，
+/// 如回形针——上游 IconPaperclipOutline16）。
+pub(crate) fn svg_icon_btn(
+    id: &'static str,
+    icon_path: &'static str,
+    color: impl Into<Hsla>,
+    tooltip: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let color = color.into();
+    div()
+        .id(id)
+        .size(px(28.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .text_color(color)
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::t().hover))
+        .tooltip(tip(tooltip))
+        .on_click(on_click)
+        .child(svg().path(icon_path).size(px(16.0)).text_color(color))
+}
+
 /// 折叠栏 36×36 图标钮（web rail .iconButton）。
 pub(crate) fn rail_icon(
     id: &'static str,

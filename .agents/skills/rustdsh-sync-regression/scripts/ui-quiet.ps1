@@ -14,7 +14,7 @@ Add-Type -MemberDefinition $sig -Name WinQ -Namespace NativeQuiet | Out-Null
 
 $script:target = [IntPtr]::Zero
 $others = New-Object System.Collections.ArrayList
-$cb = [NativeQuiet+EnumProc]{ param($h, $l)
+$cb = [NativeQuiet.WinQ+EnumProc]{ param($h, $l)
   if ([NativeQuiet.WinQ]::IsWindowVisible($h)) {
     $sb = New-Object System.Text.StringBuilder 256
     [NativeQuiet.WinQ]::GetWindowText($h, $sb, 256) | Out-Null

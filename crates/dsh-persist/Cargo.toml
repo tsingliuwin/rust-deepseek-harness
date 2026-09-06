@@ -8,4 +8,5 @@ license.workspace = true
 dsh-session = { path = "../dsh-session" }
 dsh-llm = { path = "../dsh-llm" }
 serde_json.workspace = true
+sha2.workspace = true
 zstd = "0.13"

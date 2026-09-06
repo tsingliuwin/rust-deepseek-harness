@@ -222,7 +222,14 @@ pub fn apply(mode: ThemeMode, cx: &mut gpui::App) {
     c.danger_foreground = rgb_const(0xffffff).into();
     c.success = tk.green.into();
 
-    c.accent = tk.hover;
+    // inline code 底色：上游 0.1.3-alpha.1 从 neutral-bluish 换
+    // neutral-50（亮 rgb(250,250,250)）/ neutral-800（暗 rgb(41,41,41)）；
+    // gpui-component 以 accent 色承接口内代码高亮（vendor TextView node.rs）
+    c.accent = if dark {
+        rgb_const(0x292929).into()
+    } else {
+        rgb_const(0xFAFAFA).into()
+    };
     c.accent_foreground = tk.text.into();
     c.caret = tk.accent.into();
     c.ring = tk.accent.into();

@@ -8,5 +8,6 @@
 pub mod session;
 
 pub use session::{
-    EpochHeader, HeaderReason, RequestContext, Session, SessionEntry, SessionEvent, TurnEndReason,
+    CancelCause, EpochHeader, HeaderReason, RequestContext, Session, SessionEntry, SessionEvent,
+    TurnEndReason,
 };

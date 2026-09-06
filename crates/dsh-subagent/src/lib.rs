@@ -184,6 +184,9 @@ prompt as a complete brief. This call waits for the subagent and returns its fin
             system_prompt: self.system_prompt.clone(),
             compaction: Default::default(),
             workdir: self.workdir.clone(),
+            // 子代理不上传文件（上游同）：附件根不传——委派提示里由主
+            // agent 的 handle 文本携带保存路径，执行环境可见即可读
+            attachments_root: None,
         };
         let child = ReactLoopAgent::new(
             dsh_llm::types::SessionId::new(uuid::Uuid::new_v4().to_string()),

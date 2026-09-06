@@ -17,7 +17,7 @@ WINPWD=$(pwd -W 2>/dev/null || pwd)
 
 # 1) session quiesce check (up to 45s)
 for i in 1 2 3; do
-  recent=$(find "$HOME/.dsh/sessions" -name 'session.jsonl.zstd' -newermt '-15 seconds' 2>/dev/null | head -1)
+  recent=$(find "$HOME/.dsh/sessions" -name 'session*.jsonl.zstd' -newermt '-15 seconds' 2>/dev/null | head -1)
   if [ -z "$recent" ]; then break; fi
   echo "session still streaming ($recent), waiting 15s..."
   sleep 15

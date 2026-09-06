@@ -57,6 +57,7 @@ async fn turn_persists_request_header() {
             system_prompt: Some("You are a concise assistant.".into()),
             compaction: Default::default(),
             workdir: Default::default(),
+            attachments_root: None,
         },
         llm,
         Arc::new(ToolRegistry::new()),

@@ -39,9 +39,104 @@ pub(crate) struct TurnFold {
     subagents: usize,
 }
 
+/// 聊天消息内的单个附件（web .attachmentRow 成员）：
+/// 图片 = 64×64 tile（多附件行强制 compact；单图大图样式仅上游图片画廊），
+/// 文件 = 240×64 卡（r16、0.5px l2 描边、图标 24×28、名称 14/22 w500、
+/// meta = 扩展名 + 大小 12/15 tertiary）。
+fn render_chat_attachment(
+    attach: &crate::ChatAttachment,
+    compact: bool,
+) -> gpui::AnyElement {
+    let _ = compact;
+    match attach {
+        crate::ChatAttachment::ImageTile { path } => {
+            let mut tile = div()
+                .flex_none()
+                .size(px(64.0))
+                .overflow_hidden()
+                .rounded(px(16.0))
+                .border(px(0.5))
+                .border_color(theme::t().border_l2)
+                .bg(theme::t().hover);
+            if let Some(p) = path {
+                tile = tile.child(
+                    gpui::img(p.clone())
+                        .size(px(64.0))
+                        .object_fit(gpui::ObjectFit::Cover),
+                );
+            }
+            tile.into_any_element()
+        }
+        crate::ChatAttachment::FileCard { name, bytes } => div()
+            .flex_none()
+            .w(px(240.0))
+            .min_h(px(64.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .rounded(px(16.0))
+            .border(px(0.5))
+            .border_color(theme::t().border_l2)
+            .bg(theme::t().surface)
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(24.0))
+                    .h(px(28.0))
+                    .child(svg().path("icons/document-file.svg").size_full()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .line_height(px(22.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::t().text)
+                            .truncate()
+                            .child(name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .line_height(px(15.0))
+                            .text_color(theme::t().text_3)
+                            .truncate()
+                            .child(format!(
+                                "{} {}",
+                                crate::extension_of(name),
+                                crate::file_size_text(*bytes)
+                            )),
+                    ),
+            )
+            .into_any_element(),
+    }
+}
+
+/// 图片附件对象路径：`attachments/v1/objects/<hex[0..2]>/<hex>`
+/// （web attachment-local 布局；attachments_root 不可用或 id 非法 → None）
+fn attachment_image_object_path(
+    root: Option<&std::path::Path>,
+    attachment_id: &str,
+) -> Option<std::path::PathBuf> {
+    let root = root?;
+    let hex = attachment_id.strip_prefix("sha256:")?;
+    if hex.len() < 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(root.join("objects").join(&hex[..2]).join(hex))
+}
+
 pub(crate) struct ChatView {
     /// 只读：会话日志回读（工具结果文本）
     agent: Arc<dsh_agent_loop::ReactLoopAgent>,
+    /// 附件存储根（`DSH_HOME/attachments/v1`；图片 tile 字节反查）
+    attachments_root: Option<std::path::PathBuf>,
     /// 回写宿主：工具行 → 详情面板；内容列宽读取
     app: Entity<AppView>,
     entries: Vec<ChatEntry>,
@@ -112,11 +207,13 @@ impl ChatView {
         app: Entity<AppView>,
         route_label: String,
         transcript_view: TranscriptView,
+        attachments_root: Option<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = Self {
             agent,
             app,
+            attachments_root,
             entries: Vec::new(),
             running: false,
             turn_started_at: None,
@@ -417,7 +514,33 @@ impl ChatView {
                             _ => None,
                         })
                         .collect();
-                    if text.is_empty() {
+                    // v2 混合附件：文件卡 / 图片 tile（图片字节按
+                    // sha256 反查附件存储 objects/<2hex>/<hex>）
+                    let mut attachments: Vec<MsgBlock> = Vec::new();
+                    for b in &m.content {
+                        match b {
+                            ContentBlock::File { attachment } => {
+                                attachments.push(MsgBlock::Attachment(
+                                    crate::ChatAttachment::FileCard {
+                                        name: attachment.name.clone(),
+                                        bytes: attachment.bytes,
+                                    },
+                                ));
+                            }
+                            ContentBlock::Image { attachment } => {
+                                attachments.push(MsgBlock::Attachment(
+                                    crate::ChatAttachment::ImageTile {
+                                        path: attachment_image_object_path(
+                                            self.attachments_root.as_deref(),
+                                            &attachment.attachment_id,
+                                        ),
+                                    },
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if text.is_empty() && attachments.is_empty() {
                         continue;
                     }
                     // 生产者注入的上下文 → ContextInjectionRow（非用户气泡）
@@ -436,9 +559,13 @@ impl ChatView {
                         });
                         continue;
                     }
+                    let mut blocks = attachments;
+                    if !text.is_empty() {
+                        blocks.push(MsgBlock::Text(text));
+                    }
                     self.entries.push(ChatEntry {
                         role: Role::User,
-                        blocks: vec![MsgBlock::Text(text)],
+                        blocks,
                         done: true,
                         elapsed: None, usage: None, ended_at_ms: None,
                         turn: cur_turn,
@@ -509,10 +636,21 @@ open: false,
     }
 
     /// 用户消息入列（标题逻辑在 AppView：sessions/recorder 是宿主职责）。
-    pub(crate) fn push_user_entry(&mut self, text: String) {
+    /// 用户消息条目（混合附件版）：`text = None` 为附件-only 发送；
+    /// 附件块排在文本前（渲染时呈气泡右上区域）。
+    pub(crate) fn push_user_entry_with(
+        &mut self,
+        text: Option<String>,
+        attachments: Vec<crate::ChatAttachment>,
+    ) {
+        let mut blocks: Vec<MsgBlock> =
+            attachments.into_iter().map(MsgBlock::Attachment).collect();
+        if let Some(t) = text {
+            blocks.push(MsgBlock::Text(t));
+        }
         self.entries.push(ChatEntry {
             role: Role::User,
-            blocks: vec![MsgBlock::Text(text)],
+            blocks,
             done: true,
             elapsed: None, usage: None, ended_at_ms: None,
             turn: self.ui_turn,
@@ -769,6 +907,7 @@ open: false,
 
     fn block_element(&self, block: &MsgBlock, ei: usize, bi: usize, this: &Entity<Self>, content_w: f32) -> AnyElement {
         match block {
+            MsgBlock::Attachment(_) => div().into_any_element(),
             MsgBlock::Text(t) => {
                 // 流式尾喂活文本 + 50ms 稳态解析窗（vendor [dsh] 补丁：节流
                 // 不因连续 delta 重置，约 20 次/秒渐进发布，对齐 web 每
@@ -1409,10 +1548,10 @@ open: false,
             Role::User => {
                 let text = entry
                     .blocks
-                    .first()
-                    .map(|b| match b {
-                        MsgBlock::Text(t) => t.clone(),
-                        _ => String::new(),
+                    .iter()
+                    .find_map(|b| match b {
+                        MsgBlock::Text(t) => Some(t.clone()),
+                        _ => None,
                     })
                     .unwrap_or_default();
                 let t = this.clone();
@@ -1426,14 +1565,39 @@ open: false,
                     .iter()
                     .rposition(|e| e.role == Role::User)
                     .is_some_and(|ix| ix == ei);
-                div()
+                let mut user_col = div()
                     .w_full()
                     .flex()
                     .flex_col()
                     .items_end()
                     .gap(px(6.0))
-                    .group(group)
-                    .child(
+                    .group(group);
+                // 附件区：气泡外、气泡上方，右对齐可换行（web
+                // .attachmentRow：flex-wrap、justify-end、gap8）；单图
+                // 大图样式仅上游图片画廊有——混合行一律 64px tile
+                let attach_count = entry
+                    .blocks
+                    .iter()
+                    .filter(|b| matches!(b, MsgBlock::Attachment(_)))
+                    .count();
+                if attach_count > 0 {
+                    let mut row = div()
+                        .flex()
+                        .flex_wrap()
+                        .justify_end()
+                        .max_w_full()
+                        .gap(px(8.0));
+                    for b in &entry.blocks {
+                        if let MsgBlock::Attachment(attach) = b {
+                            row = row.child(render_chat_attachment(
+                                attach,
+                                attach_count > 1,
+                            ));
+                        }
+                    }
+                    user_col = user_col.child(row);
+                }
+                user_col.child(
                         div()
                             .max_w(px(layout::user_bubble_max(content_w)))
                             .rounded(px(22.0))

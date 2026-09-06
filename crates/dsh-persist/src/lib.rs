@@ -1,13 +1,24 @@
 //! dsh-persist — 与 web 版 dsh 完全共享的会话持久化。
 //!
-//! 磁盘布局（web `session-persistence-jsonl` 同款）：
-//! `{root}/--{projectKey(cwd)}--/{session-id}/session.jsonl.zstd`
-//! - 首行 header：`{"type":"session","version":0,"id",…,"cwd","delegationDepth"}`
+//! 磁盘布局（web `session-persistence-jsonl` 同款，0.1.3-alpha.1 起 v2）：
+//! `{root}/--{projectKey(cwd)}--/{session-id}/session.v2.jsonl.zstd`
+//! - 首行 header：`{"type":"session","version":2,"id",…,"isSeeded","cwd","delegationDepth"}`
 //! - 事件行信封：`{"type":"<event>","seq":N,"time":ms,"data":{…}}`
+//!   （surfaceOp/sourceEventSeqs 是信封层成员；assistant 流内嵌在结算行
+//!   `assistant/message.stream` / `assistant/attempt`，不再有 chunk 事件）
 //! 读取时转换为本仓库 `SessionEvent` 词汇表；写入时同样转回 web 信封，
-//! 两端互读互通。旧的散文件 `{root}/{id}.jsonl` 仍可读（迁移兼容）。
+//! 两端互读互通。旧代文件（`session.jsonl.zstd` v0）保持可读；写打开旧代
+//! 先整档迁移到 v2（`v2::migrate_to_v2`），源文件永不重写。旧的散文件
+//! `{root}/{id}.jsonl` 仍可读（迁移兼容）。
 
-use dsh_llm::{CallId, ContentBlock, Message, MessageId, MessageSource, SessionId};
+mod attachments;
+mod v2;
+
+pub use attachments::{attachments_root_from_sessions_root, file_leaf_name, AttachmentStore};
+
+use dsh_llm::{
+    CallId, ContentBlock, FileAttachmentRef, Message, MessageId, MessageSource, SessionId,
+};
 use dsh_session::{EpochHeader, HeaderReason, Session, SessionEvent};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
@@ -48,16 +59,14 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-/// web `projectionCacheDomainSpec`（0.1.2-alpha.5）的当前域版本：per-record
-/// 布局，`compatibleVersions: [3, 4]`（v3/v4 行仅缺可选 lineage 字段）。
-/// 写侧 stamp 这个值——master 已并入 v6（兼容 3/4/5，行形与 v5 全同），
-/// v6 读者经 compatibleVersions 照样接受本 stamp。
-pub const PROJCACHE_DOMAIN_VERSION: u64 = 5;
+/// web `projectionCacheDomainSpec`（0.1.3-alpha.1）的当前域版本：per-record
+/// 布局，`compatibleVersions: [3, 4, 5, 6]`，checkpointIdentity 新增可选
+/// `formatVersion`（= 会话格式版本，rustdsh 恒 2）。行形与 v5/v6 全同。
+pub const PROJCACHE_DOMAIN_VERSION: u64 = 7;
 
-/// 读侧接受的版本戳并集：released v5 兼容 [3,4] ∪ master v6 兼容
-/// [3,4,5]。戳在集外（或残缺）的文档按 web `parseRecord` 的 foreign
-/// 契约视为 absent，绝不解释。
-pub const PROJCACHE_ACCEPTED_VERSIONS: &[u64] = &[3, 4, 5, 6];
+/// 读侧接受的版本戳并集：released v7 兼容 [3,4,5,6]。戳在集外（或残缺）
+/// 的文档按 web `parseRecord` 的 foreign 契约视为 absent，绝不解释。
+pub const PROJCACHE_ACCEPTED_VERSIONS: &[u64] = &[3, 4, 5, 6, 7];
 
 /// 读取 web 会话投影缓存的标题表（id → title），双布局：
 /// 1) per-record 树 `<dir>/session_projcache/sessions/*.json`（web
@@ -153,12 +162,15 @@ pub struct SessionEntry {
 
 pub struct SessionRecorder {
     root: PathBuf,
-    /// 会话 id → 已解析的会话文件（规范桶锚定；避免 cwd 口径漂移时
+    /// 会话 id → 已解析的会话文件（规范桶锚定 + 最新代；避免 cwd 口径漂移时
     /// 在错误桶里重建/写入副本）。
     resolved: std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
-    /// 会话 id → 已写到的最大 seq（增量帧追加的 O(1) 序号源；首触时
-    /// 由整档解码初始化，单写者约束下可靠）。
+    /// 会话 id → 下一个可写 seq（增量帧追加的 O(1) 序号源；首触时由整档
+    /// 解码初始化，单写者约束下可靠）。
     seqs: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// 会话 id → 进行中 attempt 的 (time, turn, step, chunk) 缓冲（v2：
+    /// chunk 不落行，结算时压缩为 AssistantStreamRecord 嵌入 settlement 行）。
+    streams: std::sync::Mutex<std::collections::HashMap<String, Vec<(u64, u64, u64, dsh_llm::StreamChunk)>>>,
 }
 
 impl SessionRecorder {
@@ -167,6 +179,7 @@ impl SessionRecorder {
             root,
             resolved: std::sync::Mutex::new(Default::default()),
             seqs: std::sync::Mutex::new(Default::default()),
+            streams: std::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -182,18 +195,27 @@ impl SessionRecorder {
         f.write_all(&frame)
     }
 
-    /// 下一个 seq：缓存优先；首触或缓存缺失时整档解码初始化。
+    /// 下一个可写 seq：缓存优先；首触或缓存缺失时整档解码初始化。
     fn next_seq(&self, id: &SessionId, file: &Path) -> u64 {
         let mut cache = self.seqs.lock().unwrap();
-        if let Some(seq) = cache.get(id.as_str()) {
-            return *seq + 1;
+        if let Some(next) = cache.get(id.as_str()) {
+            return *next;
         }
         let (_, last) = self.read_lines(file);
-        cache.insert(id.as_str().to_string(), last);
+        cache.insert(id.as_str().to_string(), last + 1);
         last + 1
     }
 
-    /// 规范桶解析：hint 命中优先，其次全桶扫描取最近修改。
+    /// 记录 seq 已消耗到 `seq`（下一个 = seq+1）。
+    fn mark_seq(&self, id: &SessionId, seq: u64) {
+        self.seqs
+            .lock()
+            .unwrap()
+            .insert(id.as_str().to_string(), seq + 1);
+    }
+
+    /// 规范桶解析：hint 命中优先，其次全桶扫描取最近修改；桶内多代文件
+    /// 取最高代（web generation 语义，`session.lock`/临时文件天然忽略）。
     /// 未找到返回 None（调用方决定是否在 hint 桶新建）。
     fn resolve_file(&self, id: &SessionId, hint: Option<&str>) -> Option<PathBuf> {
         let cache = self.resolved.lock().unwrap();
@@ -207,10 +229,10 @@ impl SessionRecorder {
         let mut hint_hit: Option<PathBuf> = None;
         if let Ok(projs) = fs::read_dir(&self.root) {
             for proj in projs.flatten() {
-                let file = proj.path().join(id.as_str()).join("session.jsonl.zstd");
-                if !file.exists() {
+                let dir = proj.path().join(id.as_str());
+                let Some(file) = v2::latest_generation(&dir) else {
                     continue;
-                }
+                };
                 if let Some(h) = hint
                     && proj.file_name().to_string_lossy() == project_key(h)
                 {
@@ -238,33 +260,36 @@ impl SessionRecorder {
         self.root.join(project_key(cwd))
     }
 
+    /// 当前写目标：v2 代文件名。
     fn session_file(&self, id: &SessionId, cwd: &str) -> PathBuf {
         self.project_dir(cwd)
             .join(id.as_str())
-            .join("session.jsonl.zstd")
+            .join(format!("session.v{}.jsonl.zstd", v2::SESSION_FORMAT_VERSION))
     }
 
     fn legacy_file(&self, id: &SessionId) -> PathBuf {
         self.root.join(format!("{}.jsonl", id.as_str()))
     }
 
-    /// 新建会话：建目录并写 header（web 读取的最小要求）。
+    /// 新建会话：建目录并写 header（web 读取的最小要求，v2 形）。
     pub fn create(&self, id: &SessionId, cwd: &str, agent_preset: &str) -> io::Result<()> {
         let file = self.session_file(id, cwd);
-        // 已存在的日志绝不允许被新 header 覆盖（fail-closed：数据 > 自愈）
-        if file.exists() {
+        // 已存在的日志（任何代）绝不允许被新 header 覆盖（fail-closed：数据 > 自愈）
+        let existing = v2::latest_generation(file.parent().unwrap_or(&file));
+        if existing.is_some() {
             self.resolved
                 .lock()
                 .unwrap()
-                .insert(id.as_str().to_string(), file.clone());
+                .insert(id.as_str().to_string(), existing.unwrap());
             return Ok(());
         }
         fs::create_dir_all(file.parent().unwrap())?;
         let header = serde_json::json!({
             "type": "session",
-            "version": 0,
+            "version": v2::SESSION_FORMAT_VERSION,
             "id": id.as_str(),
             "createdAt": now_ms(),
+            "isSeeded": false,
             "cwd": cwd,
             "delegationDepth": 0,
             "agentPreset": agent_preset,
@@ -277,6 +302,7 @@ impl SessionRecorder {
             .lock()
             .unwrap()
             .insert(id.as_str().to_string(), file.clone());
+        // v2 语义：首条事件 seq = 0（与内存 0 基位置对齐；上游 stage() 同）
         self.seqs.lock().unwrap().insert(id.as_str().to_string(), 0);
         // projcache 身份行：web 侧栏冷启动先读投影（identity 足够定位）
         self.touch_projcache(id, cwd, 0, None);
@@ -366,6 +392,11 @@ impl SessionRecorder {
                     if let Some(obj) = identity.as_object_mut() {
                         // cwd 以最近一次写入为准（会话可跨工作区移动）
                         obj.insert("cwd".into(), serde_json::json!(cwd));
+                        // v2 语义：checkpointIdentity.formatVersion（web 读
+                        // 侧要求与 header.version 精确匹配才作 hydration 捷
+                        // 径；rustdsh 写面恒为 v2）
+                        obj.entry("formatVersion")
+                            .or_insert_with(|| serde_json::json!(v2::SESSION_FORMAT_VERSION));
                     }
                     if let Some(title) = title {
                         let rows = obj
@@ -423,6 +454,8 @@ impl SessionRecorder {
         if let Some(obj) = identity.as_object_mut() {
             // cwd 以最近一次写入为准（会话可跨工作区移动）
             obj.insert("cwd".into(), serde_json::json!(cwd));
+            obj.entry("formatVersion")
+                .or_insert_with(|| serde_json::json!(v2::SESSION_FORMAT_VERSION));
         }
         if let Some(title) = title {
             let rows = row
@@ -441,17 +474,35 @@ impl SessionRecorder {
         }
     }
 
-    /// 追加一个事件（web 信封行；读-改-写整文件压缩）。
+    /// 追加一个事件（v2 信封行）。
+    ///
+    /// - 写打开旧代（v0/v1）先整档迁移到 `session.v2.jsonl.zstd`（上游
+    ///   `ensureCurrentLog` 语义）；迁移 fail-closed 时整个追加失败。
+    /// - `assistant/chunk` 不再落行：缓冲进进行中的 attempt，结算
+    ///   （`assistant/message`）时压缩嵌入 `data.stream`。
+    /// - 重试/轮末等边界事件触发缓冲冲刷：上一次尝试无表面消息 →
+    ///   落 `assistant/attempt` 行（上游 agent-loop 的 settle 语义）。
     pub fn append(&self, id: &SessionId, cwd: &str, event: &SessionEvent) -> io::Result<()> {
         // 规范桶锚定：写入永远落在会话自身的日志上（hint 只在 id 尚无
         // 任何文件时作为新建位置），杜绝 cwd 口径漂移产生跨桶副本
-        let file = match self.resolve_file(id, Some(cwd)) {
+        let mut file = match self.resolve_file(id, Some(cwd)) {
             Some(f) => f,
             None => {
                 self.create(id, cwd, "standard")?;
                 self.session_file(id, cwd)
             }
         };
+        // 写打开旧代 → 迁移（源文件保持原样；此后追加全在 v2）
+        if v2::header_version(&v2::read_header(&file).unwrap_or_default())
+            < v2::SESSION_FORMAT_VERSION
+        {
+            file = v2::migrate_to_v2(&file, id)?;
+            self.resolved
+                .lock()
+                .unwrap()
+                .insert(id.as_str().to_string(), file.clone());
+            self.seqs.lock().unwrap().remove(id.as_str());
+        }
         // 已存在但解不出内容（非空文件）：拒绝追加（可能是不认识的编码/半写状态）
         if !self.resolved.lock().unwrap().contains_key(id.as_str())
             && file.exists()
@@ -465,23 +516,92 @@ impl SessionRecorder {
                     .insert(id.as_str().to_string(), file.to_path_buf());
             }
         }
+        // chunk：缓冲（不落行、不耗 seq）——v2 词汇中 chunk 不是事件
+        if let SessionEvent::AssistantChunk { turn, step, chunk } = event {
+            self.streams
+                .lock()
+                .unwrap()
+                .entry(id.as_str().to_string())
+                .or_default()
+                .push((now_ms(), *turn, *step, chunk.clone()));
+            return Ok(());
+        }
+        // 边界事件：先冲刷进行中的 attempt（缓冲非空 = 上一次尝试已失败/
+        // 中断/结束而无表面消息）
+        let flush_attempt = matches!(
+            event,
+            SessionEvent::LlmRetry { .. }
+                | SessionEvent::LlmRetryStarted { .. }
+                | SessionEvent::TurnEnd { .. }
+                | SessionEvent::StepStart { .. }
+        );
+        if flush_attempt
+            && let Some(row) = self.take_attempt_row(id)
+        {
+            let seq = self.next_seq(id, &file);
+            self.append_frame(&file, &format!("{}\n", row))?;
+            self.mark_seq(id, seq);
+        }
         let seq = self.next_seq(id, &file);
         if let SessionEvent::SessionTitle { title } = event {
             self.touch_projcache(id, cwd, seq, Some(title));
         }
-        let row = event_to_web_line(event, seq, now_ms());
-        match row {
-            Some(row) => {
-                self.append_frame(&file, &format!("{}\n", row))?;
-                self.seqs
-                    .lock()
-                    .unwrap()
-                    .insert(id.as_str().to_string(), seq);
-                Ok(())
-            }
+        let mut row = match event_to_web_line(event, seq, now_ms()) {
+            Some(row) => row,
             // 不落盘的辅助事件：也不消耗 seq（与整档重写语义一致）
-            None => Ok(()),
+            None => return Ok(()),
+        };
+        // settlement 行内嵌本次 attempt 的流（上游 v2：message.stream 必填）
+        if let SessionEvent::AssistantMessage { .. } = event {
+            let stream = self.take_stream_records(id);
+            row["data"]["stream"] =
+                serde_json::to_value(stream).unwrap_or(serde_json::json!([]));
         }
+        self.append_frame(&file, &format!("{}\n", row))?;
+        self.mark_seq(id, seq);
+        Ok(())
+    }
+
+    /// 冲刷进行中的 attempt 缓冲为 `assistant/attempt` 行（缓冲空 → None）。
+    fn take_attempt_row(&self, id: &SessionId) -> Option<String> {
+        let mut streams = self.streams.lock().unwrap();
+        let buf = streams.get_mut(id.as_str())?;
+        if buf.is_empty() {
+            return None;
+        }
+        let drained = std::mem::take(buf);
+        let (turn, step) = (drained[0].1, drained[0].2);
+        let mut acc = dsh_llm::AssistantStreamAccumulator::new();
+        let mut last_time = 0u64;
+        for (time, _, _, chunk) in drained {
+            acc.push(time, chunk);
+            last_time = time;
+        }
+        let row = serde_json::json!({
+            "type": "assistant/attempt",
+            "seq": 0,
+            "time": last_time,
+            "data": {
+                "turn": turn,
+                "step": step,
+                "stream": serde_json::to_value(acc.snapshot()).unwrap_or(serde_json::json!([])),
+            },
+        });
+        Some(format!("{row}"))
+    }
+
+    /// 取走进行中的流缓冲并压缩为 AssistantStreamRecord 列表。
+    fn take_stream_records(&self, id: &SessionId) -> Vec<dsh_llm::AssistantStreamRecord> {
+        let mut streams = self.streams.lock().unwrap();
+        let Some(buf) = streams.get_mut(id.as_str()) else {
+            return Vec::new();
+        };
+        let drained = std::mem::take(buf);
+        let mut acc = dsh_llm::AssistantStreamAccumulator::new();
+        for (time, _, _, chunk) in drained {
+            acc.push(time, chunk);
+        }
+        acc.snapshot()
     }
 
     /// 会话标题（`session/title` 事件的最新值）。
@@ -505,10 +625,11 @@ impl SessionRecorder {
         id: &SessionId,
         cwd_hint: Option<&str>,
     ) -> io::Result<(Session, Option<String>)> {
-        // 1) 按 hint
+        // 1) 按 hint（桶内多代取最高）
         if let Some(cwd) = cwd_hint {
-            let file = self.session_file(id, cwd);
-            if file.exists() {
+            let dir = self.project_dir(cwd).join(id.as_str());
+            if let Some(file) = v2::latest_generation(&dir) {
+                v2::check_readable_version(&file)?;
                 let events = self.read_events(&file)?;
                 return Ok((
                     Session::from_events(id.clone(), events),
@@ -518,6 +639,7 @@ impl SessionRecorder {
         }
         // 2) 扫描所有 project 目录找该 id（多桶副本取最近修改）
         if let Some(file) = self.resolve_file(id, None) {
+            v2::check_readable_version(&file)?;
             let events = self.read_events(&file)?;
             let cwd = read_header_cwd(&file);
             return Ok((Session::from_events(id.clone(), events), cwd));
@@ -529,12 +651,13 @@ impl SessionRecorder {
                     continue;
                 }
                 let dir = proj.path().join(id.as_str());
-                let file = dir.join("session.jsonl.zstd");
-                if file.exists() {
-                    let cwd = read_header_cwd(&file);
-                    let events = self.read_events(&file)?;
-                    return Ok((Session::from_events(id.clone(), events), cwd));
-                }
+                let Some(file) = v2::latest_generation(&dir) else {
+                    continue;
+                };
+                v2::check_readable_version(&file)?;
+                let cwd = read_header_cwd(&file);
+                let events = self.read_events(&file)?;
+                return Ok((Session::from_events(id.clone(), events), cwd));
             }
         }
         // 3) legacy 散文件
@@ -587,17 +710,16 @@ impl SessionRecorder {
                     if !sess.file_type()?.is_dir() {
                         continue;
                     }
-                    let name = sess.file_name().to_string_lossy().into_owned();
-                    if !name.starts_with("session-") {
-                        continue;
-                    }
-                    let file = sess.path().join("session.jsonl.zstd");
-                    if !file.exists() {
-                        continue;
-                    }
-                    let modified = fs::metadata(&file)
-                        .and_then(|m| m.modified())
-                        .unwrap_or(UNIX_EPOCH);
+                let name = sess.file_name().to_string_lossy().into_owned();
+                if !name.starts_with("session-") {
+                    continue;
+                }
+                let Some(file) = v2::latest_generation(&sess.path()) else {
+                    continue;
+                };
+                let modified = fs::metadata(&file)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(UNIX_EPOCH);
                     let cwd = read_header_cwd(&file);
                     out.push(SessionEntry {
                         id: SessionId::new(name),
@@ -618,6 +740,7 @@ impl SessionRecorder {
     pub fn delete(&self, id: &SessionId, cwd: Option<&str>) -> io::Result<()> {
         self.resolved.lock().unwrap().remove(id.as_str());
         self.seqs.lock().unwrap().remove(id.as_str());
+        self.streams.lock().unwrap().remove(id.as_str());
         if let Some(cwd) = cwd {
             let dir = self.project_dir(cwd).join(id.as_str());
             if dir.exists() {
@@ -755,6 +878,35 @@ fn blocks_from_web(arr: Option<&serde_json::Value>) -> Vec<ContentBlock> {
                     is_error,
                 });
             }
+            "image" => {
+                if let Some(a) = b.get("attachment") {
+                    out.push(ContentBlock::Image {
+                        attachment: serde_json::from_value(a.clone()).unwrap_or_else(|_| {
+                            dsh_llm::ImageAttachmentRef {
+                                attachment_id: String::new(),
+                                name: None,
+                                media_type: String::new(),
+                                bytes: 0,
+                                width: 0,
+                                height: 0,
+                                original_dimensions: None,
+                            }
+                        }),
+                    });
+                }
+                // 无 attachment 成员的残缺 image 块（更旧写形）：跳过
+            }
+            "file" => {
+                if let Some(a) = b.get("attachment") {
+                    out.push(ContentBlock::File {
+                        attachment: serde_json::from_value(a.clone()).unwrap_or(FileAttachmentRef {
+                            attachment_id: String::new(),
+                            name: String::new(),
+                            bytes: 0,
+                        }),
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -783,7 +935,12 @@ fn blocks_to_web(blocks: &[ContentBlock]) -> serde_json::Value {
                 "content":blocks_to_web(content),
                 "isError":is_error.unwrap_or(false)
             }),
-            ContentBlock::Image { .. } => serde_json::json!({"type":"image"}),
+            ContentBlock::Image { attachment } => serde_json::json!({
+                "type": "image", "attachment": attachment
+            }),
+            ContentBlock::File { attachment } => serde_json::json!({
+                "type": "file", "attachment": attachment
+            }),
         })
         .collect();
     serde_json::Value::Array(arr)
@@ -903,21 +1060,51 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
         }
         "tool/result" => {
             let d = data?;
+            // v2 形：{turn, step, message:{content, source:{kind:'tool', callId}}}
+            if let Some(m) = d.get("message").filter(|m| m.is_object()) {
+                let content = blocks_from_web(m.get("content"));
+                let call = m
+                    .get("source")
+                    .and_then(|s| s.get("callId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let msg = Message {
+                    id: m
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| MessageId(s.to_string()))
+                        .unwrap_or_default(),
+                    role: dsh_llm::Role::User,
+                    content,
+                    source: MessageSource::Tool {
+                        call_id: CallId(call.to_string()),
+                    },
+                };
+                return Some(SessionEvent::ToolResult {
+                    turn: num(data, "turn"),
+                    step: num(data, "step"),
+                    message: msg,
+                });
+            }
+            // legacy 平铺形（rustdsh 旧写形）：{toolCallId, content, isError}
             let call = d
                 .get("toolCallId")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             let content = blocks_from_web(d.get("content"));
             let is_error = d.get("isError").and_then(|v| v.as_bool());
-            let msg = Message::assistant(
-                vec![ContentBlock::ToolResult {
+            let msg = Message {
+                id: MessageId::default(),
+                role: dsh_llm::Role::User,
+                content: vec![ContentBlock::ToolResult {
                     tool_call_id: CallId(call.to_string()),
                     content,
                     is_error,
                 }],
-                "web",
-                "web",
-            );
+                source: MessageSource::Tool {
+                    call_id: CallId(call.to_string()),
+                },
+            };
             Some(SessionEvent::ToolResult {
                 turn: 0,
                 step: 0,
@@ -938,14 +1125,61 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
                 .unwrap_or_default()
                 .to_string(),
         }),
-        "compaction/summary" => Some(SessionEvent::Compaction {
-            before_seq: num(data, "beforeSeq"),
-            summary: data?
-                .get("summary")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-        }),
+        "compaction/summary" => {
+            let d = data?;
+            // v2 富形：{compactionId, summary, shadowedRange, shadowedSeqs,
+            // shadowedTokenCount, provider, model}
+            if let Some(range) = d.get("shadowedRange").filter(|r| r.is_object()) {
+                return Some(SessionEvent::Compaction {
+                    before_seq: range.get("end").and_then(|v| v.as_u64()).unwrap_or(0),
+                    summary: d
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    compaction_id: d
+                        .get("compactionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    shadowed_start: range.get("start").and_then(|v| v.as_u64()).unwrap_or(0),
+                    shadowed_seqs: d
+                        .get("shadowedSeqs")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().filter_map(|s| s.as_u64()).collect())
+                        .unwrap_or_default(),
+                    shadowed_token_count: d
+                        .get("shadowedTokenCount")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    provider: d
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    model: d
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+            // legacy 形（rustdsh 旧写形）：{beforeSeq, summary}
+            Some(SessionEvent::Compaction {
+                before_seq: num(data, "beforeSeq"),
+                summary: data?
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                compaction_id: String::new(),
+                shadowed_start: 0,
+                shadowed_seqs: Vec::new(),
+                shadowed_token_count: 0,
+                provider: String::new(),
+                model: String::new(),
+            })
+        }
         "llm/retry" => {
             let d = data?;
             let failure: dsh_llm::LlmFailure = d
@@ -1016,8 +1250,10 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
     }
 }
 
-/// 本构建理解的事件词汇全集（上游 `KNOWN_SESSION_EVENT_TYPES`，0.1.2-alpha.2
-/// 抄定；已逐项核对至 0.1.2-alpha.5 无增补）。
+/// 本构建理解的事件词汇全集（上游 `KNOWN_SESSION_EVENT_TYPES`，0.1.3-alpha.1
+/// 抄定：与 alpha.5 的 51 项相比唯一变化是 `assistant/chunk` →
+/// `assistant/attempt` 替换；rustdsh 读侧两类都保留——`assistant/chunk`
+/// 是 v0 旧代日志的合法行，`assistant/attempt` 是 v2 新行）。
 ///
 /// 持久化读取路径按 [`SessionEvent.ignorable`] 契约分类未知类型：不在集合内
 /// 且未标 `ignorable` 的事件——多半是更新版本 harness 写的——拒绝解释整份
@@ -1029,6 +1265,7 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "approval/asked",
     "approval/decided",
     "approval/policy",
+    "assistant/attempt",
     "assistant/chunk",
     "assistant/message",
     "command/done",
@@ -1110,9 +1347,12 @@ fn num(data: Option<&serde_json::Value>, key: &str) -> u64 {
         .unwrap_or_default()
 }
 
-/// 我们的事件 → web 信封行（None = 不落盘的辅助事件）。
+/// 我们的事件 → web v2 信封行（None = 不落盘的辅助事件；chunk 由
+/// SessionRecorder 缓冲，结算行内嵌 stream，不在此构造）。
 pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde_json::Value> {
-    let row = |ty: &str, data: serde_json::Value| serde_json::json!({"type": ty, "seq": seq, "time": time, "data": data});
+    let row = |ty: &str, data: serde_json::Value| {
+        serde_json::json!({"type": ty, "seq": seq, "time": time, "data": data})
+    };
     match ev {
         SessionEvent::TurnStart { turn } => {
             Some(row("turn/start", serde_json::json!({"turn": turn})))
@@ -1180,8 +1420,10 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
                     }
                     serde_json::Value::Object(o)
                 }
-                _ => serde_json::json!({"kind": "user"}),
+                other => serde_json::to_value(other).unwrap_or(serde_json::json!({"kind": "user"})),
             };
+            // v2 处置表（RELEASED_V2：user/message data 必含 role/id/content/
+            // source；surfaceOp 是信封层成员，append 缺省不写）
             Some(row(
                 "user/message",
                 serde_json::json!({
@@ -1189,37 +1431,43 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
                     "source": source,
                     "role": "user",
                     "id": m.id.0,
-                    "surfaceOp": "append",
                 }),
             ))
         }
+        // v2 settlement：message 全形（id/role/content/source）+ usage/
+        // interrupted；stream 由 SessionRecorder 在 append 时注入（缓冲
+        // 压缩），此处落空数组占位保持函数纯净
         SessionEvent::AssistantMessage {
             turn,
             step,
             message,
-            ..
-        } => Some(row(
-            "assistant/message",
-            serde_json::json!({
-                "turn": turn, "step": step,
-                "message": {"role": "assistant", "content": blocks_to_web(&message.content)},
-            }),
-        )),
-        SessionEvent::ToolResult { message, .. } => {
-            let block = message.content.iter().find_map(|b| match b {
-                ContentBlock::ToolResult {
-                    tool_call_id,
-                    content,
-                    is_error,
-                } => Some((tool_call_id, content, is_error)),
-                _ => None,
-            })?;
+            interrupted,
+            usage,
+        } => {
+            let mut data = serde_json::json!({
+                "turn": turn,
+                "step": step,
+                "message": serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
+                "stream": [],
+            });
+            if let Some(u) = usage {
+                data["usage"] = serde_json::to_value(u).unwrap_or(serde_json::Value::Null);
+            }
+            if *interrupted {
+                data["interrupted"] = serde_json::json!(true);
+            }
+            Some(row("assistant/message", data))
+        }
+        // v2：chunk 不再是事件（缓冲后内嵌结算行）
+        SessionEvent::AssistantChunk { .. } => None,
+        SessionEvent::ToolResult { turn, step, message } => {
+            // v2 形：{turn, step, message:{id, role:'user', content, source}}
             Some(row(
                 "tool/result",
                 serde_json::json!({
-                    "toolCallId": block.0 .0,
-                    "content": blocks_to_web(block.1),
-                    "isError": block.2.unwrap_or(false),
+                    "turn": turn,
+                    "step": step,
+                    "message": serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
                 }),
             ))
         }
@@ -1227,21 +1475,31 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
             "step/end",
             serde_json::json!({"turn": turn, "step": step}),
         )),
+        // v2 富形（RELEASED_V2 必填七件套）
         SessionEvent::Compaction {
             before_seq,
             summary,
+            compaction_id,
+            shadowed_start,
+            shadowed_seqs,
+            shadowed_token_count,
+            provider,
+            model,
         } => Some(row(
             "compaction/summary",
-            serde_json::json!({"beforeSeq": before_seq, "summary": summary}),
+            serde_json::json!({
+                "compactionId": compaction_id,
+                "summary": summary,
+                "shadowedRange": {"start": shadowed_start, "end": before_seq},
+                "shadowedSeqs": shadowed_seqs,
+                "shadowedTokenCount": shadowed_token_count,
+                "provider": provider,
+                "model": model,
+            }),
         )),
         SessionEvent::SessionTitle { title } => Some(row(
             "session/title",
             serde_json::json!({"title": title, "messageSeqs": [], "source": {"kind": "fallback"}}),
-        )),
-        // 流式 chunk（web assistant/chunk：载荷即 StreamChunk 的 serde 形状）
-        SessionEvent::AssistantChunk { turn, step, chunk } => Some(row(
-            "assistant/chunk",
-            serde_json::json!({"chunk": serde_json::to_value(chunk).unwrap_or(serde_json::Value::Null), "turn": turn, "step": step}),
         )),
         // 重试链（web llm/retry：normal 模式带 maxRetries，always 模式不带）
         SessionEvent::LlmRetry {
@@ -1295,6 +1553,12 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
     }
 }
 
+/// 迁移词汇表判定：迁移器接受的行类型 = 当前词汇 ∪ v0 打包存储记录
+/// （未知且非 ignorable 的类型拒绝迁移——fail-closed，与上游一致）。
+pub fn is_migration_known_type(ty: &str) -> bool {
+    KNOWN_SESSION_EVENT_TYPES.contains(&ty) || KNOWN_STORAGE_RECORD_TYPES.contains(&ty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,7 +1604,8 @@ mod tests {
         assert_eq!(pr["record"]["identity"]["cwd"], "/tmp/ws");
         assert_eq!(pr["record"]["rows"]["title"]["val"], "你好");
         assert_eq!(pr["record"]["rows"]["title"]["ver"], 1);
-        assert_eq!(pr["record"]["rows"]["title"]["seq"], 1);
+        // v2 起 seq 0 基（与内存位置对齐；上游 stage() 同）
+        assert_eq!(pr["record"]["rows"]["title"]["seq"], 0);
         // 旧整档（无树家的 bootstrap 源）同步更新
         let pc: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("storages").join("session_projcache.json")).unwrap(),
@@ -1779,12 +2044,12 @@ mod tests {
             .join("sessions")
             .join(project_key("/tmp/ws-a"))
             .join(id.as_str())
-            .join("session.jsonl.zstd");
+            .join("session.v2.jsonl.zstd");
         let b_file = dir
             .join("sessions")
             .join(project_key("/tmp/ws-b"))
             .join(id.as_str())
-            .join("session.jsonl.zstd");
+            .join("session.v2.jsonl.zstd");
         assert!(a_file.exists());
         assert!(!b_file.exists(), "cross-bucket copy created");
         let (session, _) = rec.load(&id, None).unwrap();
@@ -1869,7 +2134,8 @@ mod replay_tests {
         };
         let row = event_to_web_line(&event, 9, 5678).expect("turn/end must map");
         assert_eq!(row["data"]["reason"]["kind"], "error", "{row}");
-        assert_eq!(row["data"]["reason"]["failure"]["code"], "QUOTA");
+        // v2 词汇：error 载荷键 = error（web 命名）
+        assert_eq!(row["data"]["reason"]["error"]["code"], "QUOTA");
         match web_line_to_event(&row).expect("turn/end must parse back") {
             SessionEvent::TurnEnd { turn, reason } => {
                 assert_eq!(turn, 3);

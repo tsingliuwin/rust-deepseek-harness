@@ -73,19 +73,43 @@ brand!(SessionId);
 
 /// A durable raster image reference, valid in user or assistant content.
 ///
-/// v1 keeps a minimal self-contained stand-in for the attachment service; the
-/// full `dsh-attachment` capability (bytes ownership, dedup, variants) lands
-/// with the attachment package in a later milestone.
+/// Field names mirror upstream `ImageAttachmentRef`
+/// (`packages/attachment/attachment/src/types.ts`): the stored bytes are
+/// content-addressed (`attachmentId` = `sha256:<hex>`), normalization is owned
+/// by the attachment service.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAttachmentRef {
     pub attachment_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub mime_type: String,
+    pub media_type: String,
     pub bytes: u64,
     pub width: u32,
     pub height: u32,
+    /// Input dimensions before normalization scaling; present only when
+    /// normalization reduced the image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_dimensions: Option<ImageDimensions>,
+}
+
+/// Intrinsic pixel dimensions (upstream `originalDimensions` member shape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageDimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A durable verbatim file reference (`FileAttachmentRef` upstream): files are
+/// stored byte-for-byte with no normalization; `attachment_id` is the sha256
+/// digest of exactly those bytes and `name` is the sanitized display leaf name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileAttachmentRef {
+    pub attachment_id: String,
+    pub name: String,
+    pub bytes: u64,
 }
 
 /// Plain text visible to the end user.
@@ -103,6 +127,12 @@ pub enum ContentBlock {
     },
     Image {
         attachment: ImageAttachmentRef,
+    },
+    /// A verbatim stored file reference. Providers never receive file bytes:
+    /// request assembly replaces every file block (including nested tool
+    /// results) with deterministic handle text (`project_files_to_text`).
+    File {
+        attachment: FileAttachmentRef,
     },
     ToolCall {
         id: CallId,
@@ -146,6 +176,7 @@ impl ContentBlock {
             Self::Text { .. } => ContentBlockType::Text,
             Self::Reasoning { .. } => ContentBlockType::Reasoning,
             Self::Image { .. } => ContentBlockType::Image,
+            Self::File { .. } => ContentBlockType::File,
             Self::ToolCall { .. } => ContentBlockType::ToolCall,
             Self::ToolResult { .. } => ContentBlockType::ToolResult,
         }
@@ -161,6 +192,7 @@ pub enum ContentBlockType {
     Text,
     Reasoning,
     Image,
+    File,
     ToolCall,
     ToolResult,
 }
@@ -305,8 +337,46 @@ impl StreamChunk {
     }
 }
 
+/// Lossless compact representation of one model-stream attempt, embedded in
+/// durable v2 settlement events (`assistant/message.stream`,
+/// `assistant/attempt.stream`). Mirrors upstream `AssistantStreamRecord`
+/// (`packages/llm/llm/src/assistant-stream.ts`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum AssistantStreamRecord {
+    #[serde(rename_all = "camelCase")]
+    TextChunks {
+        time0: u64,
+        index: usize,
+        /// ms gaps; `dt[i]` is the gap between member `i` and `i+1`.
+        dt: Vec<i64>,
+        texts: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ReasoningChunks {
+        time0: u64,
+        index: usize,
+        dt: Vec<i64>,
+        texts: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    ToolCallChunks {
+        time0: u64,
+        index: usize,
+        dt: Vec<i64>,
+        id: CallId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        args: Vec<String>,
+    },
+    /// A chunk that cannot merge (block boundaries, usage, finish) verbatim.
+    Chunk {
+        time: u64,
+        chunk: StreamChunk,
+    },
+}
+
 /// JSON-schema description of a tool, as sent to the model.
-///
 /// Declared here (not in `dsh-tools`) because it is part of `GenerateOptions`;
 /// both `dsh-tools` and `dsh-system-prompt` import it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

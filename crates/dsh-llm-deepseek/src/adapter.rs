@@ -137,7 +137,7 @@ impl DeepSeekAdapter {
                             "type": "function",
                             "function": { "name": name, "arguments": arguments },
                         })),
-                        ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {}
+                        ContentBlock::Image { .. } | ContentBlock::File { .. } | ContentBlock::ToolResult { .. } => {}
                     }
                 }
                 let mut obj = serde_json::Map::new();
@@ -164,7 +164,9 @@ impl DeepSeekAdapter {
             match b {
                 ContentBlock::Text { text } | ContentBlock::Reasoning { text } => out.push_str(text),
                 ContentBlock::ToolResult { content, .. } => out.push_str(&Self::blocks_to_text(content)),
-                ContentBlock::ToolCall { .. } | ContentBlock::Image { .. } => {}
+                // File 块到不了适配器：请求组装已把一切 FileBlock 投影为 handle 文本
+                // （project_files_to_text）；此分支只兜底。
+                ContentBlock::ToolCall { .. } | ContentBlock::Image { .. } | ContentBlock::File { .. } => {}
             }
         }
         out

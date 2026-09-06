@@ -3,14 +3,33 @@
 use serde::{Deserialize, Serialize};
 
 /// Why a turn ended.
+///
+/// serde 形状对齐上游 v2 词汇（`TurnEndReasonMap`）：`aborted` 携带
+/// `reason`（rustdsh 的取消一律落上游迁移自己合成的 `{kind:"legacy"}`
+/// 取消原因——保证嵌套变体可被 web 校验接受），`error` 的载荷键是
+/// `error`（web 命名；rustdsh 内部字段名保持 failure）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum TurnEndReason {
     Completed,
     MaxTokens,
     Blocked,
-    Aborted,
-    Error { failure: dsh_llm::LlmFailure },
+    Aborted {
+        #[serde(rename = "reason")]
+        cancel_cause: CancelCause,
+    },
+    Error {
+        #[serde(rename = "error")]
+        failure: dsh_llm::LlmFailure,
+    },
+}
+
+/// 取消原因（web `TurnEndCancelCause` 的已知保底形；web 迁移对无因取消
+/// 合成 `{kind:"legacy"}`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CancelCause {
+    Legacy,
 }
 
 /// Whether a request header was appended initially, on resume, or on change.
@@ -86,10 +105,24 @@ pub enum SessionEvent {
     },
     RequestContext(RequestContext),
     /// 压缩事务：影子区（来源 seq <= before_seq 的消息）由检查点消息替换
-    /// （web compaction/start→summary→end 的合并承载）。
+    /// （web compaction/start→summary→end 的合并承载）。v2 日志的
+    /// `compaction/summary` 富形字段一并携带（web RELEASED_V2 处置表要求
+    /// compactionId/shadowedRange/shadowedSeqs/shadowedTokenCount/provider/
+    /// model 必填）。
     Compaction {
         before_seq: u64,
         summary: String,
+        /// 事务标识（web compactionId；rustdsh 每次压缩生成一个）。
+        compaction_id: String,
+        /// 影子区起点（首个被替换消息的事件 seq；终点即 `before_seq`）。
+        shadowed_start: u64,
+        /// 被替换消息的事件 seq 清单。
+        shadowed_seqs: Vec<u64>,
+        /// 影子区估算 token 数。
+        shadowed_token_count: u64,
+        /// 发起压缩时的路由（web 必填字段）。
+        provider: String,
+        model: String,
     },
     /// 会话标题（log-only，latest-wins；不进模型可见面）。
     /// web SessionTitleEventData 的 title 部分（messageSeqs/source 不落盘）。
@@ -118,6 +151,31 @@ pub enum SessionEvent {
 pub struct SessionEntry {
     pub seq: u64,
     pub event: SessionEvent,
+}
+
+impl SessionEvent {
+    /// 构造一次压缩事务（v2 富形；`compaction_id` 由调用方生成）。
+    pub fn compaction(
+        before_seq: u64,
+        summary: String,
+        compaction_id: String,
+        shadowed_start: u64,
+        shadowed_seqs: Vec<u64>,
+        shadowed_token_count: u64,
+        provider: String,
+        model: String,
+    ) -> Self {
+        Self::Compaction {
+            before_seq,
+            summary,
+            compaction_id,
+            shadowed_start,
+            shadowed_seqs,
+            shadowed_token_count,
+            provider,
+            model,
+        }
+    }
 }
 
 /// 检查点消息帧形（web CHECKPOINT_PREAMBLE + SUMMARY 标签；与
@@ -209,7 +267,7 @@ impl Session {
                     }
                 }
                 SessionEvent::ToolResult { message, .. } => out.push((e.seq, message.clone(), false)),
-                SessionEvent::Compaction { before_seq, summary } => {
+                SessionEvent::Compaction { before_seq, summary, .. } => {
                     out.retain(|(seq, _, checkpoint)| !checkpoint && *seq > *before_seq);
                     // 影子区是历史前缀：检查点插在保留消息之前（替换其位置）
                     out.insert(0, (e.seq, compaction_checkpoint_message(summary), true));
@@ -306,7 +364,16 @@ mod tests {
         s.append(SessionEvent::UserMessage(Message::user_text("old-1"))); // seq 0
         s.append(SessionEvent::UserMessage(Message::user_text("old-2"))); // seq 1
         s.append(SessionEvent::UserMessage(Message::user_text("keep"))); // seq 2
-        s.append(SessionEvent::Compaction { before_seq: 1, summary: "## Current Work\n- x".into() });
+        s.append(SessionEvent::compaction(
+            1,
+            "## Current Work\n- x".into(),
+            "cp-1".into(),
+            0,
+            vec![0, 1],
+            42,
+            "deepseek".into(),
+            "test-model".into(),
+        ));
 
         let msgs = s.derive_messages();
         assert_eq!(msgs.len(), 2);
@@ -317,7 +384,16 @@ mod tests {
         assert_eq!(msgs[1].content[0], ContentBlock::Text { text: "keep".into() });
 
         // 第二次压缩替换到更晚的落点
-        s.append(SessionEvent::Compaction { before_seq: 2, summary: "merged".into() });
+        s.append(SessionEvent::compaction(
+            2,
+            "merged".into(),
+            "cp-2".into(),
+            1,
+            vec![1, 2],
+            30,
+            "deepseek".into(),
+            "test-model".into(),
+        ));
         let msgs = s.derive_messages();
         assert_eq!(msgs.len(), 1);
         let ContentBlock::Text { text } = &msgs[0].content[0] else { panic!() };

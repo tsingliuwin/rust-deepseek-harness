@@ -205,8 +205,7 @@ struct ChatSnap {
     empty: bool,
     running: bool,
     tab: CenterTab,
-    stats: String,
-    stats_steps: u64,
+    stats: crate::chat::SessionStats,
 }
 
 
@@ -1110,6 +1109,110 @@ impl TurnUsage {
 }
 
 /// 紧凑 token 数（web formatTokens：<1k 原样，<1M 一位小数千位，其余百万）。
+/// composer 统计 pill 的对话框种类（web StatsPills 互斥 slot）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatDialogKind {
+    /// 会话统计（模型用时/工具调用用时/TTFT/TPS）。
+    Gauge,
+    /// Token 用量（输入/缓存读/缓存写/输出）。
+    Usage,
+}
+
+/// 统计对话框面板（web stat-dialog.module.css：r12 menu 面、描边重绑进
+/// elevation-prominent；标题行 + 0.5px 分隔线 + dt/dd 行，12/18 字号）。
+/// 定位在 pill 行上方水平居中（上游逐 pill 锚定 + viewport clamp 简化）。
+fn stat_dialog_panel(kind: StatDialogKind, stats: &crate::chat::SessionStats) -> Div {
+    let (title, icon) = match kind {
+        StatDialogKind::Gauge => ("会话统计", IconName::LayoutDashboard),
+        StatDialogKind::Usage => ("Token 用量", IconName::ChartPie),
+    };
+    let mut headline: Option<String> = None;
+    let mut rows: Vec<(&'static str, String)> = Vec::new();
+    match kind {
+        StatDialogKind::Gauge => {
+            if stats.llm_ms > 0 {
+                rows.push(("模型用时", format_run_duration(stats.llm_ms)));
+            }
+            if stats.tool_ms > 0 {
+                rows.push(("工具调用用时", format_run_duration(stats.tool_ms)));
+            }
+            if let Some(ttft) = stats.ttft_avg_ms {
+                rows.push(("首 token 平均（TTFT）", format_run_duration(ttft)));
+            }
+            if let Some(tps) = stats.tps {
+                rows.push(("输出速度（TPS）", format_tps(tps)));
+            }
+        }
+        StatDialogKind::Usage => {
+            let total = stats.input_tokens.saturating_add(stats.output_tokens);
+            headline = Some(format_tokens_exact(total));
+            let uncached = stats
+                .input_tokens
+                .saturating_sub(stats.cache_read)
+                .saturating_sub(stats.cache_write);
+            let hit = if stats.input_tokens > 0 {
+                Some(((stats.cache_read as f64 / stats.input_tokens as f64) * 100.0) as u64)
+            } else {
+                None
+            };
+            if let Some(p) = hit {
+                rows.push(("缓存命中", format!("{p}%")));
+            }
+            rows.push(("输入", format_tokens_exact(uncached)));
+            rows.push(("缓存读取", format_tokens_exact(stats.cache_read)));
+            rows.push(("缓存写入", format_tokens_exact(stats.cache_write)));
+            rows.push(("输出", format_tokens_exact(stats.output_tokens)));
+        }
+    }
+    let mut panel = div()
+        .w(px(300.0))
+        .rounded(px(12.0))
+        .bg(theme::t().menu)
+        .shadow(theme::elevation_prominent())
+        .p(px(16.0))
+        .text_size(px(12.0))
+        .line_height(px(18.0))
+        .text_color(theme::t().text_2)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(16.0))
+                .mb(px(8.0))
+                .text_color(theme::t().text)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(Icon::new(icon).size(px(14.0)))
+                        .child(title),
+                )
+                .children(headline.map(|h| div().child(h))),
+        )
+        .child(div().mb(px(10.0)).h(px(0.5)).w_full().bg(theme::t().border_l2));
+    for (dt, dd) in rows {
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .py(px(2.0))
+                .child(div().text_color(theme::t().text_3).child(dt))
+                .child(dd),
+        );
+    }
+    div()
+        .absolute()
+        .bottom(px(30.0))
+        .left(px(0.0))
+        .right(px(0.0))
+        .flex()
+        .justify_center()
+        .child(panel.occlude())
+}
+
 fn format_tokens_compact(value: u64) -> String {
     let scaled = |v: f64| if v >= 100.0 { format!("{}", v.round() as u64) } else { format!("{:.1}", (v * 10.0).round() / 10.0) };
     if value < 1_000 {
@@ -1226,6 +1329,8 @@ struct AppView {
     hero_ws_menu: bool,
     /// composer 模型菜单开合（模型牌点击弹出）
     model_menu: bool,
+    /// composer 统计 pill 的对话框互斥开合（web StatsPills exclusive slot）
+    stat_dialog: Option<StatDialogKind>,
     rename_input: Entity<InputState>,
     input: Entity<InputState>,
     /// composer 附件草稿（有序；上游 DraftFileUploads）
@@ -1441,6 +1546,7 @@ impl AppView {
             renaming_session: None,
             hero_ws_menu: false,
             model_menu: false,
+            stat_dialog: None,
             rename_input,
             attachments: Vec::new(),
             attachment_store: Arc::new(dsh_persist::AttachmentStore::new(
@@ -2818,8 +2924,7 @@ impl Render for AppView {
             empty: c.is_empty(),
             running: c.running(),
             tab: c.tab(),
-            stats: c.stats_line(),
-            stats_steps: c.stats_steps(),
+            stats: c.session_stats(),
         });
 
         let this = cx.entity();
@@ -3127,36 +3232,137 @@ impl AppView {
         let content_w = layout::chat_content_width(width);
         let card_w = layout::composer_card_width(width);
         let locked = snap.empty && self.current_workspace.is_none();
+        let this = this.clone();
         let mut area = div()
             .flex_none()
             .v_flex()
             .bg(theme::t().bg_base)
             .pb_2()
-            .child(self.composer_card(this, has_text, card_w, snap.running, locked));
-        // web StatsLine：输入卡下方常驻 footer。占位恒在（固定行高），
-        // 避免首条统计出现时输入卡上移；steps>0 只决定有无文本，
-        // 文本居中（.root text-align: center）
-        area = area.child(
-            div()
-                .w_full()
+            .child(self.composer_card(this.clone(), has_text, card_w, snap.running, locked));
+        // web StatsPills（0.1.5-alpha.1）：输入卡下方两个图标 pill——
+        // 仪表 pill（轮/步 + 输出速度）开「会话统计」对话框，数据 pill
+        // （总 token + 缓存命中）开「Token 用量」对话框；互斥开合（exclusive
+        // slot）。占位行高恒在（24px）避免首条统计出现时输入卡上移；
+        // steps=0 且无 token 时整行只留占位（上游 return null）。
+        let stats = snap.stats.clone();
+        let has_tokens = stats.input_tokens > 0 || stats.output_tokens > 0;
+        let gauge_open = self.stat_dialog == Some(StatDialogKind::Gauge);
+        let usage_open = self.stat_dialog == Some(StatDialogKind::Usage);
+        let mut strip = div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .items_center()
+            .gap(px(12.0))
+            .h(px(24.0))
+            .pt(px(4.0));
+        if stats.steps > 0 || has_tokens {
+            let t_gauge = this.clone();
+            let t_usage = this.clone();
+            let counts = format!("{} 轮 {} 步", stats.turns, stats.steps);
+            let tps_text = stats.tps.map(format_tps);
+            let total = stats.input_tokens.saturating_add(stats.output_tokens);
+            let cache_hit = if stats.input_tokens > 0 {
+                Some(((stats.cache_read as f64 / stats.input_tokens as f64) * 100.0) as u64)
+            } else {
+                None
+            };
+            let total_text = format_tokens_compact(total);
+            // 时间 pill：无任何计时数据时保持纯文本读数（不开空对话框）
+            let gauge_timed = stats.llm_ms > 0
+                || stats.tool_ms > 0
+                || stats.ttft_avg_ms.is_some()
+                || stats.tps.is_some();
+            let gauge_pill = div()
+                .id("stat-pill-gauge")
                 .flex()
-                .justify_center()
-                .h(px(24.0))
-                .pt(px(4.0))
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .py(px(1.0))
+                .rounded(px(24.0))
+                .text_size(px(theme::FONT_CAPTION))
+                .line_height(px(20.0))
+                .text_color(if gauge_open {
+                    theme::t().text_2
+                } else {
+                    theme::t().text_3
+                })
+                .when(gauge_open, |d| d.bg(theme::t().hover))
+                .when(!gauge_open && gauge_timed, |d| {
+                    d.hover(|s| s.bg(theme::t().hover).text_color(theme::t().text_2))
+                })
                 .child(
-                    div()
-                        .max_w(px(content_w))
-                        .w_full()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_center()
-                        .text_size(px(theme::FONT_CAPTION))
-                        .line_height(px(20.0))
-                        .text_color(theme::t().text_3)
-                        .when(snap.stats_steps > 0, |d| d.child(snap.stats.clone())),
-                ),
-        );
+                    Icon::new(IconName::LayoutDashboard)
+                        .size(px(14.0))
+                        .text_color(theme::t().text_3),
+                )
+                .child(counts.clone())
+                .children(tps_text.clone().map(|t| {
+                    div().ml(px(6.0)).text_color(theme::t().text_3).child(t)
+                }))
+                .when(gauge_timed, |d| {
+                    let t = t_gauge.clone();
+                    d.on_click(move |_, _, cx| {
+                        t.update(cx, |v, cx| {
+                            v.stat_dialog = if v.stat_dialog == Some(StatDialogKind::Gauge) {
+                                None
+                            } else {
+                                Some(StatDialogKind::Gauge)
+                            };
+                            cx.notify();
+                        });
+                    })
+                });
+            let usage_pill = div()
+                .id("stat-pill-usage")
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(8.0))
+                .py(px(1.0))
+                .rounded(px(24.0))
+                .text_size(px(theme::FONT_CAPTION))
+                .line_height(px(20.0))
+                .text_color(if usage_open {
+                    theme::t().text_2
+                } else {
+                    theme::t().text_3
+                })
+                .when(usage_open, |d| d.bg(theme::t().hover))
+                .when(!usage_open && has_tokens, |d| {
+                    d.hover(|s| s.bg(theme::t().hover).text_color(theme::t().text_2))
+                })
+                .child(
+                    Icon::new(IconName::ChartPie)
+                        .size(px(14.0))
+                        .text_color(theme::t().text_3),
+                )
+                .child(total_text)
+                .children(cache_hit.map(|p| {
+                    div().ml(px(6.0)).text_color(theme::t().text_3).child(format!("缓存命中 {p}%"))
+                }))
+                .when(has_tokens, |d| {
+                    let t = t_usage.clone();
+                    d.on_click(move |_, _, cx| {
+                        t.update(cx, |v, cx| {
+                            v.stat_dialog = if v.stat_dialog == Some(StatDialogKind::Usage) {
+                                None
+                            } else {
+                                Some(StatDialogKind::Usage)
+                            };
+                            cx.notify();
+                        });
+                    })
+                });
+            strip = strip
+                .relative()
+                .child(gauge_pill)
+                .child(usage_pill)
+                .when(gauge_open, |d| d.child(stat_dialog_panel(StatDialogKind::Gauge, &stats)))
+                .when(usage_open, |d| d.child(stat_dialog_panel(StatDialogKind::Usage, &stats)));
+        }
+        area = area.child(strip);
         area
     }
 

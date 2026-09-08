@@ -14,6 +14,7 @@ fn main() {
                         dsh_session::SessionEvent::TurnEnd { .. } => "turn/end",
                         dsh_session::SessionEvent::StepStart { .. } => "step/start",
                         dsh_session::SessionEvent::StepEnd { .. } => "step/end",
+                        dsh_session::SessionEvent::SystemMessage { .. } => "system/message",
                         dsh_session::SessionEvent::UserMessage(m) => {
                             match &m.source {
                                 dsh_llm::MessageSource::User => "user/message(user)",

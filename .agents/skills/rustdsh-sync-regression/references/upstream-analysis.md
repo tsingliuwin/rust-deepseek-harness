@@ -1,9 +1,9 @@
 # 上游更新分析法（模式 A 详细步骤）
 
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
-> **当前同步点：dsh-v0.1.3-alpha.2（82a5fd61a7）**——2026-09-08 同步。此前 d347e70390（0.1.3-alpha.1，2026-09-06）。
-> 0.1.3-alpha.2 主面：system-prompt 序位重排 + persona 前缀/后缀拆分（e28862db57+40792330c0）、模型切换公告（48cc1cf1d6，agent/pre-step 追加 plugin/model-selection notice）、会话流式迁移重构（面外，格式不变）；master HEAD c389f96bf3 相对发布点另有 ~20 提交（Sidebar 文件树 tab/docking 引擎/deliverables 文件打开）为下轮候选。
-> **最近检查：2026-09-08（定时轮 #3，同步轮）**——上游发布 0.1.3-alpha.2，按面内两项实施；其余判面外固化（见判定表）。
+> **当前同步点：dsh-v0.1.5-alpha.1（5dda764ed3）**——2026-09-08 同步（跨 0.1.3-alpha.3/0.1.4 系列；发布点=master HEAD）。此前 82a5fd61a7（0.1.3-alpha.2，2026-09-06 同步）。
+> 0.1.5-alpha.1 主面：**会话格式 v3**（system prompt 晋升 system/message 行 + request/header 去 system + PTC 改名 + canonical 信封）、composer 统计行改双图标 pill + 互斥统计对话框、SystemPromptRow（系统提示词折叠行）；Sidebar 工作区文件树/dockkit/textpreview/remotes 全链面外。
+> **最近检查：2026-09-08（定时轮 #4，同步轮）**——上游发布 0.1.5-alpha.1（703 文件 +35815/-4724），面内三项实施；另修 dsh-shell 环境脆弱测试遗留问题；master 无标签后增量。
 
 ## 1. 一键差异分析
 
@@ -55,6 +55,14 @@
 | str_replace_editor 默认工具移除（36a4665144、965adbb5cf）| 面外 | rustdsh 工具集本就无 str_replace_editor |
 | ui-agent-preset / ui-settings-plugin-inventory / ui-settings-plugins / SubagentModelSelectionCard / ui-trajectory / ui-skill | 面外 | rustdsh 无对应 UI 面（既有判定）|
 | token-meter / session-stats / telemetry-otel / session-controller / api contract | 面外 | host 统计与遥测内部面，无镜像 |
+| 会话格式 v3（0.1.5-alpha.1：header version 3 + agentPreset code→ptc + system prompt 晋升 `system/message` 行（head 保护/精确 replace/startSeq,endSeq 富形）+ request/header 去 system/空 tools/空 adapterDefaults + tool/code-dispatch→tool/ptc-dispatch + tools-code-mode→tools-ptc）| **面内**（已实施）| 磁盘互通；rustdsh 写 v3 + 读 v2/v3 + 写打开 v0/v1→v2→v3 级联迁移（v2.rs migrate_v2_to_v3：system promotion/PTC 改名/canonical/seq 重映射，id=v2-to-v3-system+sha256）；dsh-agent-loop 落盘序 step/start→system→user，head 归一化 replace（非 in-history 路线）|
+| SystemPromptRow（0.1.5-alpha.1：system prompt 折叠行「系统提示词」/更新行「系统提示词更新」，展开体 141px 代码块）| **面内**（已实施）| chat.rs 渲染 system/message 为 Role::Context 折叠行；上游 surface replace 语义 rustdsh 线性显示每条（偏差）|
+| composer 统计条改双图标 pill + 互斥统计对话框（3997f36999：gauge pill=轮步+TPS 开「会话统计」，database pill=总 token+缓存命中开「Token 用量」；stats.counts 去 ·；stats.dialog.* 词汇）| **面内**（已实施）| SessionStats 窗口累计（上游 deriveStats fallback fold 语义）；TTFT 会话平均；TPS 以 llm−ttft 近似 decode 窗口 |
+| Sidebar 工作区文件树全链（workspace-files 双面 API/remotes/resources/file 资源订阅/dockkit 引擎/sidebar tab+文件树/textpreview 分页 tab/deliverables 产出文件/聊天点击文件改侧栏打开）| 面外 | rustdsh 无工作区文件浏览器面（既有判定先例）；聊天文件链接维持既有打开行为（7f0a613 守卫）|
+| Send busy 态系列（9a5ed6fb60 跟随 busy-Enter、2f630626b8 纯文本草稿才显模式名、8935c3d725 上传 pending 保 Send）| 面外 | rustdsh 发送钮无 busy 文案形态 |
+| think 摘要去粗体（b08310ac1d）/ markdown 图片失败显原文本（88ab8e9133）| 面外 | rustdsh think 行固定标题无摘要文本面；vendor TextView 无图片加载 |
+| session-controller 拒空 prompt（ae19d9383b）/ api file 边界修复系列 | 面外 | rustdsh 无 session-controller RPC 层 |
+| open-in-app SSH 检测共享 / visualizer feat+revert 净零 / native node-addon-system（flock/Landlock）/ agent-instructions root marker 修复 | 面外 | 无对应面/净零/Node 原生层 |
 
 ## 3. 实施顺序
 
@@ -82,3 +90,6 @@
 - StateDot idle/unloading 五态目录：消费面（插件库存页）rustdsh 无镜像；state_dot 色值由调用方供给，不扩枚举。
 - 模型切换公告显示形态：上游在转录里渲染为折叠摘要行（notice summary 骑行）；rustdsh 无 ContextInjectionRow 折叠行组件，公告按既有用户消息渲染面显示（互通面已 1:1，视觉形态偏差）。
 - dsh-shell 端到端 cmd 编码测试（cmd_non_utf8_stderr_is_readable）弱化为编码无关断言：cmd 子进程输出字节随父链 console 输出代码页漂移且偶发尾字节截断（65001/936 间歇），强语义由 GBK 纯字节解码单测固定覆盖——2026-09-08 定时轮 #3 发现并修复（曾致 cargo test 中止后续 suite、总数波动 80/88/93）。
+
+- V3 system prompt 面：上游 in-history 路线（provider 适配器声明能力）变化时 append 新节点；rustdsh 路线走请求 system 参数（非 in-history）→ 归一化 replace head。读取多节点 v3 日志（in-history 写形）时 rustdsh 线性显示每条 system/message，不做 surface 替换折叠。
+- 统计 pill：IconGaugeOutline16/IconDatabaseOutline16 不可得（gpui-component-assets 86 枚无 gauge/database），近似用 LayoutDashboard/ChartPie；TPS 的 decode 窗口以 llm−ttft 近似（rustdsh 无独立解码计时）；对话框无点外关闭（strip 在文档流，无法全窗捕获；pill 再点/互斥切换关闭）+ 面板固定于 pill 行上方居中（上游逐 pill 锚定 + viewport clamp）。

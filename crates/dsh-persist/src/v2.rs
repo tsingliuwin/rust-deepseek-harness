@@ -4,12 +4,13 @@
 //! generation.ts）与 `session-format-v0-to-v1` / `v1-to-v2` 迁移器的净态语义：
 //!
 //! - 代数文件名：v0 = `session.jsonl(.zstd)`，v1+ = `session.vN.jsonl(.zstd)`；
-//!   当前写目标恒为 `session.v2.jsonl.zstd`。
+//!   当前写目标恒为 `session.v3.jsonl.zstd`（0.1.5-alpha.1 起；v0/v1 先
+//!   升 v2 再级联到 v3）。
 //! - header：`version: 2`，必填 `isSeeded`（v0 的 `seedLength` 被移除，种子
 //!   切点改为落 `session/end-seed {inherited:true}` 事件）。
 //! - 流内嵌：`assistant/chunk` 不再是事件；每个 attempt 结算为一行
 //!   `assistant/message`（data 带 `stream`）或 `assistant/attempt`。
-//! - 迁移永不重写源文件：临时文件 → rename 到 `session.v2.jsonl.zstd`；
+//! - 迁移永不重写源文件：临时文件 → rename 到目标代文件（v2/v3）；
 //!   目标已存在视为冲突。未知必读类型拒绝迁移——fail-closed。
 
 use dsh_llm::{AssistantStreamAccumulator, AssistantStreamRecord};
@@ -18,8 +19,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// 当前会话格式版本（web `SESSION_FORMAT_VERSION`）。
-pub const SESSION_FORMAT_VERSION: u64 = 2;
+/// 当前会话格式版本（web `SESSION_FORMAT_VERSION`）。0.1.5-alpha.1 起为 3：
+/// system prompt 从 request/header 晋升为 `system/message` 面节点、PTC 词汇
+/// 改名（code→ptc）、canonical 信封（replace 富形 startSeq/endSeq）。
+pub const SESSION_FORMAT_VERSION: u64 = 3;
 
 /// 从文件名解析代数：`session.jsonl.zstd` → 0，`session.vN.jsonl.zstd` → N。
 pub fn generation_of(file_name: &str) -> Option<u64> {
@@ -253,7 +256,9 @@ pub fn migrate_to_v2(source: &Path, id: &SessionId) -> io::Result<PathBuf> {
     let seed_length = header.get("seedLength").and_then(|v| v.as_u64());
     if let Some(obj) = header.as_object_mut() {
         obj.remove("seedLength");
-        obj.insert("version".into(), serde_json::json!(SESSION_FORMAT_VERSION));
+        // 本迁移的产物恒为 v2（不跟随 SESSION_FORMAT_VERSION——级联的
+        // 下一段以该值判定输入代数）
+        obj.insert("version".into(), serde_json::json!(2));
         obj.insert(
             "isSeeded".into(),
             serde_json::json!(seed_length.map(|l| l > 0).unwrap_or(false)),
@@ -674,4 +679,454 @@ fn row_message_id(row: &serde_json::Value, ty: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string()
+}
+
+// ---- v2 → v3 迁移 ----
+
+/// 把 v2 日志迁移为 v3，发布到同目录 `session.v3.jsonl.zstd`。语义对齐上游
+/// `session-format-v2-to-v3`（0.1.5-alpha.1）净态：头升 3、agentPreset
+/// code→ptc；system prompt 晋升（request/header 的 header.system 抽出，
+/// 变化时在该行前插入 system/message；首个 step/start 后补空 head）；PTC
+/// 改名（tool/ptc-dispatch*、tools-code-mode→tools-ptc）；canonical 信封
+/// （request/header 省略 system/空 tools/空 adapterDefaults）；引用重映射
+/// （command/done、compaction、session/title*、信封 sourceEventSeqs 与
+/// surfaceOp replace 范围）；未知必读类型拒绝；源文件字节永不改动。
+pub fn migrate_v2_to_v3(source: &Path, id: &SessionId) -> io::Result<PathBuf> {
+    let bytes = crate::read_decompressed(source)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut header: Option<serde_json::Value> = None;
+    let mut raw_rows: Vec<serde_json::Value> = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| bad_log(format!("malformed line: {e}")))?;
+        if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+            header = Some(v);
+        } else {
+            raw_rows.push(v);
+        }
+    }
+    let Some(mut header) = header else {
+        return Err(bad_log("no session header"));
+    };
+    if header_version(&header) != 2 {
+        return Err(bad_log("source is not v2"));
+    }
+    if let Some(obj) = header.as_object_mut() {
+        obj.insert("version".into(), serde_json::json!(3));
+        if obj.get("agentPreset").and_then(|v| v.as_str()) == Some("code") {
+            obj.insert("agentPreset".into(), serde_json::json!("ptc"));
+        }
+    }
+
+    let session_id = id.as_str().to_string();
+    let mut staged: Vec<serde_json::Value> = Vec::new();
+    let mut old_to_new: HashMap<u64, u64> = Default::default();
+    let mut head: Option<u64> = None;
+    let mut last_prompt = String::new();
+    let mut step: Option<(u64, u64)> = None;
+    let mut generated_ids: BTreeSet<String> = Default::default();
+
+    // 生成的 system/message 行（上游 emitSystem：id 带 sha256 身份、固定
+    // plugin source、append 或精确 replace head + sourceEventSeqs）
+    fn emit_system(
+        staged: &mut Vec<serde_json::Value>,
+        head: &mut Option<u64>,
+        generated_ids: &mut BTreeSet<String>,
+        session_id: &str,
+        prompt: &str,
+        anchor_seq: u64,
+        anchor_type: &str,
+        anchor_time: u64,
+        turn: u64,
+        step: u64,
+    ) -> io::Result<()> {
+        let identity = serde_json::json!([
+            "session-format-v2-to-v3",
+            session_id,
+            anchor_seq,
+            anchor_type,
+        ]);
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(identity.to_string().as_bytes());
+            let bytes = hasher.finalize();
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        let msg_id = format!("v2-to-v3-system-{digest}");
+        if generated_ids.contains(&msg_id) {
+            return Err(bad_log("generated system message id collides"));
+        }
+        generated_ids.insert(msg_id.clone());
+        let target_seq = staged.len() as u64;
+        let mut row = serde_json::json!({
+            "type": "system/message",
+            "seq": target_seq,
+            "time": anchor_time,
+            "data": {
+                "turn": turn,
+                "step": step,
+                "message": {
+                    "id": msg_id,
+                    "role": "system",
+                    "source": {"kind": "plugin", "plugin": "@deepseek-ai/dsh-system-prompt"},
+                    "content": if prompt.is_empty() {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!([{"type": "text", "text": prompt}])
+                    },
+                },
+            },
+        });
+        match *head {
+            None => row["surfaceOp"] = serde_json::json!("append"),
+            Some(h) => {
+                row["surfaceOp"] =
+                    serde_json::json!({"op": "replace", "startSeq": h, "endSeq": h});
+                row["sourceEventSeqs"] = serde_json::json!([h]);
+            }
+        }
+        *head = Some(target_seq);
+        staged.push(row);
+        Ok(())
+    }
+
+    for row in raw_rows {
+        let ty = row
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let ignorable = row.get("ignorable").and_then(|i| i.as_bool()) == Some(true);
+        if !crate::is_migration_known_type(&ty) && !ignorable {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "session log contains event type \"{ty}\" unknown to this harness and not marked ignorable; refusing to migrate the log — it was likely written by a newer harness"
+                ),
+            ));
+        }
+        let source_seq = row.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        let time = row.get("time").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut row = row;
+
+        // request/header：抽 system 晋升（在该行之前插入），canonical 收尾
+        if ty == "request/header" {
+            let prompt = row
+                .pointer("/data/header/system")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            if prompt != last_prompt {
+                let (st_turn, st_step) = step.unwrap_or((0, 0));
+                emit_system(
+                    &mut staged,
+                    &mut head,
+                    &mut generated_ids,
+                    &session_id,
+                    &prompt,
+                    source_seq,
+                    "request/header",
+                    time,
+                    st_turn,
+                    st_step,
+                )?;
+                last_prompt = prompt;
+            }
+            if let Some(header_obj) =
+                row.pointer_mut("/data/header").and_then(|h| h.as_object_mut())
+            {
+                header_obj.remove("system");
+                if header_obj.get("tools").and_then(|t| t.as_array()).is_some_and(|a| a.is_empty())
+                {
+                    header_obj.remove("tools");
+                }
+                if header_obj
+                    .get("adapterDefaults")
+                    .and_then(|a| a.as_object())
+                    .is_some_and(|o| o.is_empty())
+                {
+                    header_obj.remove("adapterDefaults");
+                }
+            }
+        }
+
+        // PTC 改名
+        match ty.as_str() {
+            "tool/code-dispatch-start" => {
+                row["type"] = serde_json::json!("tool/ptc-dispatch-start");
+            }
+            "tool/code-dispatch" => {
+                row["type"] = serde_json::json!("tool/ptc-dispatch");
+            }
+            "agent-preset/selected" => {
+                if row.pointer("/data/agentPreset").and_then(|v| v.as_str()) == Some("code") {
+                    row["data"]["agentPreset"] = serde_json::json!("ptc");
+                }
+            }
+            "user/message" => {
+                if row.pointer("/data/source/plugin").and_then(|v| v.as_str())
+                    == Some("tools-code-mode")
+                {
+                    row["data"]["source"]["plugin"] = serde_json::json!("tools-ptc");
+                }
+            }
+            _ => {}
+        }
+
+        // step 上下文
+        match ty.as_str() {
+            "step/start" => {
+                let turn = row.pointer("/data/turn").and_then(|v| v.as_u64()).unwrap_or(0);
+                let stp = row.pointer("/data/step").and_then(|v| v.as_u64()).unwrap_or(0);
+                step = Some((turn, stp));
+            }
+            "step/end" | "turn/end" => step = None,
+            _ => {}
+        }
+
+        // 落行（引用重映射只指向更早的源行）
+        remap_v3_row_refs(&mut row, &old_to_new);
+        let new_seq = staged.len() as u64;
+        old_to_new.insert(source_seq, new_seq);
+        staged.push(row);
+
+        // 首个 step/start 后补空 head（上游锚序：step/start 行先 emit）
+        if ty == "step/start" && head.is_none() {
+            let (st_turn, st_step) = step.unwrap_or((0, 0));
+            emit_system(
+                &mut staged,
+                &mut head,
+                &mut generated_ids,
+                &session_id,
+                "",
+                source_seq,
+                "step/start",
+                time,
+                st_turn,
+                st_step,
+            )?;
+        }
+    }
+
+    // 致密化（插入行已占目标位；顺序即新 seq，0 基）+ canonical surfaceOp
+    // replace 富形（上游 canonicalizeTransformedEvent：start/end → startSeq/endSeq）
+    for (index, row) in staged.iter_mut().enumerate() {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("seq".into(), serde_json::json!(index));
+            if let Some(op) = obj.get_mut("surfaceOp") {
+                if op.get("op").and_then(|o| o.as_str()) == Some("replace") {
+                    let start = op.get("startSeq").or_else(|| op.get("start")).and_then(|v| v.as_u64());
+                    let end = op.get("endSeq").or_else(|| op.get("end")).and_then(|v| v.as_u64());
+                    if let (Some(s), Some(e)) = (start, end) {
+                        *op = serde_json::json!({"op": "replace", "startSeq": s, "endSeq": e});
+                    }
+                }
+            }
+        }
+    }
+
+    // 发布：临时文件 → rename（源文件与字节永不改动）
+    let parent = source
+        .parent()
+        .ok_or_else(|| bad_log("source has no parent dir"))?;
+    let target = parent.join("session.v3.jsonl.zstd");
+    if target.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "migration target session.v3.jsonl.zstd already exists",
+        ));
+    }
+    let mut payload =
+        serde_json::to_string(&header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    payload.push('\n');
+    for row in &staged {
+        payload.push_str(
+            &serde_json::to_string(row).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        );
+        payload.push('\n');
+    }
+    let compressed = zstd::stream::encode_all(payload.as_bytes(), 0)?;
+    let tmp = tmp_path(parent);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&compressed)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &target)?;
+    Ok(target)
+}
+
+/// v2→v3 的引用重映射（上游 remapEvent 的审计字段集；surfaceOp 范围在
+/// v2 存储形 start/end 与 v3 形 startSeq/endSeq 之间读到哪个用哪个）。
+fn remap_v3_row_refs(row: &mut serde_json::Value, map: &HashMap<u64, u64>) {
+    let one = |v: Option<u64>| -> Option<u64> { v.and_then(|s| map.get(&s).copied()) };
+    let ty = row.get("type").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+    match ty.as_str() {
+        "command/done" => {
+            if let Some(seq) = one(row.pointer("/data/sourceEventSeq").and_then(|v| v.as_u64())) {
+                row["data"]["sourceEventSeq"] = serde_json::json!(seq);
+            }
+        }
+        "compaction/summary" | "compaction/prune" => {
+            let start = one(row.pointer("/data/shadowedRange/start").and_then(|v| v.as_u64()));
+            let end = one(row.pointer("/data/shadowedRange/end").and_then(|v| v.as_u64()));
+            if let (Some(s), Some(e)) = (start, end) {
+                row["data"]["shadowedRange"] = serde_json::json!({"start": s, "end": e});
+            }
+            if let Some(seqs) = row.pointer("/data/shadowedSeqs").and_then(|v| v.as_array()).cloned() {
+                let mapped: Vec<u64> = seqs
+                    .iter()
+                    .filter_map(|s| s.as_u64())
+                    .filter_map(|s| map.get(&s).copied())
+                    .collect();
+                row["data"]["shadowedSeqs"] = serde_json::json!(mapped);
+            }
+        }
+        "session/title" | "session/title-llm-request" => {
+            if let Some(seqs) = row.pointer("/data/messageSeqs").and_then(|v| v.as_array()).cloned() {
+                let mapped: Vec<u64> = seqs
+                    .iter()
+                    .filter_map(|s| s.as_u64())
+                    .filter_map(|s| map.get(&s).copied())
+                    .collect();
+                row["data"]["messageSeqs"] = serde_json::json!(mapped);
+            }
+        }
+        _ => {}
+    }
+    if let Some(seqs) = row.get("sourceEventSeqs").and_then(|v| v.as_array()).cloned() {
+        let mapped: Vec<u64> = seqs
+            .iter()
+            .filter_map(|s| s.as_u64())
+            .filter_map(|s| map.get(&s).copied())
+            .collect();
+        row["sourceEventSeqs"] = serde_json::json!(mapped);
+    }
+    if let Some(op) = row.get_mut("surfaceOp") {
+        if op.get("op").and_then(|o| o.as_str()) == Some("replace") {
+            let start = op
+                .get("startSeq")
+                .or_else(|| op.get("start"))
+                .and_then(|v| v.as_u64());
+            let end = op
+                .get("endSeq")
+                .or_else(|| op.get("end"))
+                .and_then(|v| v.as_u64());
+            if let (Some(s), Some(e)) = (one(start), one(end)) {
+                *op = serde_json::json!({"op": "replace", "start": s, "end": e});
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+
+    /// 写一份最小 v2 日志（header + rows），返回路径。
+    fn write_v2(dir: &Path, rows: &[serde_json::Value]) -> PathBuf {
+        let session_dir = dir.join("s1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let header = serde_json::json!({
+            "type": "session", "version": 2, "id": "s1",
+            "createdAt": 1u64, "isSeeded": false,
+            "cwd": "/tmp/ws", "delegationDepth": 0,
+        });
+        let mut payload = serde_json::to_string(&header).unwrap() + "\n";
+        for row in rows {
+            payload += &(serde_json::to_string(row).unwrap() + "\n");
+        }
+        let file = session_dir.join("session.v2.jsonl.zstd");
+        std::fs::write(&file, zstd::stream::encode_all(payload.as_bytes(), 0).unwrap()).unwrap();
+        file
+    }
+
+    fn read_rows(file: &Path) -> Vec<serde_json::Value> {
+        let bytes = crate::read_decompressed(file).unwrap();
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// v2→v3：system 晋升（空 head + replace 链）、PTC 改名、seq 重映射、
+    /// request/header 去 system、源文件原样。
+    #[test]
+    fn v2_to_v3_promotes_system_renames_ptc_and_densifies() {
+        let dir = std::env::temp_dir().join(format!("dsh-v3-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = write_v2(
+            &dir,
+            &[
+                serde_json::json!({"type":"step/start","seq":0,"time":1,"data":{"turn":1,"step":1}}),
+                serde_json::json!({"type":"request/header","seq":1,"time":2,"data":{"header":{"config":{"provider":"p","model":"m"},"system":"Prompt v1","tools":[]},"reason":"initial"}}),
+                serde_json::json!({"type":"tool/code-dispatch","seq":2,"time":3,"data":{"turn":1,"step":1}}),
+                serde_json::json!({"type":"session/title","seq":3,"time":4,"data":{"title":"t","messageSeqs":[2]}}),
+            ],
+        );
+        let before = std::fs::read(&source).unwrap();
+        let id = SessionId::new("s1");
+
+        let target = migrate_v2_to_v3(&source, &id).unwrap();
+
+        assert_eq!(target.file_name().unwrap(), "session.v3.jsonl.zstd");
+        assert_eq!(std::fs::read(&source).unwrap(), before, "source bytes must not change");
+        let rows = read_rows(&target);
+        let header = &rows[0];
+        assert_eq!(header["version"], 3);
+
+        // rows[0] 是 header；事件行序：step/start(0) → 空 head(1, append)
+        // → system v1(2, replace head) → request/header(3, 无 system、无空
+        // tools) → tool/ptc-dispatch(4) → session/title(5, messageSeqs 重映射 2→4)
+        assert_eq!(rows[1]["type"], "step/start");
+        assert_eq!(rows[2]["type"], "system/message");
+        assert_eq!(rows[2]["surfaceOp"], "append");
+        assert_eq!(rows[2]["data"]["message"]["content"], serde_json::json!([]));
+        assert_eq!(rows[3]["type"], "system/message");
+        assert_eq!(rows[3]["data"]["message"]["content"][0]["text"], "Prompt v1");
+        assert_eq!(
+            rows[3]["surfaceOp"],
+            serde_json::json!({"op": "replace", "startSeq": 1, "endSeq": 1})
+        );
+        assert_eq!(rows[3]["sourceEventSeqs"], serde_json::json!([1]));
+        assert!(rows[3]["data"]["message"]["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("v2-to-v3-system-"));
+        assert_eq!(rows[4]["type"], "request/header");
+        assert!(rows[4]["data"]["header"].get("system").is_none());
+        assert!(rows[4]["data"]["header"].get("tools").is_none());
+        assert_eq!(rows[5]["type"], "tool/ptc-dispatch");
+        assert_eq!(rows[6]["type"], "session/title");
+        assert_eq!(rows[6]["data"]["messageSeqs"], serde_json::json!([4]));
+        for (index, row) in rows.iter().enumerate().skip(1) {
+            assert_eq!(row["seq"], index - 1, "dense seqs from 0");
+        }
+
+        // 二次迁移拒绝（已是 v3）
+        assert!(migrate_v2_to_v3(&target, &id).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 未知必读类型拒绝迁移（fail-closed）。
+    #[test]
+    fn v2_to_v3_refuses_unknown_required_events() {
+        let dir = std::env::temp_dir().join(format!("dsh-v3-ref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = write_v2(
+            &dir,
+            &[serde_json::json!({
+                "type": "brand-new/thing", "seq": 0, "time": 1, "data": {}
+            })],
+        );
+        let id = SessionId::new("s1");
+        assert!(migrate_v2_to_v3(&source, &id).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

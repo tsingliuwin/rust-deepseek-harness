@@ -1,7 +1,7 @@
 //! dsh-persist — 与 web 版 dsh 完全共享的会话持久化。
 //!
 //! 磁盘布局（web `session-persistence-jsonl` 同款，0.1.3-alpha.1 起 v2）：
-//! `{root}/--{projectKey(cwd)}--/{session-id}/session.v2.jsonl.zstd`
+//! `{root}/--{projectKey(cwd)}--/{session-id}/session.v3.jsonl.zstd`
 //! - 首行 header：`{"type":"session","version":2,"id",…,"isSeeded","cwd","delegationDepth"}`
 //! - 事件行信封：`{"type":"<event>","seq":N,"time":ms,"data":{…}}`
 //!   （surfaceOp/sourceEventSeqs 是信封层成员；assistant 流内嵌在结算行
@@ -17,7 +17,7 @@ mod v2;
 pub use attachments::{attachments_root_from_sessions_root, file_leaf_name, AttachmentStore};
 
 use dsh_llm::{
-    CallId, ContentBlock, FileAttachmentRef, Message, MessageId, MessageSource, SessionId,
+    CallId, ContentBlock, FileAttachmentRef, Message, MessageId, MessageSource, Role, SessionId,
 };
 use dsh_session::{EpochHeader, HeaderReason, Session, SessionEvent};
 use std::fs::{self, File};
@@ -476,7 +476,7 @@ impl SessionRecorder {
 
     /// 追加一个事件（v2 信封行）。
     ///
-    /// - 写打开旧代（v0/v1）先整档迁移到 `session.v2.jsonl.zstd`（上游
+    /// - 写打开旧代级联迁移（v0/v1→v2→v3）到 `session.v3.jsonl.zstd`（上游
     ///   `ensureCurrentLog` 语义）；迁移 fail-closed 时整个追加失败。
     /// - `assistant/chunk` 不再落行：缓冲进进行中的 attempt，结算
     ///   （`assistant/message`）时压缩嵌入 `data.stream`。
@@ -492,16 +492,21 @@ impl SessionRecorder {
                 self.session_file(id, cwd)
             }
         };
-        // 写打开旧代 → 迁移（源文件保持原样；此后追加全在 v2）
-        if v2::header_version(&v2::read_header(&file).unwrap_or_default())
-            < v2::SESSION_FORMAT_VERSION
+        // 写打开旧代 → 级联迁移（v0/v1 先到 v2，再统一 v2→v3；源文件保持
+        // 原样；此后追加全在当前代）——上游 `ensureCurrentLog` 语义
         {
-            file = v2::migrate_to_v2(&file, id)?;
-            self.resolved
-                .lock()
-                .unwrap()
-                .insert(id.as_str().to_string(), file.clone());
-            self.seqs.lock().unwrap().remove(id.as_str());
+            let version = v2::header_version(&v2::read_header(&file).unwrap_or_default());
+            if version < v2::SESSION_FORMAT_VERSION {
+                if version < 2 {
+                    file = v2::migrate_to_v2(&file, id)?;
+                }
+                file = v2::migrate_v2_to_v3(&file, id)?;
+                self.resolved
+                    .lock()
+                    .unwrap()
+                    .insert(id.as_str().to_string(), file.clone());
+                self.seqs.lock().unwrap().remove(id.as_str());
+            }
         }
         // 已存在但解不出内容（非空文件）：拒绝追加（可能是不认识的编码/半写状态）
         if !self.resolved.lock().unwrap().contains_key(id.as_str())
@@ -1246,14 +1251,45 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
                 .unwrap_or(HeaderReason::Change);
             Some(SessionEvent::RequestHeader { header, reason })
         }
+        // v3 system prompt 面节点（上游 emitSystem 形：固定 plugin source，
+        // 信封 surfaceOp append 或 {op:'replace',startSeq,endSeq} 精确替换 head）
+        "system/message" => {
+            let d = data?;
+            let m = d.get("message")?;
+            let content = blocks_from_web(m.get("content"));
+            let source = m.get("source");
+            let plugin = source
+                .and_then(|s| s.get("plugin"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("@deepseek-ai/dsh-system-prompt")
+                .to_string();
+            let msg = Message::with_id(
+                MessageId(m.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string()),
+                Role::System,
+                content,
+                MessageSource::Plugin { plugin, form: None, summary: None, sections: None },
+            );
+            let replace = v.get("surfaceOp").and_then(|op| {
+                if op.get("op").and_then(|o| o.as_str()) == Some("replace") {
+                    op.get("startSeq").and_then(|s| s.as_u64())
+                } else {
+                    None
+                }
+            });
+            Some(SessionEvent::SystemMessage {
+                turn: num(Some(d), "turn"),
+                step: num(Some(d), "step"),
+                message: msg,
+                replace,
+            })
+        }
         _ => None,
     }
 }
 
-/// 本构建理解的事件词汇全集（上游 `KNOWN_SESSION_EVENT_TYPES`，0.1.3-alpha.1
-/// 抄定：与 alpha.5 的 51 项相比唯一变化是 `assistant/chunk` →
-/// `assistant/attempt` 替换；rustdsh 读侧两类都保留——`assistant/chunk`
-/// 是 v0 旧代日志的合法行，`assistant/attempt` 是 v2 新行）。
+/// 本构建理解的事件词汇全集（上游 `KNOWN_SESSION_EVENT_TYPES`，0.1.5-alpha.1
+/// 对齐：新增 `system/message`（v3 system prompt 面节点）与 PTC 改名后的
+/// `tool/ptc-dispatch*`；v2 的 `tool/code-dispatch*` 保留——读旧代日志合法）。
 ///
 /// 持久化读取路径按 [`SessionEvent.ignorable`] 契约分类未知类型：不在集合内
 /// 且未标 `ignorable` 的事件——多半是更新版本 harness 写的——拒绝解释整份
@@ -1295,6 +1331,7 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "step/start",
     "subagent/descriptor",
     "subagent/model-selection-policy",
+    "system/message",
     "team/member",
     "team/message/delivered",
     "team/message/queued",
@@ -1307,6 +1344,8 @@ pub const KNOWN_SESSION_EVENT_TYPES: &[&str] = &[
     "tool/call",
     "tool/code-dispatch",
     "tool/code-dispatch-start",
+    "tool/ptc-dispatch",
+    "tool/ptc-dispatch-start",
     "tool/result",
     "turn/end",
     "turn/start",
@@ -1542,13 +1581,61 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         // 请求纪元（web request/header：config + 实际下发的 system/tools +
         // 变更原因）——审计「模型实际看到什么」的唯一凭据，必须落盘；
         // 首次 Initial、此后仅变更时追加，体量有界
-        SessionEvent::RequestHeader { header, reason } => Some(row(
-            "request/header",
-            serde_json::json!({
-                "header": serde_json::to_value(header).unwrap_or(serde_json::Value::Null),
-                "reason": serde_json::to_value(reason).unwrap_or(serde_json::Value::Null),
-            }),
-        )),
+        SessionEvent::RequestHeader { header, reason } => {
+            // v3：system prompt 经 system/message 行持久化，request/header 不再
+            // 携带 system；canonical 同时省略空 tools / 空 adapterDefaults
+            // （上游 canonicalizeTransformedEvent）。
+            let mut header_value =
+                serde_json::to_value(header).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = header_value.as_object_mut() {
+                obj.remove("system");
+                if obj.get("tools").and_then(|t| t.as_array()).is_some_and(|a| a.is_empty()) {
+                    obj.remove("tools");
+                }
+                if obj
+                    .get("adapterDefaults")
+                    .and_then(|a| a.as_object())
+                    .is_some_and(|o| o.is_empty())
+                {
+                    obj.remove("adapterDefaults");
+                }
+            }
+            Some(row(
+                "request/header",
+                serde_json::json!({
+                    "header": header_value,
+                    "reason": serde_json::to_value(reason).unwrap_or(serde_json::Value::Null),
+                }),
+            ))
+        }
+        SessionEvent::SystemMessage { turn, step, message, replace } => {
+            // v3 system prompt 面节点（上游 emitSystem）：固定 role=system 的
+            // plugin source；replace 精确替换 head 并携带 sourceEventSeqs
+            // （canonical 富形 startSeq/endSeq）。
+            let mut envelope = row(
+                "system/message",
+                serde_json::json!({
+                    "turn": turn,
+                    "step": step,
+                    "message": {
+                        "id": message.id.0,
+                        "role": "system",
+                        "source": serde_json::to_value(&message.source)
+                            .unwrap_or(serde_json::json!({"kind": "plugin", "plugin": "@deepseek-ai/dsh-system-prompt"})),
+                        "content": blocks_to_web(&message.content),
+                    },
+                }),
+            );
+            match replace {
+                None => envelope["surfaceOp"] = serde_json::json!("append"),
+                Some(seq) => {
+                    envelope["surfaceOp"] =
+                        serde_json::json!({"op": "replace", "startSeq": seq, "endSeq": seq});
+                    envelope["sourceEventSeqs"] = serde_json::json!([seq]);
+                }
+            }
+            Some(envelope)
+        }
         _ => None,
     }
 }
@@ -1869,23 +1956,22 @@ mod tests {
         )
         .unwrap();
 
-        // 落盘行形：request/header + header.system + reason=initial
+        // 落盘行形：request/header（v3 起无 header.system——system prompt 经
+        // system/message 行持久化）+ reason=initial
         let file = rec.session_file(&id, "/tmp/ws");
         let raw_bytes = zstd::stream::decode_all(std::fs::File::open(&file).unwrap()).unwrap();
         let raw = String::from_utf8(raw_bytes).unwrap();
         assert!(raw.contains("\"request/header\""), "{raw}");
-        assert!(raw.contains("You are DeepSeek Harness (Rust)."), "{raw}");
+        assert!(!raw.contains("You are DeepSeek Harness (Rust)."), "{raw}");
         assert!(raw.contains("\"initial\""), "{raw}");
+        assert!(raw.contains("\"version\":3"), "{raw}");
 
-        // 读回：typed 事件还原
+        // 读回：typed 事件还原（header 无 system）
         let (session, _) = rec.load(&id, Some("/tmp/ws")).unwrap();
         let restored = session
             .request_header()
             .expect("header should survive load");
-        assert_eq!(
-            restored.system.as_deref(),
-            Some("You are DeepSeek Harness (Rust).")
-        );
+        assert_eq!(restored.system, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2044,12 +2130,12 @@ mod tests {
             .join("sessions")
             .join(project_key("/tmp/ws-a"))
             .join(id.as_str())
-            .join("session.v2.jsonl.zstd");
+            .join("session.v3.jsonl.zstd");
         let b_file = dir
             .join("sessions")
             .join(project_key("/tmp/ws-b"))
             .join(id.as_str())
-            .join("session.v2.jsonl.zstd");
+            .join("session.v3.jsonl.zstd");
         assert!(a_file.exists());
         assert!(!b_file.exists(), "cross-bucket copy created");
         let (session, _) = rec.load(&id, None).unwrap();

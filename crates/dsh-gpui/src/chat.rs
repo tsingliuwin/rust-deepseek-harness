@@ -132,6 +132,24 @@ fn attachment_image_object_path(
     Some(root.join("objects").join(&hex[..2]).join(hex))
 }
 
+/// composer 下方统计 pill 的数据（web StatsPills 的 WindowStats + token
+/// 投影聚合；rustdsh 数值为实时窗口累计）。
+#[derive(Clone, Default)]
+pub(crate) struct SessionStats {
+    pub(crate) turns: u64,
+    pub(crate) steps: u64,
+    pub(crate) llm_ms: u64,
+    pub(crate) tool_ms: u64,
+    /// TTFT 平均（毫秒；None = 无计时步）。
+    pub(crate) ttft_avg_ms: Option<u64>,
+    /// 输出速度 tok/s（None = 无解码窗口）。
+    pub(crate) tps: Option<f64>,
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cache_read: u64,
+    pub(crate) cache_write: u64,
+}
+
 pub(crate) struct ChatView {
     /// 只读：会话日志回读（工具结果文本）
     agent: Arc<dsh_agent_loop::ReactLoopAgent>,
@@ -193,6 +211,12 @@ pub(crate) struct ChatView {
     stats_output_tokens: u64,
     stats_cache_read: u64,
     stats_cache_write: u64,
+    /// 会话级 TTFT 累计与计时步数（web sessionStats 的 ttftMs/ttftSteps）。
+    session_ttft_sum_ms: u64,
+    session_ttft_steps: u64,
+    /// 会话级纯解码时长与同窗口输出 token（TPS 分母；近似 = llm − ttft）。
+    session_decode_ms: u64,
+    session_decode_tokens: u64,
     /// 轮次统计药丸的路由标签（provider/model；AppView 切路由时同步）
     pub(crate) route_label: String,
     /// display_path 的相对化基准（随 AppView.current_cwd 同步）
@@ -248,6 +272,10 @@ impl ChatView {
             stats_output_tokens: 0,
             stats_cache_read: 0,
             stats_cache_write: 0,
+            session_ttft_sum_ms: 0,
+            session_ttft_steps: 0,
+            session_decode_ms: 0,
+            session_decode_tokens: 0,
             route_label,
             cwd: String::new(),
             transcript_view,
@@ -388,6 +416,31 @@ impl ChatView {
         )
     }
 
+    /// composer 下方统计 pill 的数据（web StatsPills：窗口 fold fallback 语义，
+    /// 持久投影无镜像——数值为实时窗口累计）。
+    pub(crate) fn session_stats(&self) -> SessionStats {
+        SessionStats {
+            turns: self.stats_turns,
+            steps: self.stats_steps,
+            llm_ms: self.session_llm_time.as_millis() as u64,
+            tool_ms: self.session_tool_time.as_millis() as u64,
+            ttft_avg_ms: if self.session_ttft_steps > 0 {
+                Some(self.session_ttft_sum_ms / self.session_ttft_steps)
+            } else {
+                None
+            },
+            tps: if self.session_decode_ms > 0 {
+                Some(self.session_decode_tokens as f64 / (self.session_decode_ms as f64 / 1000.0))
+            } else {
+                None
+            },
+            input_tokens: self.stats_input_tokens,
+            output_tokens: self.stats_output_tokens,
+            cache_read: self.stats_cache_read,
+            cache_write: self.stats_cache_write,
+        }
+    }
+
     pub(crate) fn stats_steps(&self) -> u64 {
         self.stats_steps
     }
@@ -416,6 +469,10 @@ impl ChatView {
         self.stats_output_tokens = 0;
         self.stats_cache_read = 0;
         self.stats_cache_write = 0;
+        self.session_ttft_sum_ms = 0;
+        self.session_ttft_steps = 0;
+        self.session_decode_ms = 0;
+        self.session_decode_tokens = 0;
         self.session_llm_time = Duration::ZERO;
         self.session_tool_time = Duration::ZERO;
         self.turn_tool_time = Duration::ZERO;
@@ -505,6 +562,36 @@ impl ChatView {
                     }
                 }
                 SessionEvent::ToolCall { .. } => { self.stats_tools += 1; }
+                // v3 system prompt 面节点（上游 SystemPromptRow）：折叠行
+                // 「系统提示词」/「系统提示词更新」（replace 行），展开体为
+                // 提示词全文；空内容（dormant head）不显示。
+                SessionEvent::SystemMessage { message, replace, .. } => {
+                    let text: String = message
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() {
+                        continue;
+                    }
+                    self.entries.push(ChatEntry {
+                        role: Role::Context,
+                        blocks: vec![MsgBlock::Text(text)],
+                        done: true,
+                        elapsed: None, usage: None, ended_at_ms: None,
+                        turn: cur_turn,
+                        context: Some(crate::ContextInfo {
+                            title: if replace.is_some() { "系统提示词更新" } else { "系统提示词" },
+                            label: None,
+                            summary: None,
+                        }),
+                        open: false,
+                    });
+                }
                 SessionEvent::UserMessage(m) => {
                     let text: String = m
                         .content
@@ -772,6 +859,25 @@ open: false,
                 }
                 usage.route = self.route_label.clone();
                 let has_usage = usage.total_tokens() > 0;
+                // 结转本轮 LLM/工具耗时（web sessionStats 的 llmMs/toolMs）
+                if let Some(total) = elapsed {
+                    self.session_llm_time += total.saturating_sub(self.turn_tool_time);
+                    self.session_tool_time += self.turn_tool_time;
+                }
+                // 结转 TTFT 与纯解码窗口（web sessionStats 的 ttftMs/ttftSteps、
+                // decodeMs/decodeTokens；rustdsh 无独立解码计时，以 llm − ttft
+                // 近似——两侧都计到才进均值/速度）
+                if let Some(ttft) = usage.ttft_ms {
+                    self.session_ttft_sum_ms += ttft;
+                    self.session_ttft_steps += 1;
+                    if let Some(total) = elapsed {
+                        let llm = total.saturating_sub(self.turn_tool_time).as_millis() as u64;
+                        if llm > ttft {
+                            self.session_decode_ms += llm - ttft;
+                            self.session_decode_tokens += usage.output_tokens;
+                        }
+                    }
+                }
                 if let Some(e) = self.entries.last_mut() {
                     e.done = true;
                     e.elapsed = elapsed;
@@ -779,11 +885,6 @@ open: false,
                         e.usage = Some(usage);
                     }
                     e.ended_at_ms = Some(now_ms());
-                }
-                // 结转本轮 LLM/工具耗时（web sessionStats 的 llmMs/toolMs）
-                if let Some(total) = elapsed {
-                    self.session_llm_time += total.saturating_sub(self.turn_tool_time);
-                    self.session_tool_time += self.turn_tool_time;
                 }
                 self.turn_started_at = None;
                 self.turn_open = None;

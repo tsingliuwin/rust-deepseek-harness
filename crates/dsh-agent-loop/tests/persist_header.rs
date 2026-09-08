@@ -78,22 +78,37 @@ async fn turn_persists_request_header() {
     agent.followup("hi");
     agent.when_idle().await;
 
-    // 内存 session 里有 header（发射侧存在）
+    // 内存 session 里有 header——但 v3 起盘上 request/header 不再携带 system
+    //（system prompt 经 system/message 行持久化），内存 header 的 system 也在
+    // build_request 落盘口径下恒 None
     let logged = {
         let s = agent.session();
         let s = s.lock().unwrap();
         s.request_header().map(|h| h.system.clone()).flatten()
     };
-    assert_eq!(logged.as_deref(), Some("You are a concise assistant."));
+    assert_eq!(logged, None, "v3 request/header carries no system field");
 
-    // 盘上也有（持久侧不再丢弃），且 system 内容完整
+    // 盘上：request/header 存在且无 system；system prompt 落在 system/message
+    // 行（首个 surface head，append 形）
     let (loaded, _) = recorder
         .load(&dsh_llm::SessionId::new("session-header-e2e"), Some("/tmp/ws"))
         .expect("session should load");
     let on_disk = loaded.entries().iter().any(|e| matches!(e.event, SessionEvent::RequestHeader { .. }));
     assert!(on_disk, "request/header must be persisted; entries: {:?}", loaded.entries().iter().map(|e| format!("{:?}", e.event).chars().take(60).collect::<String>()).collect::<Vec<_>>());
     let sys = loaded.request_header().and_then(|h| h.system.clone());
-    assert_eq!(sys.as_deref(), Some("You are a concise assistant."));
+    assert_eq!(sys, None, "v3 request/header carries no system field on disk");
+    let head = loaded.entries().iter().find_map(|e| match &e.event {
+        SessionEvent::SystemMessage { message, replace, .. } => {
+            Some((message.content.first().cloned(), *replace))
+        }
+        _ => None,
+    });
+    match head {
+        Some((Some(dsh_llm::ContentBlock::Text { text }), None)) => {
+            assert_eq!(text, "You are a concise assistant.");
+        }
+        other => panic!("expected append-form system head with prompt text, got {other:?}"),
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }

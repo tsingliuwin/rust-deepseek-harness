@@ -21,7 +21,7 @@ pub use dsh_agent::InboxTarget;
 use dsh_cordis::EventBus;
 use dsh_llm::{
     AbortSignal, BlockAssembler, CallId, ContentBlock, FinishReason, GenerateOptions, LlmCallConfig,
-    LlmRuntime, Message, SessionId, StreamChunk,
+    LlmRuntime, Message, MessageSource, Role, SessionId, StreamChunk,
 };
 use dsh_session::SessionEntry;
 use dsh_session::{EpochHeader, HeaderReason, Session, SessionEvent, TurnEndReason};
@@ -149,6 +149,26 @@ fn route_label(provider: &str, model: &str, other_provider: &str) -> String {
     if provider == other_provider { model.to_string() } else { format!("{provider}/{model}") }
 }
 
+/// v3 system prompt 面节点消息（上游 createSystemMessage(text, SOURCE)）：
+/// role system、固定 plugin source；空 prompt 落空 content（dormant head）。
+fn system_prompt_message(rendered: &str) -> Message {
+    let content = if rendered.is_empty() {
+        Vec::new()
+    } else {
+        vec![ContentBlock::text(rendered)]
+    };
+    Message::new(
+        Role::System,
+        content,
+        MessageSource::Plugin {
+            plugin: "@deepseek-ai/dsh-system-prompt".into(),
+            form: None,
+            summary: None,
+            sections: None,
+        },
+    )
+}
+
 /// 构造模型切换公告消息（上游 `modelSwitchNotice`）：user/plugin
 /// `model-selection` 形态，notice form 携带摘要。
 fn model_switch_notice_message(previous: (&str, &str), selected: (&str, &str)) -> Message {
@@ -199,6 +219,9 @@ pub struct ReactLoopAgent {
     /// `turnBoundary` 注册的撤销柄（注册随 agent 存活，上游 rode the fiber）。
     /// Mutex 使整体保持 Sync（Disposer 本身只是 Send）。
     _turn_boundary_registration: Mutex<Option<Disposer>>,
+    /// v3 system prompt 面节点 head：(日志 seq, 当前文本)。None = 本会话
+    /// 尚无 system/message 行（上游 SystemPromptProjection 的 head 跟踪）。
+    system_head: Mutex<Option<(u64, String)>>,
 }
 
 /// Side-channel observer for every appended session event.
@@ -232,6 +255,7 @@ impl ReactLoopAgent {
             ui_events: Mutex::new(None),
             on_event: Mutex::new(None),
             _turn_boundary_registration: Mutex::new(Some(turn_boundary_registration)),
+            system_head: Mutex::new(None),
         })
     }
 
@@ -247,8 +271,24 @@ impl ReactLoopAgent {
     }
 
     /// Replace the agent's session (session switching). The inbox is cleared.
+    /// The v3 system head is rebuilt from the log (last `system/message` row).
     pub fn set_session(&self, session: Session) {
         self.projections.forget_session(&self.session.lock().unwrap());
+        let head = session.entries().iter().rev().find_map(|e| match &e.event {
+            SessionEvent::SystemMessage { message, .. } => {
+                let text = message
+                    .content
+                    .first()
+                    .and_then(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                Some((e.seq, text))
+            }
+            _ => None,
+        });
+        *self.system_head.lock().unwrap() = head;
         *self.session.lock().unwrap() = session;
         self.inbox.lock().unwrap().clear();
     }
@@ -272,14 +312,16 @@ impl ReactLoopAgent {
     }
 
     /// Append one event to the session log and fan it out to the sink.
-    fn append_event(&self, event: SessionEvent) {
-        {
+    /// Returns the log seq the event took (0 基致密).
+    fn append_event(&self, event: SessionEvent) -> u64 {
+        let seq = {
             let mut s = self.session.lock().unwrap();
-            s.append(event.clone());
-        }
+            s.append(event.clone())
+        };
         if let Some(sink) = self.on_event.lock().unwrap().as_ref() {
             sink(event);
         }
+        seq
     }
 
     pub fn status(&self) -> AgentStatus {
@@ -533,6 +575,38 @@ impl ReactLoopAgent {
             }
 
             let assembly = self.assemble_prompt();
+            // 上游 agent.ts 落盘序：step/start → system commits → user 批。
+            self.append_event(SessionEvent::StepStart { turn, step });
+            // v3 system prompt 面节点：rustdsh 的 provider 路线走请求 system
+            // 参数（非 in-history），按上游 SystemPromptProjection 归一化语义
+            // ——无 head 则 append（空 prompt 也保留 head），变化则精确替换
+            // head（上游验证要求 replace 端点恰为当前 head）。
+            {
+                let rendered = assembly.system.clone();
+                let mut head = self.system_head.lock().unwrap();
+                match head.as_ref() {
+                    None => {
+                        let seq = self.append_event(SessionEvent::SystemMessage {
+                            turn,
+                            step,
+                            message: system_prompt_message(&rendered),
+                            replace: None,
+                        });
+                        *head = Some((seq, rendered));
+                    }
+                    Some((seq, text)) if *text != rendered => {
+                        let seq = *seq;
+                        let new_seq = self.append_event(SessionEvent::SystemMessage {
+                            turn,
+                            step,
+                            message: system_prompt_message(&rendered),
+                            replace: Some(seq),
+                        });
+                        *head = Some((new_seq, rendered));
+                    }
+                    _ => {}
+                }
+            }
             // 模型切换公告（上游 model-selection.ts pre-step 通知）：本步有新增
             // 消息且本轮路由与上一持久化 request/header 不同时，在消息批尾部追加
             // 一条公告；首次请求与 effort-only 变化不公告。公告随消息落盘并自然
@@ -559,7 +633,6 @@ impl ReactLoopAgent {
             for m in &messages {
                 self.append_event(SessionEvent::UserMessage(m.clone()));
             }
-            self.append_event(SessionEvent::StepStart { turn, step });
 
             let step_end = self.run_step(turn, step, &assembly, &signal).await;
 
@@ -811,9 +884,12 @@ impl ReactLoopAgent {
             }
         };
 
+        // v3：system prompt 经 system/message 行持久化，request/header 不再
+        // 携带 system 字段（上游 canonicalizeTransformedEvent 语义）；模型
+        // 请求本身仍走 options.system。
         let header = EpochHeader {
             config: config.clone(),
-            system: system.clone(),
+            system: None,
             tools: tools.clone(),
         };
         let (changed, reason) = {

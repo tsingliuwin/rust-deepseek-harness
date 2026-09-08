@@ -58,12 +58,12 @@ fn v2_new_session_header_and_filename() {
         .join("sessions")
         .join(dsh_persist::project_key("/tmp/ws"))
         .join(id.as_str())
-        .join("session.v2.jsonl.zstd");
-    assert!(file.exists(), "v2 代文件名必须落盘");
+        .join("session.v3.jsonl.zstd");
+    assert!(file.exists(), "v3 代文件名必须落盘");
 
     let rows = read_rows(&file);
     assert_eq!(rows[0]["type"], "session");
-    assert_eq!(rows[0]["version"], 2, "header version = 2");
+    assert_eq!(rows[0]["version"], 3, "header version = 3");
     assert_eq!(rows[0]["isSeeded"], false, "isSeeded 必填（rustdsh 恒 false）");
     assert!(rows[0].get("seedLength").is_none(), "seedLength 已退役");
 
@@ -116,7 +116,7 @@ fn v2_chunks_embed_into_settlement_stream() {
         .join("sessions")
         .join(dsh_persist::project_key("/tmp/ws"))
         .join(id.as_str())
-        .join("session.v2.jsonl.zstd");
+        .join("session.v3.jsonl.zstd");
     let rows = read_rows(&file);
     // 日志里没有 chunk 行
     assert!(
@@ -213,7 +213,7 @@ fn v2_failed_attempt_flushes_as_assistant_attempt() {
         .join("sessions")
         .join(dsh_persist::project_key("/tmp/ws"))
         .join(id.as_str())
-        .join("session.v2.jsonl.zstd");
+        .join("session.v3.jsonl.zstd");
     let rows = read_rows(&file);
     let attempt = rows.iter().find(|r| r["type"] == "assistant/attempt").expect("失败尝试必须落 assistant/attempt");
     assert_eq!(attempt["data"]["turn"], 1);
@@ -262,7 +262,7 @@ fn v2_tool_result_and_compaction_shapes() {
         .join("sessions")
         .join(dsh_persist::project_key("/tmp/ws"))
         .join(id.as_str())
-        .join("session.v2.jsonl.zstd");
+        .join("session.v3.jsonl.zstd");
     let rows = read_rows(&file);
     let tr = rows.iter().find(|r| r["type"] == "tool/result").unwrap();
     // v2 形：{turn, step, message:{id, role:'user', content, source}}
@@ -316,7 +316,8 @@ fn migration_upgrades_legacy_rustdsh_log() {
         .unwrap();
 
     let v2_file = log.parent().unwrap().join("session.v2.jsonl.zstd");
-    assert!(v2_file.exists(), "迁移产物必须发布到 session.v2.jsonl.zstd");
+    assert!(v2_file.exists(), "级联中间产物必须发布到 session.v2.jsonl.zstd");
+    assert!(log.parent().unwrap().join("session.v3.jsonl.zstd").exists(), "级联终产物必须发布到 session.v3.jsonl.zstd");
     // 源文件字节原封不动（上游：source vN artifact remains unchanged）
     assert_eq!(
         std::fs::read(&log).unwrap(),
@@ -483,9 +484,9 @@ fn load_refuses_future_format_version() {
         .join(dsh_persist::project_key("/tmp/ws"))
         .join(id_str);
     write_log(
-        &bucket.join("session.v3.jsonl.zstd"),
+        &bucket.join("session.v4.jsonl.zstd"),
         &[
-            json!({"type": "session", "version": 3, "id": id_str, "createdAt": 1, "isSeeded": false}),
+            json!({"type": "session", "version": 4, "id": id_str, "createdAt": 1, "isSeeded": false}),
             json!({"type": "user/message", "seq": 0, "time": 1, "data": {"content": [], "source": {"kind": "user"}, "role": "user", "id": "m"}}),
         ],
     );
@@ -524,7 +525,7 @@ fn projcache_stamps_v7_with_format_version() {
     .unwrap();
     assert_eq!(doc["version"], PROJCACHE_DOMAIN_VERSION);
     assert_eq!(doc["version"], 7);
-    assert_eq!(doc["record"]["identity"]["formatVersion"], 2, "v2 语义：identity 携带会话格式版本");
+    assert_eq!(doc["record"]["identity"]["formatVersion"], 3, "v3 语义：identity 携带会话格式版本");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -552,7 +553,7 @@ fn user_message_file_block_round_trips() {
         .join("sessions")
         .join(dsh_persist::project_key("/tmp/ws"))
         .join(id.as_str())
-        .join("session.v2.jsonl.zstd");
+        .join("session.v3.jsonl.zstd");
     let rows = read_rows(&file);
     let um = rows.iter().find(|r| r["type"] == "user/message").unwrap();
     // 附件块在前、文本在后（上游 sendSession content 顺序）

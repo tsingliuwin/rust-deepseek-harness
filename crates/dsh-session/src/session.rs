@@ -144,6 +144,18 @@ pub enum SessionEvent {
     /// 一次重试等待完成、下一次请求尝试开始前的持久迁移（web
     /// `llm/retry-started`）。
     LlmRetryStarted { retry_id: String, turn: u64, step: u64, retry: u32 },
+    /// `system/message`（v3）：system prompt 面节点。首个 surface 节点为
+    /// protected head；后续 prompt 变化在非 in-history 路线（rustdsh 的
+    /// provider 请求走 system 参数）下归一化替换 head（上游
+    /// SystemPromptProjection 语义）。
+    SystemMessage {
+        turn: u64,
+        step: u64,
+        message: dsh_llm::Message,
+        /// None = append；Some(seq) = 精确替换该 seq 的面节点（当前实现恒为
+        /// head，上游验证要求 replace 端点恰为当前 head）。
+        replace: Option<u64>,
+    },
 }
 
 /// A log entry: the event plus its monotonic sequence number.

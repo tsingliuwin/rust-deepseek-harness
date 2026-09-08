@@ -14,6 +14,14 @@ pub enum Role {
     Assistant,
 }
 
+/// 上游 `ContextSnapshotSection`：snapshot 形态 source 里的具名贡献段。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSnapshotSection {
+    pub name: String,
+    pub text: String,
+}
+
 /// Where a message came from.
 ///
 /// The reference keeps this a merge-extensible sum type; Rust holds it closed
@@ -23,8 +31,16 @@ pub enum Role {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum MessageSource {
     User,
+    /// 上游 `plugin: { kind: 'plugin'; plugin: string } & ContextFormed`：form 缺省
+    /// 为未声明上下文；`snapshot` 携带 sections、`notice` 携带 summary。
     Plugin {
         plugin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sections: Option<Vec<ContextSnapshotSection>>,
     },
     Model {
         provider: String,
@@ -117,7 +133,23 @@ impl Message {
         Self::new(
             Role::System,
             vec![ContentBlock::text(text)],
-            MessageSource::Plugin { plugin: plugin.to_string() },
+            MessageSource::Plugin { plugin: plugin.to_string(), form: None, summary: None, sections: None },
+        )
+    }
+
+    /// Create one identified user-role plugin-sourced message with full
+    /// `ContextFormed` fields (upstream `createUserMessage` with a plugin source).
+    pub fn user_plugin(
+        content: Vec<ContentBlock>,
+        plugin: &str,
+        form: Option<String>,
+        summary: Option<String>,
+        sections: Option<Vec<ContextSnapshotSection>>,
+    ) -> Self {
+        Self::new(
+            Role::User,
+            content,
+            MessageSource::Plugin { plugin: plugin.to_string(), form, summary, sections },
         )
     }
 
@@ -173,5 +205,45 @@ pub fn bound_context_summary(summary: &str) -> String {
         let mut out: String = summary.chars().take(CONTEXT_SUMMARY_MAX_CHARS - 1).collect();
         out.push('…');
         out
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 0.1.3-alpha.2 model-switch notice 落盘形：plugin source 携带 form/summary
+    /// （上游 `plugin & ContextFormed`），缺省字段不序列化；旧形仅 plugin 读回兼容。
+    #[test]
+    fn plugin_source_notice_serializes_form_and_summary() {
+        let source = MessageSource::Plugin {
+            plugin: "model-selection".into(),
+            form: Some("notice".into()),
+            summary: Some("deepseek-v4-flash → deepseek-v4-pro".into()),
+            sections: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&source).unwrap(),
+            serde_json::json!({
+                "kind": "plugin",
+                "plugin": "model-selection",
+                "form": "notice",
+                "summary": "deepseek-v4-flash → deepseek-v4-pro",
+            })
+        );
+        let bare: MessageSource =
+            serde_json::from_value(serde_json::json!({ "kind": "plugin", "plugin": "x" })).unwrap();
+        assert_eq!(
+            bare,
+            MessageSource::Plugin { plugin: "x".into(), form: None, summary: None, sections: None }
+        );
+    }
+
+    #[test]
+    fn bound_context_summary_ellipsizes_at_120() {
+        let long = "a".repeat(200);
+        let out = bound_context_summary(&long);
+        assert_eq!(out.chars().count(), 120);
+        assert!(out.ends_with('…'));
+        assert_eq!(bound_context_summary("ok"), "ok");
     }
 }

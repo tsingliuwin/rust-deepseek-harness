@@ -1,9 +1,9 @@
 # 上游更新分析法（模式 A 详细步骤）
 
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
-> **当前同步点：dsh-v0.1.3-alpha.1（d347e70390）**——2026-09-06 同步。此前 76fda729（0.1.2-rc.1，对 alpha.5 零功能变更）。
-> 0.1.3-alpha.1 主面：会话日志格式 v2（breaking）+ 通用文件附件 + 可点击链接语言 + skill 芯片（rustdsh 面外）。
-> **最近检查：2026-09-07（定时轮 #2）**——上游 pull 后 HEAD 仍 d347e70390（= master HEAD = 发布点），五段 diff 全空，零功能变更，无动作。
+> **当前同步点：dsh-v0.1.3-alpha.2（82a5fd61a7）**——2026-09-08 同步。此前 d347e70390（0.1.3-alpha.1，2026-09-06）。
+> 0.1.3-alpha.2 主面：system-prompt 序位重排 + persona 前缀/后缀拆分（e28862db57+40792330c0）、模型切换公告（48cc1cf1d6，agent/pre-step 追加 plugin/model-selection notice）、会话流式迁移重构（面外，格式不变）；master HEAD c389f96bf3 相对发布点另有 ~20 提交（Sidebar 文件树 tab/docking 引擎/deliverables 文件打开）为下轮候选。
+> **最近检查：2026-09-08（定时轮 #3，同步轮）**——上游发布 0.1.3-alpha.2，按面内两项实施；其余判面外固化（见判定表）。
 
 ## 1. 一键差异分析
 
@@ -39,6 +39,22 @@
 | QueueDock/Trajectory 文件计数/WorkspaceBrowser reveal/goal 命令芯片 | 面外 | rustdsh 无对应 UI 面 |
 | token-meter（sourceEventSeqs → 内嵌 stream 重算）| 面外 | rustdsh 无 token-meter 镜像（TurnUsage 走实时 usage） |
 | 链接语言（--dsw-alias-link + LinkIcon + hover 点状下划线）| 半面内 | 色值已同（deepseek-400/500）；LinkIcon 内联图标与逐 span hover 态 vendor TextView 不可复刻（偏差） |
+| system-prompt 序位表（alpha.2：HARNESS_SOURCE 10000 / WEB_SURFACE 10100，persona 拆 prefix(0)/suffix(10200)）| **面内**（已对齐）| dsh-system-prompt SECTION_ORDERS 逐值镜像；rustdsh 无 persona 配置消费面，Config.persona→personaPrefix/Suffix 拆分不落码 |
+| 模型切换公告（48cc1cf1d6：pre-step 比较上一 request/header，路由变化在消息批尾追加 user/plugin model-selection notice，notice form + summary；request/header reason=change 由既有 EpochHeader 比较自然成立）| **面内**（已实施）| dsh-agent-loop run_turn 消息批 + MessageSource::Plugin 扩 form/summary/sections（上游 plugin & ContextFormed）|
+| MessageSource::Plugin 形扩展（plugin & ContextFormed：form instructions/catalog/snapshot(sections)/notice(summary)/relay/recall 可选字段）| **面内**（已实施）| serde default + skip None 向后兼容旧形；新形落盘与上游逐字节对齐 |
+| open-in-app（9292dd8a2d feat workspace：web UI 经 URL scheme 唤起本地编辑器/终端/git 客户端 + 30 个 app.* 词汇 + ui-primitives Menu 依附改动）| 面外 | web→本地桥接功能；rustdsh 即本地应用，无对应面 |
+| queue.sending 词汇（a3ccbd4d99 队列提交发送中态）| 面外 | QueueDock/排队系统 rustdsh 无对应面（既有判定）|
+| chat 滚动 fix ×2（fa6bf62a98 settle pinned scroll before layout growth、9ef426d729 near-floor gestures pending）| 面外 | DOM 滚动/布局增长异步性专属；GPUI 列表滚动语义不同 |
+| conversation-nodes perf（84c11c7243 avoid replaying settled assistant streams）+ llm stream readers（isTokenDelta/isVisibleChunk/assistantStreamFirstTokenTime 导出）| 面外 | web 重放优化；readers 无 rustdsh 消费面（session-stats/token-meter 无镜像）|
+| resume 系列（6ad01cbd8d 重复 system prompt、477ff9d5e3 resumed series boundaries 等）| 面外 | rustdsh system 经 request/header 字段下发，无历史消息注入面，重复问题不存在 |
+| connection 层（1bd26370cc handshake recovery、1e04ff35 retry factors）| 面外 | rustdsh 无 connection 层（本地直连）|
+| subprocess native runner 批量（~80 提交：Windows Job/句柄/隔离/生命周期）| 面外 | host 进程管理内部实现，不动磁盘格式与工具可观察行为 |
+| session 流式迁移（a84a8da9e1 stages、ec2f63dbdb publication、46196d6f95 v0→v2 streaming、migration-verifier Worker 校验）| 面外 | 内部性能重构，磁盘格式逐字不变（README 物理编码段仅加流式细节）；撕裂尾帧部分恢复语义 rustdsh 逐帧独立解压天然等价（未确认批次本就不可靠）|
+| StateDot 第五态 idle/unloading 动画（452b2a816a + a6ef8dc97a）| 面外 | 消费面是 ui-settings-plugin-inventory 插件状态点，rustdsh 无插件库存页；state_dot 按调用方传色无枚举可扩 |
+| Switch/Pill/Tag 胶囊原语重构（452b2a816a、c279350e03）| 面外 | rustdsh 无这三原语的镜像 |
+| str_replace_editor 默认工具移除（36a4665144、965adbb5cf）| 面外 | rustdsh 工具集本就无 str_replace_editor |
+| ui-agent-preset / ui-settings-plugin-inventory / ui-settings-plugins / SubagentModelSelectionCard / ui-trajectory / ui-skill | 面外 | rustdsh 无对应 UI 面（既有判定）|
+| token-meter / session-stats / telemetry-otel / session-controller / api contract | 面外 | host 统计与遥测内部面，无镜像 |
 
 ## 3. 实施顺序
 
@@ -60,3 +76,9 @@
 - v2 写形：迁移对 rustdsh 旧形合成 `legacy-message:{sid}:{seq}` 消息 id 与 `{kind:"model",provider:"legacy",model:"legacy"}` source（上游迁移只认自家旧形）；compaction legacy `{beforeSeq,summary}` → 富形时 shadowedTokenCount=0、provider/model="legacy"。
 - 链接/内联码样式：TextView 无逐 span hover 态 → 链接保持常显下划线（上游默认无下划线 + hover 点状）；LinkIcon 前置图标不可复刻（文本流无内联图标）；inline code 0.5px 描边不可复刻，底色已对齐 neutral-50/neutral-800。
 - turn-metrics contract 本区间净零（仅 import 换源）。
+- open-in-app（0.1.3-alpha.2）：web→本地应用 URL-scheme 桥接，rustdsh 本体即本地应用，无对应面；30 个 app.* 词汇随之不落。
+- MessageSource::Plugin 旧形消费（Message::system 等仅 plugin 字段）不变；新形 form/summary/sections 仅在 producer 显式供给时落盘（当前唯 model-selection notice）。
+- 撕裂尾帧：上游部分解码恢复完整记录+写侧截断重写；rustdsh 逐帧独立解压，损坏尾帧整帧不返回——两者在"未确认 durable 批次不交付"语义上等价，边缘崩溃场景不另行实施。
+- StateDot idle/unloading 五态目录：消费面（插件库存页）rustdsh 无镜像；state_dot 色值由调用方供给，不扩枚举。
+- 模型切换公告显示形态：上游在转录里渲染为折叠摘要行（notice summary 骑行）；rustdsh 无 ContextInjectionRow 折叠行组件，公告按既有用户消息渲染面显示（互通面已 1:1，视觉形态偏差）。
+- dsh-shell 端到端 cmd 编码测试（cmd_non_utf8_stderr_is_readable）弱化为编码无关断言：cmd 子进程输出字节随父链 console 输出代码页漂移且偶发尾字节截断（65001/936 间歇），强语义由 GBK 纯字节解码单测固定覆盖——2026-09-08 定时轮 #3 发现并修复（曾致 cargo test 中止后续 suite、总数波动 80/88/93）。

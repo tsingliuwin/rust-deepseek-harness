@@ -8,6 +8,8 @@
 //! 私有表 + `get_section_order` / `get_context_order` 服务 API）。消费方经
 //! 服务查询顺序，不再各自 import 常量（remove cross-package runtime relays）；
 //! 渲染按 `(order, name)` 升序拼接（同 order 用 name 的码元序）。
+//! 0.1.3-alpha.2 对齐：harness:source/web:surface 移到序位 10000/10100
+//! （环境事实跟在可复用指令后），persona 拆前缀（0）/后缀（10200）两节。
 
 use dsh_llm::ToolSchema;
 
@@ -21,7 +23,8 @@ pub enum PromptSectionOrderName {
     HarnessIdentity,
     HarnessSource,
     WebSurface,
-    DeploymentPersona,
+    DeploymentPersonaPrefix,
+    DeploymentPersonaSuffix,
     WorkspaceInstructions,
     PlanPolicy,
     TeamPolicy,
@@ -60,11 +63,12 @@ pub enum PromptContextOrderName {
 }
 
 /// 私有序位表（上游 `SECTION_ORDERS`；相邻值至少差 10，让首位冲突可机械检出）。
+/// 0.1.3-alpha.2 对齐：本地路径/端点（harness:source、web:surface）与 persona
+/// 后缀移到可复用指令之后（e28862db57）；persona 拆前缀（order 0，仅 identity
+/// 之后）+ 后缀（order 10200）两节（40792330c0）。
 const SECTION_ORDERS: &[(PromptSectionOrderName, i32)] = &[
     (PromptSectionOrderName::HarnessIdentity, -1000),
-    (PromptSectionOrderName::HarnessSource, -900),
-    (PromptSectionOrderName::WebSurface, -800),
-    (PromptSectionOrderName::DeploymentPersona, 0),
+    (PromptSectionOrderName::DeploymentPersonaPrefix, 0),
     (PromptSectionOrderName::WorkspaceInstructions, 400),
     (PromptSectionOrderName::PlanPolicy, 500),
     (PromptSectionOrderName::TeamPolicy, 600),
@@ -92,6 +96,9 @@ const SECTION_ORDERS: &[(PromptSectionOrderName, i32)] = &[
     (PromptSectionOrderName::ToolsSdk, 5000),
     (PromptSectionOrderName::DeliverableFileReferences, 9000),
     (PromptSectionOrderName::StructuredOutput, 9900),
+    (PromptSectionOrderName::HarnessSource, 10000),
+    (PromptSectionOrderName::WebSurface, 10100),
+    (PromptSectionOrderName::DeploymentPersonaSuffix, 10200),
 ];
 
 /// 运行时上下文私有序位表（上游 `CONTEXT_ORDERS`）。
@@ -188,12 +195,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_instructions_order_sits_between_persona_and_plan() {
+    fn workspace_instructions_order_sits_between_persona_prefix_and_plan() {
         let prompt = SystemPrompt::new();
-        let persona = prompt.get_section_order(PromptSectionOrderName::DeploymentPersona);
+        let prefix = prompt.get_section_order(PromptSectionOrderName::DeploymentPersonaPrefix);
         let ws = prompt.get_section_order(PromptSectionOrderName::WorkspaceInstructions);
         let bash = prompt.get_section_order(PromptSectionOrderName::ToolBash);
-        assert!(persona < ws && ws < bash, "{persona} < {ws} < {bash}");
+        assert!(prefix < ws && ws < bash, "{prefix} < {ws} < {bash}");
+    }
+
+    /// 0.1.3-alpha.2：本地路径/端点与 persona 后缀在可复用指令之后
+    /// （e28862db57 + 40792330c0）。
+    #[test]
+    fn local_facts_and_persona_suffix_follow_reusable_instructions() {
+        let prompt = SystemPrompt::new();
+        let structured = prompt.get_section_order(PromptSectionOrderName::StructuredOutput);
+        let source = prompt.get_section_order(PromptSectionOrderName::HarnessSource);
+        let web = prompt.get_section_order(PromptSectionOrderName::WebSurface);
+        let suffix = prompt.get_section_order(PromptSectionOrderName::DeploymentPersonaSuffix);
+        assert!(
+            structured < source && source < web && web < suffix,
+            "{structured} < {source} < {web} < {suffix}"
+        );
     }
 
     #[test]

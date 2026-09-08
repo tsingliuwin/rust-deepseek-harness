@@ -35,6 +35,7 @@ UI 项给出入口路径与通过判据。回归时按层推进：A 全绿才进
 | C4 | 权限 chip 显示（Workspace Write） | 目测 | 文案与 web 一致 |
 | C5 | @文件引用注入 | 输入 @ | 文件候选、选中后注入 |
 | C6 | 繁忙时 Enter：按 E3 设置排队或打断 | 流式中按 Enter | 行为符合设置 |
+| C7 | 模型切换公告（0.1.3-alpha.2）：会话中经 C3 切换模型后，下一轮消息批尾追加 user/plugin `model-selection` notice（summary「旧 → 新」），随日志派生进入模型历史；请求头 reason=change | C3 切换模型后发消息 | 日志新增 user/message 行（source 带 form=notice/summary）+ request/header reason=change；聊天流出现公告文本（显示形态为既有用户消息渲染面，上游折叠行不可复刻见偏差表） |
 
 ## D. 侧栏（sidebar.rs）
 

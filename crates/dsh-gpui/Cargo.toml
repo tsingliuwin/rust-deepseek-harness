@@ -34,3 +34,6 @@ serde_yaml = "0.9"
 chrono = "0.4"
 rfd = "0.15"
 serde_json.workspace = true
+[dev-dependencies]
+usvg = "0.45.1"
+resvg = "0.45.1"

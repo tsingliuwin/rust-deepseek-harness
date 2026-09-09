@@ -2277,14 +2277,14 @@ impl AppView {
                         })
                     })
                     .child(
-                        // 图标座 28×28（蓝渐变文档形，web DocumentFileIcon）
+                        // 图标座 28×28（web FileTypeIcon：类色文件底 + 白 mark）
                         div()
                             .flex_none()
                             .size(px(28.0))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(svg().path("icons/document-file.svg").size(px(24.0))),
+                            .child(crate::chat::file_type_icon(&draft.name)),
                     )
                     .child(
                         div()

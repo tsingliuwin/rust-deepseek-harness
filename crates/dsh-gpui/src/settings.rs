@@ -407,7 +407,7 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
     let transcript = segmented(
         "set-transcript",
         &[
-            ("常规", app.settings.transcript_view == TranscriptView::Normal, true),
+            ("标准", app.settings.transcript_view == TranscriptView::Normal, true),
             ("紧凑", app.settings.transcript_view == TranscriptView::Compact, true),
         ],
         move |i, _, _, cx| {

@@ -1,9 +1,9 @@
 # 上游更新分析法（模式 A 详细步骤）
 
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
-> **当前同步点：dsh-v0.1.5-alpha.1（5dda764ed3）**——2026-09-08 同步（跨 0.1.3-alpha.3/0.1.4 系列；发布点=master HEAD）。此前 82a5fd61a7（0.1.3-alpha.2，2026-09-06 同步）。
+> **当前同步点：dsh-v0.1.5-alpha.2（b2e3b2a012）**——2026-09-09 同步。此前 5dda764ed3（0.1.5-alpha.1，2026-09-08 同步）。
 > 0.1.5-alpha.1 主面：**会话格式 v3**（system prompt 晋升 system/message 行 + request/header 去 system + PTC 改名 + canonical 信封）、composer 统计行改双图标 pill + 互斥统计对话框、SystemPromptRow（系统提示词折叠行）；Sidebar 工作区文件树/dockkit/textpreview/remotes 全链面外。
-> **最近检查：2026-09-08（定时轮 #4，同步轮）**——上游发布 0.1.5-alpha.1（703 文件 +35815/-4724），面内三项实施；另修 dsh-shell 环境脆弱测试遗留问题；master 无标签后增量。
+> **最近检查：2026-09-09（定时轮 #5，同步轮）**——上游发布 0.1.5-alpha.2（543 文件 +17458/-5357），面内两项实施（附件卡文件类型图标 + transcript 设置文案）；Mermaid 预览 feat 被 revert 净零；master 无标签后增量。
 
 ## 1. 一键差异分析
 
@@ -60,6 +60,10 @@
 | composer 统计条改双图标 pill + 互斥统计对话框（3997f36999：gauge pill=轮步+TPS 开「会话统计」，database pill=总 token+缓存命中开「Token 用量」；stats.counts 去 ·；stats.dialog.* 词汇）| **面内**（已实施）| SessionStats 窗口累计（上游 deriveStats fallback fold 语义）；TTFT 会话平均；TPS 以 llm−ttft 近似 decode 窗口 |
 | Sidebar 工作区文件树全链（workspace-files 双面 API/remotes/resources/file 资源订阅/dockkit 引擎/sidebar tab+文件树/textpreview 分页 tab/deliverables 产出文件/聊天点击文件改侧栏打开）| 面外 | rustdsh 无工作区文件浏览器面（既有判定先例）；聊天文件链接维持既有打开行为（7f0a613 守卫）|
 | Send busy 态系列（9a5ed6fb60 跟随 busy-Enter、2f630626b8 纯文本草稿才显模式名、8935c3d725 上传 pending 保 Send）| 面外 | rustdsh 发送钮无 busy 文案形态 |
+| 附件卡文件类型图标（0.1.5-alpha.2：4ee9e055d5 shared file type icons——FileCard 的 DocumentFileIcon → FileTypeIcon，扩展名/文件名分类 12+ 类，类色文件底 + 白 mark 双层 glyph）| **面内**（已实施）| 分类逻辑与色值照抄（传统类 + code 归并单类）；glyph 以 body/mark 双 svg 分层 tint 复刻（assets/filetype/），fold 与 body 同色（单 tint 白折角对比损失）、48 语言 CodeFileIcon 细分收敛通用 code glyph（资产不可得）|
+| transcript 设置文案中文化（'Normal'→'标准'、'Compact'→'紧凑'）| **面内**（已实施）| rustdsh 原为「常规」，改「标准」对齐 |
+| Mermaid/Graphviz/SVG/HTML 围栏预览（ee35e40bc8 等 feat 系列 → 58956c1a8a Revert）| 面外净零 | feat→revert 对，以 HEAD 净态为准 |
+| Sidebar 图片文件预览（8870a13aa9）/ ui-deliverables 交付文件呈现（presented.* 词汇大批）/ workspace-files subagent roots / webworker file handle | 面外 | Sidebar 文件树与 deliverables 无对应面（既有判定）；api/webworker 层无镜像 |
 | think 摘要去粗体（b08310ac1d）/ markdown 图片失败显原文本（88ab8e9133）| 面外 | rustdsh think 行固定标题无摘要文本面；vendor TextView 无图片加载 |
 | session-controller 拒空 prompt（ae19d9383b）/ api file 边界修复系列 | 面外 | rustdsh 无 session-controller RPC 层 |
 | open-in-app SSH 检测共享 / visualizer feat+revert 净零 / native node-addon-system（flock/Landlock）/ agent-instructions root marker 修复 | 面外 | 无对应面/净零/Node 原生层 |

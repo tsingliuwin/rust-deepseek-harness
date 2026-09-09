@@ -80,13 +80,7 @@ fn render_chat_attachment(
             .border(px(0.5))
             .border_color(theme::t().border_l2)
             .bg(theme::t().surface)
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(24.0))
-                    .h(px(28.0))
-                    .child(svg().path("icons/document-file.svg").size_full()),
-            )
+            .child(file_type_icon(name))
             .child(
                 div()
                     .flex_1()
@@ -148,6 +142,128 @@ pub(crate) struct SessionStats {
     pub(crate) output_tokens: u64,
     pub(crate) cache_read: u64,
     pub(crate) cache_write: u64,
+}
+
+
+/// 附件文件类型分类（上游 ui-primitives FileTypeIcon 传统类；48 语言 code
+/// 细分收敛为单一 code——语言级 glyph 资产不可得，见偏差表）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileKind {
+    Code,
+    Excel,
+    Html,
+    Image,
+    Markdown,
+    Other,
+    Pdf,
+    Ppt,
+    Video,
+    Word,
+}
+
+impl FileKind {
+    fn asset_stem(self) -> &'static str {
+        match self {
+            FileKind::Code => "code",
+            FileKind::Excel => "excel",
+            FileKind::Html => "html",
+            FileKind::Image => "image",
+            FileKind::Markdown => "markdown",
+            FileKind::Other => "other",
+            FileKind::Pdf => "pdf",
+            FileKind::Ppt => "ppt",
+            FileKind::Video => "video",
+            FileKind::Word => "word",
+        }
+    }
+
+    /// 上游 FileTypeIcon.module.css 每类色（设计平台 static token 实值；
+    /// image/video 为 css 自定义 violet）。
+    fn color(self) -> gpui::Rgba {
+        let (r, g, b): (u8, u8, u8) = match self {
+            FileKind::Code | FileKind::Html | FileKind::Markdown => (65, 118, 230),
+            FileKind::Excel => (34, 197, 94),
+            FileKind::Image | FileKind::Video => (139, 118, 246),
+            FileKind::Other => (207, 211, 214),
+            FileKind::Pdf => (236, 19, 19),
+            FileKind::Ppt => (245, 158, 11),
+            FileKind::Word => (86, 134, 254),
+        };
+        gpui::Rgba { r: r as f32 / 255.0, g: g as f32 / 255.0, b: b as f32 / 255.0, a: 1.0 }
+    }
+}
+
+/// 上游 classifyFileType 传统面：文件名规则 → 扩展名规则，大小写不敏感，
+/// 未知名回落 other。
+pub(crate) fn classify_file_type(name: &str) -> FileKind {
+    let lower = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+    match lower.as_str() {
+        "readme" | "changelog" | "contributing" => return FileKind::Markdown,
+        "makefile" | "gnumakefile" | "bsdmakefile" | "dockerfile" | "gemfile" | "guardfile"
+        | "package.json" | "package-lock.json" | "npm-shrinkwrap.json"
+        | "docker-compose.yaml" | "docker-compose.yml" | "compose.yaml" | "compose.yml"
+        | "cmakelists.txt" => return FileKind::Code,
+        _ => {}
+    }
+    if lower.starts_with('.') {
+        return match lower.as_str() {
+            ".bash_profile" | ".bashrc" | ".profile" | ".zprofile" | ".zshrc" | ".env"
+            | ".gitattributes" | ".gitconfig" | ".gitignore" | ".gitmodules" | ".mailmap"
+            | ".commit_editmsg" => FileKind::Code,
+            _ => FileKind::Other,
+        };
+    }
+    let ext = match lower.rsplit_once('.') {
+        Some((_, e)) if !e.is_empty() => e,
+        _ => return FileKind::Other,
+    };
+    match ext {
+        "md" | "mdx" | "markdown" => FileKind::Markdown,
+        "pdf" => FileKind::Pdf,
+        "ppt" | "pptx" | "key" => FileKind::Ppt,
+        "doc" | "docx" | "rtf" | "odt" | "pages" => FileKind::Word,
+        "xls" | "xlsx" | "xlsm" | "numbers" => FileKind::Excel,
+        "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" | "mpg" | "mpeg" => FileKind::Video,
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "avif" | "bmp" | "ico" | "tif"
+        | "tiff" | "heic" | "heif" => FileKind::Image,
+        "html" | "htm" => FileKind::Html,
+        "scss" | "sass" | "less" | "vue" | "svelte" | "astro" | "bat" | "cmd" | "csv" | "tsv"
+        | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "rs" | "go" | "java" | "kt"
+        | "rb" | "php" | "c" | "h" | "cpp" | "hpp" | "cs" | "swift" | "scala" | "sh" | "sql"
+        | "json" | "yaml" | "yml" | "toml" | "xml" | "proto" | "graphql" | "zig" | "lua"
+        | "pl" | "r" | "dart" | "erl" | "ex" | "hs" | "clj" | "wasm" | "ini" | "cmake" => {
+            FileKind::Code
+        }
+        _ => FileKind::Other,
+    }
+}
+
+/// 附件卡类型图标（上游 FileTypeIcon 双层：类色文件底 + 白 mark，28 viewBox；
+/// other 类无 mark）。单 tint 限制下 fold 与 body 同色（上游白色折角对比损失）。
+pub(crate) fn file_type_icon(name: &str) -> Div {
+    let kind = classify_file_type(name);
+    let stem = kind.asset_stem();
+    let mut d = div()
+        .flex_none()
+        .w(px(24.0))
+        .h(px(28.0))
+        .relative()
+        .child(
+            svg()
+                .path(SharedString::from(format!("filetype/{stem}-body.svg")))
+                .size_full()
+                .text_color(kind.color()),
+        );
+    if kind != FileKind::Other {
+        d = d.child(
+            svg()
+                .path(SharedString::from(format!("filetype/{stem}-mark.svg")))
+                .absolute()
+                .size_full()
+                .text_color(gpui::white()),
+        );
+    }
+    d
 }
 
 pub(crate) struct ChatView {

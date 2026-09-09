@@ -3,6 +3,7 @@ name = "dsh-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
 
 [dependencies]
 dsh-llm = { path = "../dsh-llm" }

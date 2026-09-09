@@ -30,6 +30,8 @@ gpui-component = { path = "vendor/gpui-component" }
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "DeepSeek Harness (deepseek-harness) web client rebuilt natively in Rust + GPUI, sharing ~/.dsh session storage with the web build"
+repository = "https://github.com/tsingliuwin/rust-deepseek-harness"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

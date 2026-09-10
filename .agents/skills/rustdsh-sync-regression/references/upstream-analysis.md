@@ -1,9 +1,9 @@
 # 上游更新分析法（模式 A 详细步骤）
 
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
-> **当前同步点：dsh-v0.1.5-alpha.2（b2e3b2a012）**——2026-09-09 同步。此前 5dda764ed3（0.1.5-alpha.1，2026-09-08 同步）。
+> **当前同步点：dsh-v0.1.5-rc.2（fb2c4b9e69）**——2026-09-11 同步（rc.1+rc.2；发布点后 master 增量 30 提交全部 subprocess/desktop/ci 面外）。此前 b2e3b2a012（0.1.5-alpha.2，2026-09-09 同步）。
 > 0.1.5-alpha.1 主面：**会话格式 v3**（system prompt 晋升 system/message 行 + request/header 去 system + PTC 改名 + canonical 信封）、composer 统计行改双图标 pill + 互斥统计对话框、SystemPromptRow（系统提示词折叠行）；Sidebar 工作区文件树/dockkit/textpreview/remotes 全链面外。
-> **最近检查：2026-09-09（定时轮 #5，同步轮）**——上游发布 0.1.5-alpha.2（543 文件 +17458/-5357），面内两项实施（附件卡文件类型图标 + transcript 设置文案）；Mermaid 预览 feat 被 revert 净零；master 无标签后增量。
+> **最近检查：2026-09-11（定时轮 #6，同步轮）**——上游发布 0.1.5-rc.1/rc.2（184 文件 +1293/-1144，存储零变更），面内两项实施（deepseek 模型目录 V41 Flash 首项默认 + Usage 对话框 cacheWrite 为 0 省行）。
 
 ## 1. 一键差异分析
 
@@ -62,6 +62,11 @@
 | Send busy 态系列（9a5ed6fb60 跟随 busy-Enter、2f630626b8 纯文本草稿才显模式名、8935c3d725 上传 pending 保 Send）| 面外 | rustdsh 发送钮无 busy 文案形态 |
 | 附件卡文件类型图标（0.1.5-alpha.2：4ee9e055d5 shared file type icons——FileCard 的 DocumentFileIcon → FileTypeIcon，扩展名/文件名分类 12+ 类，类色文件底 + 白 mark 双层 glyph）| **面内**（已实施）| 分类逻辑与色值照抄（传统类 + code 归并单类）；glyph 以 body/mark 双 svg 分层 tint 复刻（assets/filetype/），fold 与 body 同色（单 tint 白折角对比损失）、48 语言 CodeFileIcon 细分收敛通用 code glyph（资产不可得）|
 | transcript 设置文案中文化（'Normal'→'标准'、'Compact'→'紧凑'）| **面内**（已实施）| rustdsh 原为「常规」，改「标准」对齐 |
+| deepseek 模型目录（0.1.5-rc.1/rc.2：DEFAULT_MODELS 头部插 deepseek-flash/DeepSeek-V41-Flash（vision+in-history），目录净态 V41 Flash/V4 Flash/V4 Pro/V4 Flash Vision Exp；默认 Chat Completions → V41 Flash）| **面内**（已实施）| rustdsh 落点：设置页 deepseek 内置模型行 4 条 + 启动/AppSettings 默认模型 deepseek-chat→deepseek-flash；description 文案与 image 字段无显示面不落（CatalogModel 结构差异既有偏差）|
+| Usage 对话框 cacheWrite 为 0 省行（3435dbd690 stats review 修正）| **面内**（已实施）| 统计对话框 Token 用量分支条件化 |
+| category.service-stability 文案改「稳定性和速度」/ guide.description | 面外 | feedback 分类与 sidebar guide 面无镜像 |
+| CodeBlock contentRef/display:contents、TurnTailNodeView actions margin-top 4px | 面外 | web DOM 缝（ref/滚动端口挂载）与 DOM 流间距补偿，vendor TextView 布局模型无对应结构 |
+| sidebar guide 起始页/documentpreview 精修/preview scrollports | 面外 | Sidebar 全链面外（既有判定）|
 | Mermaid/Graphviz/SVG/HTML 围栏预览（ee35e40bc8 等 feat 系列 → 58956c1a8a Revert）| 面外净零 | feat→revert 对，以 HEAD 净态为准 |
 | Sidebar 图片文件预览（8870a13aa9）/ ui-deliverables 交付文件呈现（presented.* 词汇大批）/ workspace-files subagent roots / webworker file handle | 面外 | Sidebar 文件树与 deliverables 无对应面（既有判定）；api/webworker 层无镜像 |
 | think 摘要去粗体（b08310ac1d）/ markdown 图片失败显原文本（88ab8e9133）| 面外 | rustdsh think 行固定标题无摘要文本面；vendor TextView 无图片加载 |

@@ -37,7 +37,7 @@ UI 项给出入口路径与通过判据。回归时按层推进：A 全绿才进
 | C6 | 繁忙时 Enter：按 E3 设置排队或打断 | 流式中按 Enter | 行为符合设置 |
 | C7 | 模型切换公告（0.1.3-alpha.2）：会话中经 C3 切换模型后，下一轮消息批尾追加 user/plugin `model-selection` notice（summary「旧 → 新」），随日志派生进入模型历史；请求头 reason=change | C3 切换模型后发消息 | 日志新增 user/message 行（source 带 form=notice/summary）+ request/header reason=change；聊天流出现公告文本（显示形态为既有用户消息渲染面，上游折叠行不可复刻见偏差表） |
 | C8 | v3 落盘序与 system 面节点（0.1.5-alpha.1）：step/start → system/message（head append，变化 replace）→ user 批；request/header 无 system 字段 | 跑一轮会话后查日志 | 日志行序正确、session.v3.jsonl.zstd、request/header data.header 无 system、system/message 行 source=plugin @dsh-system-prompt |
-| C9 | 统计双 pill + 对话框（0.1.5-alpha.1）：composer 下仪表 pill（轮步+TPS）与数据 pill（总 token+缓存命中），点击开互斥对话框（会话统计 / Token 用量），再点关闭 | 跑一轮后看 composer 下方 | pill 数值正确、对话框行与数据一致（模型用时/TTFT/TPS；输入/缓存/输出）、互斥开合 |
+| C9 | 统计双 pill + 对话框（0.1.5-alpha.1）：composer 下仪表 pill（轮步+TPS）与数据 pill（总 token+缓存命中），点击开互斥对话框（会话统计 / Token 用量），再点关闭 | 跑一轮后看 composer 下方 | pill 数值正确、对话框行与数据一致（模型用时/TTFT/TPS；输入/缓存读/缓存写/输出，缓存写为 0 时该行省略）、互斥开合 |
 | C10 | 附件卡文件类型图标（0.1.5-alpha.2）：回形针选文件/气泡附件卡按扩展名出类色文件底+白 mark 图标（pdf 红/word 蓝/excel 绿/图片紫/代码 deepseek 蓝/其他灰）| 附件 TXT/PDF/PNG/RS 各一张 | 图标随类型变化、未知扩展回落灰 other、双层渲染无错位 |
 
 ## D. 侧栏（sidebar.rs）

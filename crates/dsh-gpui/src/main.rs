@@ -288,7 +288,7 @@ impl Default for AppSettings {
             appearance: AppearanceMode::System,
             enter: EnterBehavior::Queue,
             transcript_view: TranscriptView::Compact,
-            model: "deepseek-chat".into(),
+            model: "deepseek-flash".into(),
             providers: Vec::new(),
         }
     }
@@ -1160,7 +1160,10 @@ fn stat_dialog_panel(kind: StatDialogKind, stats: &crate::chat::SessionStats) ->
             }
             rows.push(("输入", format_tokens_exact(uncached)));
             rows.push(("缓存读取", format_tokens_exact(stats.cache_read)));
-            rows.push(("缓存写入", format_tokens_exact(stats.cache_write)));
+            // 从未写缓存的会话省略该行（上游 StatsPills review 修正）
+            if stats.cache_write != 0 {
+                rows.push(("缓存写入", format_tokens_exact(stats.cache_write)));
+            }
             rows.push(("输出", format_tokens_exact(stats.output_tokens)));
         }
     }
@@ -4236,7 +4239,7 @@ fn main() {
     let (provider, model) = match DeepSeekAdapter::from_env() {
         Some(adapter) => {
             let _h = llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter)).expect("register deepseek");
-            let model = std::env::var("DSH_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
+            let model = std::env::var("DSH_MODEL").unwrap_or_else(|_| "deepseek-flash".to_string());
             ("deepseek".to_string(), model)
         }
         None => {
@@ -4245,7 +4248,7 @@ fn main() {
                 let _h = llm.register_adapter(&["deepseek".to_string()], Arc::new(adapter))
                     .expect("register deepseek from credentials");
                 let model = std::env::var("DSH_MODEL")
-                    .unwrap_or_else(|_| "deepseek-chat".to_string());
+                    .unwrap_or_else(|_| "deepseek-flash".to_string());
                 ("deepseek".to_string(), model)
             } else {
                 let _h = llm.register_adapter(&["mock".to_string()], Arc::new(MockAdapter)).expect("register mock");
@@ -4476,7 +4479,7 @@ fn main() {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| if startup_desired.is_empty() { None } else { Some(startup_desired.clone()) })
-        .unwrap_or_else(|| "deepseek-chat".to_string());
+        .unwrap_or_else(|| "deepseek-flash".to_string());
     // 初始路由：**用户持久化的选择优先**（settings 的 active provider +
     // agent-default-model）——UI 显示什么模型就必须用什么模型。曾有回归：
     // deepseek key（env/.credentials）存在时强制短路回 deepseek/deepseek-chat，

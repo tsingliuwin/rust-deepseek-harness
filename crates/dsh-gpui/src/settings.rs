@@ -714,7 +714,13 @@ fn edit_card(app: &AppView, this: &Entity<AppView>, id: &str, name: &str, cx: &A
     let tk = theme::t();
     let t_save = this.clone();
     let models: Vec<String> = if id == "deepseek" {
-        vec!["deepseek-chat".into(), "deepseek-reasoner".into()]
+        // 上游 llm-deepseek DEFAULT_MODELS（0.1.5-rc.2：V41 Flash 首项默认）
+        vec![
+            "deepseek-flash".into(),
+            "deepseek-v4-flash".into(),
+            "deepseek-v4-pro".into(),
+            "deepseek-v4-flash-vision-exp".into(),
+        ]
     } else {
         app.settings
             .providers

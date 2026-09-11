@@ -186,6 +186,7 @@ struct SessionMeta {
 }
 
 /// 详情面板当前选中的工具调用。
+#[derive(Clone)]
 struct ToolDetail {
     name: String,
     arguments: String,

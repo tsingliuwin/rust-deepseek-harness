@@ -92,6 +92,28 @@ pub struct Tokens {
     /// 滚动条 thumb（scrollbar-bg-l2 对）。
     pub scrollbar_thumb: Rgba,
     pub scrollbar_thumb_hover: Rgba,
+    /// `--dsw-alias-bg-layer-3`（轨迹 cell 卡底 / 菜单卡底同值）。
+    pub layer3: Rgba,
+    /// `--dsw-alias-button-ghost-active-fill`（轨迹轮次吸顶条底）。
+    pub ghost_active: Rgba,
+    /// `--dsw-alias-bg-module-platform`（轨迹 system tag 底）。
+    pub module_platform: Rgba,
+    /// `--dsw-alias-state-warn-label`（轨迹 tool tag 字）。
+    pub warn_label: Rgba,
+    /// `--dsw-alias-state-warn-tertiary`（轨迹 tool tag 底）。
+    pub warn_tertiary: Rgba,
+    /// `--dsw-alias-state-success-tertiary`（轨迹 user/context tag 底）。
+    pub success_tertiary: Rgba,
+    /// 轨迹 message tag 字（color-mix(brand-new 60%, error-secondary) 实值）。
+    pub tag_message_fg: Rgba,
+    /// 轨迹 message tag 底（color-mix(…55%…15%, bg-layer-1) 实值）。
+    pub tag_message_bg: Rgba,
+    /// 轨迹 context tag 字（color-mix(success 68%, label-secondary) 实值）。
+    pub tag_context_fg: Rgba,
+    /// 轨迹 subtool tag 字（color-mix(warn-label 62%, label-tertiary) 实值）。
+    pub tag_subtool_fg: Rgba,
+    /// 轨迹 subtool tag 底（color-mix(warn-tertiary 58%, bg-layer-1) 实值）。
+    pub tag_subtool_bg: Rgba,
 }
 
 /// 暗色主题（`body[data-ds-dark-theme]`）。
@@ -126,6 +148,17 @@ pub const DARK: Tokens = Tokens {
     mask: hsla_const(0.0, 0.0, 0.0, 0.5),
     scrollbar_thumb: rgb_const(0x545557),       // neutral-600
     scrollbar_thumb_hover: rgb_const(0x65676b), // neutral-550
+    layer3: rgb_const(0x353638),                // neutral-bluish-800
+    ghost_active: rgb_const(0x43454a),          // neutral-bluish-750
+    module_platform: rgb_const(0x353638),       // neutral-bluish-800
+    warn_label: rgb_const(0xdd8629),            // amber-600
+    warn_tertiary: rgb_const(0x27241f),         // amber-900
+    success_tertiary: rgb_const(0x233c2c),      // green-900
+    tag_message_fg: rgb_const(0x9474bc),        // mix(brand-new 60%, red-400)
+    tag_message_bg: rgb_const(0x352f3a),        // mix(…55%… 15%, layer-1)
+    tag_context_fg: rgb_const(0x59c984),        // mix(green-500 68%, label-2)
+    tag_subtool_fg: rgb_const(0xcb975f),        // mix(amber-600 62%, label-3)
+    tag_subtool_bg: rgb_const(0x252421),        // mix(amber-900 58%, layer-1)
 };
 
 /// 亮色主题（`body` 默认段）。
@@ -160,6 +193,17 @@ pub const LIGHT: Tokens = Tokens {
     mask: hsla_const(0.0, 0.0, 0.0, 0.24),
     scrollbar_thumb: rgb_const(0xe5e5e5),       // neutral-200
     scrollbar_thumb_hover: rgb_const(0xd4d4d4), // neutral-300
+    layer3: rgb_const(0xffffff),                // neutral-bluish-00
+    ghost_active: rgb_const(0xebeef2),          // neutral-bluish-100
+    module_platform: rgb_const(0xf5f6f7),       // neutral-bluish-60
+    warn_label: rgb_const(0xdd8629),            // amber-600
+    warn_tertiary: rgb_const(0xfef5e7),         // amber-100
+    success_tertiary: rgb_const(0xe6faed),      // green-100
+    tag_message_fg: rgb_const(0x886bae),        // mix(brand-new 60%, red-400)
+    tag_message_bg: rgb_const(0xeee8f2),        // mix(…55%… 15%, layer-1)
+    tag_context_fg: rgb_const(0x36a762),        // mix(green-500 68%, label-2)
+    tag_subtool_fg: rgb_const(0xba864f),        // mix(amber-600 62%, label-3)
+    tag_subtool_bg: rgb_const(0xfef9f1),        // mix(amber-100 58%, layer-1)
 };
 
 static ACTIVE: RwLock<Tokens> = RwLock::new(DARK);

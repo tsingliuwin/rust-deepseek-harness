@@ -10,7 +10,7 @@
 //! on_children_prepainted 捕获首子元素，这里消费）。动作闭包遵守
 //! 「先侧栏本地 update、再宿主 update」的顺序，避免同名实体重入。
 
-use crate::layout::{self, SIDEBAR_AUTO_COLLAPSE};
+use crate::layout::{self, SIDEBAR_AUTO_COLLAPSE, SIDEBAR_COLLAPSED};
 use crate::theme;
 use crate::widgets::{icon_btn, rail_icon, session_row, tip};
 use crate::{AppView, SessionMeta, WorkspaceInfo};
@@ -125,7 +125,10 @@ impl Render for SidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let vw: f32 = window.viewport_size().width.into();
         let collapsed = self.layout_collapsed || vw < SIDEBAR_AUTO_COLLAPSE;
-        let width = self.layout_width;
+        // 折叠宽度在渲染处收敛（与 compute_columns 的 pref<=0 → COLLAPSED
+        // 同语义）：镜像 width 恒为展开值，窄窗自动折叠无推送路径，
+        // 在此收口才能同时覆盖点击与 resize 两条路。
+        let width = if collapsed { SIDEBAR_COLLAPSED } else { self.layout_width };
         // 双句柄：this = 宿主动作；sb = 侧栏本地态
         let this = self.app.clone();
         let sb = cx.entity();

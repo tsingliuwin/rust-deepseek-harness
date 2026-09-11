@@ -627,7 +627,7 @@ impl ChatView {
                 }
                 SessionEvent::AssistantMessage { usage, message, .. } => {
                     self.stats_steps += 1;
-                    if let Some(u) = usage {
+                    if let Some(u) = &usage {
                         self.stats_input_tokens += u.input_tokens;
                         self.stats_output_tokens += u.output_tokens;
                         if let Some(cr) = u.cache_read_tokens { self.stats_cache_read += cr; }
@@ -664,12 +664,24 @@ impl ChatView {
                         }
                     }
                     if !blocks.is_empty() {
+                        // 轨迹指标列数据源：事件级 usage 落条目快照
+                        // （计时字段日志无承载，留 0 → 时长列按缺省 — 渲染）
                         self.entries.push(ChatEntry {
                             role: Role::Assistant,
                             blocks,
                             done: true,
                             elapsed: None,
-                            usage: None,
+                            usage: usage.as_ref().map(|u| TurnUsage {
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                                cache_read: u.cache_read_tokens,
+                                cache_write: u.cache_write_tokens,
+                                reasoning: u.reasoning_tokens,
+                                run_ms: 0,
+                                llm_ms: 0,
+                                ttft_ms: None,
+                                route: String::new(),
+                            }),
                             ended_at_ms: None,
                             turn: cur_turn,
                             context: None,
@@ -1284,6 +1296,8 @@ open: false,
                         }
                     }
                 }
+                // 新台账布局插入轮头条与非工具 cell：换算成滚动容器子节点下标
+                let traj_ix = self.traj_child_index(traj_ix);
                 let row_group: SharedString = format!("toolrow-{}-{}", ei, bi).into();
                 let mut header = div()
                     .id(("tool-row", (ei * 1000 + bi) as u64))
@@ -2112,103 +2126,470 @@ open: false,
         )
     }
 
-    /// 轨迹 tab：全量工具调用台账。滚动容器在本方法内（track_scroll 接
-    /// Inspect pill 的 scroll_to_item；行必须是其直接子节点才能按行号跳转）。
-    fn render_trajectory(&self, this: &Entity<Self>, width: f32) -> Stateful<Div> {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (ei, entry) in self.entries.iter().enumerate() {
-            for (bi, block) in entry.blocks.iter().enumerate() {
-                if let MsgBlock::Tool(tool) = block {
-                    let (label, icon) = widgets::tool_display(&tool.name);
-                    let (_, traj_summary, _) = widgets::tool_row_texts(&tool.name, &tool.arguments);
-                    let traj_summary = widgets::display_path(&traj_summary, &self.cwd);
-                    let t = this.clone();
-                    let name = tool.name.clone();
-                    let arguments = tool.arguments.clone();
-                    let result = tool.result.clone();
-                    let error = tool.error;
-                    rows.push(
-                        div()
-                            .id(("traj", (ei * 1000 + bi) as u64))
-                            .flex()
-                            .items_center()
-                            .h(px(32.0))
-                            .px_2()
-                            .gap_1p5()
-                            .rounded(px(8.0))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme::t().hover))
-                            .on_click(move |_, _, cx| {
-                                t.update(cx, |v, cx| {
-                                    let detail = ToolDetail {
-                                        name: name.clone(),
-                                        arguments: arguments.clone(),
-                                        result: result.clone(),
-                                        error,
-                                    };
-                                    v.app.update(cx, |a, cx| {
-                                        a.selected_tool = Some(detail);
-                                        a.details_open = true;
-                                        cx.notify();
-                                    });
-                                });
-                            })
-                            .when(tool.error && tool.result.is_some(), |r| {
-                                // web ToolRow leadingFor：终态 error 用状态点替换工具图标
-                                r.child(state_dot(theme::t().error))
-                            })
-                            .when(!(tool.error && tool.result.is_some()), |r| {
-                                r.child(Icon::new(icon).size(px(14.0)).text_color(theme::t().text_2))
-                            })
-                            .child(
-                                div()
-                                    .text_size(px(theme::FONT_ROW))
-                                    .line_height(px(theme::FONT_ROW_LEADING))
-                                    .text_color(theme::t().text)
-                                    .child(label),
-                            )
-                            .child(dot_sep())
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .text_size(px(theme::FONT_ROW))
-                                    .line_height(px(theme::FONT_ROW_LEADING))
-                                    .text_color(theme::t().text_3)
-                                    .child(traj_summary),
-                            )
-                            .into_any_element(),
-                    );
-                }
+    /// 轨迹 tab：轮次分组的事件台账（上游 ui-trajectory TrajectoryTable 的
+    /// GPUI 对应物）。行 = 38px 卡片 cell（序号 + 种类 tag 药丸 + 摘要 +
+    /// 右 320px 指标栏）；每轮一条 44px 吸顶轮头条（列标签 输入/输出/思考/时间）。
+    /// 滚动容器在本方法内（track_scroll 接 Inspect pill 的 scroll_to_item；
+    /// 行必须是其直接子节点才能按行号跳转）。
+    fn render_trajectory(&self, this: &Entity<Self>, width: f32, cx: &App) -> Stateful<Div> {
+        // --- 台账行派生（user / message / tool 三类 cell，全局 #序号连续）---
+        let cells = self.traj_cells();
+        // 轮次分段：[轮号, 起始行下标, 行数]（cells 按轮连续）
+        let mut sections: Vec<(u64, usize, usize)> = Vec::new();
+        for (ci, c) in cells.iter().enumerate() {
+            match sections.last_mut() {
+                Some(last) if last.0 == c.turn => last.2 += 1,
+                _ => sections.push((c.turn, ci, 1)),
             }
         }
+        let t = theme::t();
+        let selected = self.app.read_with(cx, |a, _| a.selected_tool.clone());
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (si, &(turn, start, count)) in sections.iter().enumerate() {
+            rows.push(self.traj_turn_header(turn, width).bar().into_any_element());
+            for c in &cells[start..start + count] {
+                rows.push(
+                    self.traj_cell_row(c, selected.as_ref(), this, si)
+                        .into_any_element(),
+                );
+            }
+        }
+        // --- 吸顶轮头覆盖层（CSS position:sticky 的 GPUI 等价：固定行高可算
+        // 出各段偏移；轮头过视口顶即贴顶，段尾临近随段尾上移、不越出父段）---
+        let scrolled = -self.traj_scroll.offset().y.to_f64() as f32;
+        let mut y = TRAJ_PAD_PX;
+        let mut sticky: Option<(u64, f32)> = None;
+        for &(turn, _start, count) in &sections {
+            let section_h = TRAJ_HEADER_PX + count as f32 * TRAJ_CELL_PX;
+            let header_top = y;
+            let section_bottom = y + section_h;
+            // CSS sticky top:0：轮头过视口顶才画覆盖层；贴顶后恒 0，段尾
+            // 临近（bottom-44-scrolled < 0）随段尾上移、不越出父段。
+            if scrolled > header_top && scrolled < section_bottom {
+                let top = (header_top - scrolled)
+                    .max(0.0)
+                    .min(section_bottom - TRAJ_HEADER_PX - scrolled);
+                sticky = Some((turn, top));
+            }
+            y += section_h;
+        }
+        // 台账行通栏（上游表格行占满面板宽）；轮头条内容道限 880 居中。
+        let lane = TRAJ_LANE_MAX_PX.min(width);
         let mut col = div()
-            .id("traj-scroll")
+            .id("traj-col")
+            .relative()
             .h_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.traj_scroll)
             .w_full()
-            .max_w(px(layout::chat_content_width(width)))
-            .mx_auto()
-            .v_flex()
-            .py_4();
-        if rows.is_empty() {
+            .child(
+                div()
+                    .id("traj-scroll")
+                    .h_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.traj_scroll)
+                    .w_full()
+                    .max_w(px(width))
+                    .mx_auto()
+                    .v_flex()
+                    .py_4()
+                    .children(rows),
+            );
+        if cells.is_empty() {
             col = col.child(
                 div()
-                    .py_4()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .text_size(px(13.0))
                     .line_height(px(20.0))
-                    .text_color(theme::t().text_3)
+                    .text_color(t.text_3)
                     .child("本轮还没有工具调用记录"),
             );
-        } else {
-            col = col.children(rows);
+        } else if let Some((turn, top)) = sticky {
+            col = col.child(
+                div()
+                    .absolute()
+                    .top(px(top))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(self.traj_turn_header(turn, width).sticky_overlay(lane)),
+            );
         }
         col
     }
+
+    /// 台账 cell 派生：user/context/notice → 用户 cell；assistant → 消息 cell
+    /// （带 usage 三指标与 llm 用时）+ 逐工具 cell。序号全局连续（上游 #index）。
+    fn traj_cells(&self) -> Vec<TrajCell> {
+        let mut cells: Vec<TrajCell> = Vec::new();
+        for entry in &self.entries {
+            let texts: Vec<&String> = entry
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    MsgBlock::Text(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            // 单行 cell：内部换行压空格（nowrap 下 \n 仍会断行撑破 38px 行高）
+            let joined = texts
+                .iter()
+                .map(|s| s.as_str().replace('\n', " "))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match entry.role {
+                Role::User | Role::Context | Role::Notice => {
+                    if joined.trim().is_empty() {
+                        continue;
+                    }
+                    cells.push(TrajCell {
+                        turn: entry.turn,
+                        kind: TrajKind::User,
+                        index: cells.len() + 1,
+                        text: joined,
+                        metrics: None,
+                        time_ms: None,
+                        tool: None,
+                    });
+                }
+                Role::Assistant | Role::Error => {
+                    cells.push(TrajCell {
+                        turn: entry.turn,
+                        kind: TrajKind::Message,
+                        index: cells.len() + 1,
+                        text: joined,
+                        metrics: entry
+                            .usage
+                            .as_ref()
+                            .map(|u| (u.input_tokens, u.output_tokens, u.reasoning)),
+                        time_ms: entry.usage.as_ref().map(|u| u.llm_ms).filter(|v| *v > 0),
+                        tool: None,
+                    });
+                    for block in &entry.blocks {
+                        if let MsgBlock::Tool(tool) = block {
+                            let (_, summary, _) =
+                                widgets::tool_row_texts(&tool.name, &tool.arguments);
+                            cells.push(TrajCell {
+                                turn: entry.turn,
+                                kind: TrajKind::Tool,
+                                index: cells.len() + 1,
+                                text: widgets::display_path(&summary, &self.cwd),
+                                metrics: None,
+                                time_ms: None,
+                                tool: Some(tool.clone()),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    /// Inspect 跳转行号换算：第 ord 个工具 cell（0 起，旧工具块计数序）在
+    /// 新台账滚动容器里的子节点下标（轮头条与非工具 cell 都占位）。
+    fn traj_child_index(&self, ord: usize) -> usize {
+        let cells = self.traj_cells();
+        let mut p = 0usize;
+        let mut seen = 0usize;
+        for (i, c) in cells.iter().enumerate() {
+            if c.kind == TrajKind::Tool {
+                if seen == ord {
+                    p = i;
+                    break;
+                }
+                seen += 1;
+            }
+        }
+        let mut headers = 0usize;
+        let mut last: Option<u64> = None;
+        for c in cells.iter().take(p + 1) {
+            if last != Some(c.turn) {
+                headers += 1;
+                last = Some(c.turn);
+            }
+        }
+        p + headers
+    }
+
+    /// 44px 轮头条（上游 TrajectoryTurnHeader）：轮次标题 + 四列标签。
+    fn traj_turn_header(&self, turn: u64, width: f32) -> TrajHeader {
+        let _ = width;
+        TrajHeader { turn }
+    }
+
+    /// 38px cell 行（上游 TrajectoryCell）：#序号 + tag 药丸 + 摘要 + 指标栏。
+    fn traj_cell_row(
+        &self,
+        c: &TrajCell,
+        selected: Option<&ToolDetail>,
+        this: &Entity<Self>,
+        _section: usize,
+    ) -> Stateful<Div> {
+        let t = theme::t();
+        let (tag_label, tag_fg, tag_bg) = match c.kind {
+            TrajKind::User => ("用户", t.green, t.success_tertiary),
+            TrajKind::Message => ("消息", t.tag_message_fg, t.tag_message_bg),
+            TrajKind::Tool => ("工具", t.warn_label, t.warn_tertiary),
+        };
+        let is_sel = match (&c.tool, selected) {
+            (Some(tool), Some(sel)) => sel.name == tool.name && sel.arguments == tool.arguments,
+            _ => false,
+        };
+        // 选中环：上游 .selected 是 inset 2px 品牌环；GPUI 无 inset shadow，
+        // 用 2px 品牌边框等价（border-box，行高不变）。
+        let mut row = div()
+            .id(("traj", c.index as u64))
+            .flex()
+            // 滚动列是定高 column 容器：子项默认 flex_shrink=1 会把 38px 行
+            // 按溢出比例压扁（实测压到 14px），固定行高必须 flex_none。
+            .flex_none()
+            .items_center()
+            .border(px(if is_sel { 2.0 } else { 0.5 }))
+            .border_color(if is_sel { t.accent.into() } else { t.border_l4 })
+            .rounded(px(8.0))
+            .bg(t.layer3)
+            .h(px(TRAJ_CELL_PX))
+            .overflow_hidden()
+            .pl(px(20.0))
+            .pr(px(8.0))
+            .gap(px(24.0));
+        if c.kind == TrajKind::Tool {
+            let tool = c.tool.clone().unwrap();
+            let th = this.clone();
+            let name = tool.name.clone();
+            let arguments = tool.arguments.clone();
+            let result = tool.result.clone();
+            let error = tool.error;
+            row = row
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::t().hover))
+                .on_click(move |_, _, cx| {
+                    th.update(cx, |v, cx| {
+                        let detail = ToolDetail {
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                            result: result.clone(),
+                            error,
+                        };
+                        v.app.update(cx, |a, cx| {
+                            a.selected_tool = Some(detail);
+                            a.details_open = true;
+                            cx.notify();
+                        });
+                    });
+                });
+        }
+        row = row
+            // #序号（24px 三级色）
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(24.0))
+                    .whitespace_nowrap()
+                    .text_size(px(13.0))
+                    .line_height(px(20.0))
+                    .text_color(t.text_3)
+                    .child(format!("#{}", c.index)),
+            )
+            // 种类 tag 药丸（80px 槽 / 22px 丸 / 6px 圆角）
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(80.0))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .h(px(22.0))
+                            .px_1()
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .bg(tag_bg)
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tag_fg)
+                            .child(tag_label),
+                    ),
+            )
+            // 摘要（主文字色 + 单行省略；错误终态前置状态点）
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .when(
+                        c.tool.as_ref().is_some_and(|tl| tl.error && tl.result.is_some()),
+                        |s| s.child(state_dot(t.error)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .text_color(t.text)
+                            .child(c.text.clone()),
+                    ),
+            )
+            // 右 320px 指标栏（4×71 + 3×12；消息行三指标，其余占位空串）
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(320.0))
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(12.0))
+                    .child(traj_metric(
+                        c.metrics.as_ref().map(|m| m.0.to_string()).unwrap_or_default(),
+                    ))
+                    .child(traj_metric(
+                        c.metrics.as_ref().map(|m| m.1.to_string()).unwrap_or_default(),
+                    ))
+                    .child(traj_metric(
+                        c.metrics
+                            .as_ref()
+                            .and_then(|m| m.2)
+                            .map(|v| v.to_string())
+                            .unwrap_or_default(),
+                    ))
+                    .child(traj_metric(match c.time_ms {
+                        Some(ms) => format!(
+                            "{} 毫秒",
+                            ms.to_string()
+                                .as_bytes()
+                                .rchunks(3)
+                                .rev()
+                                .map(|c| std::str::from_utf8(c).unwrap_or_default())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                        None => "—".to_string(),
+                    })),
+            );
+        row
+    }
+}
+
+/// 台账行高规格（上游 TrajectoryCell/TrajectoryTurnHeader module.css 实值）。
+const TRAJ_CELL_PX: f32 = 38.0;
+const TRAJ_HEADER_PX: f32 = 44.0;
+const TRAJ_PAD_PX: f32 = 16.0;
+/// 轮头条内容道最大宽（上游 .inner max-width: 880px）。
+const TRAJ_LANE_MAX_PX: f32 = 880.0;
+
+/// 轨迹台账 cell（上游 TrajectoryCellProps 的 rustdsh 子集）。
+struct TrajCell {
+    turn: u64,
+    kind: TrajKind,
+    /// 全局序号（上游 #index，1 起）。
+    index: usize,
+    text: String,
+    /// 消息行 usage 三指标（输入/输出/思考）。
+    metrics: Option<(u64, u64, Option<u64>)>,
+    /// 时长列（消息行 = 轮 llm 用时；rustdsh 日志无事件级时间戳，工具行恒 —）。
+    time_ms: Option<u64>,
+    tool: Option<ToolBlock>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TrajKind {
+    User,
+    Message,
+    Tool,
+}
+
+/// 指标/时间列单元（71px 定宽三级色，上游 .metric/.time）。
+fn traj_metric(text: String) -> Div {
+    div()
+        .flex_none()
+        .w(px(71.0))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(px(13.0))
+        .line_height(px(20.0))
+        .text_color(theme::t().text_3)
+        .child(text)
+}
+
+/// 轮头条构建器（流内与吸顶覆盖层共用同一规格）。
+struct TrajHeader {
+    turn: u64,
+}
+
+impl TrajHeader {
+    fn bar(&self) -> Div {
+        let t = theme::t();
+        // 流内靠 v_flex 交叉轴 stretch 取满列宽（滚动内容盒里百分比宽
+        // 会退化成 fit-content）；吸顶覆盖层父宽确定，另补 w_full。
+        div()
+            .flex_none()
+            .h(px(TRAJ_HEADER_PX))
+            .bg(t.ghost_active)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .flex_grow()
+                    .max_w(px(TRAJ_LANE_MAX_PX))
+                    .h_full()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(t.text)
+                            .child(format!("第 {} 轮", self.turn)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(320.0))
+                            .mr_2()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(traj_col_label("输入"))
+                            .child(traj_col_label("输出"))
+                            .child(traj_col_label("思考"))
+                            .child(traj_col_label("时间")),
+                    ),
+            )
+    }
+
+    /// 吸顶覆盖层包装（父宽由 absolute 左右锚定确定，百分比宽可用）。
+    fn sticky_overlay(&self, lane: f32) -> Div {
+        let _ = lane;
+        self.bar().w_full()
+    }
+}
+
+/// 轮头条列标签（上游 .column：71px 定宽二级色）。
+fn traj_col_label(text: &'static str) -> Div {
+    div()
+        .flex_none()
+        .w(px(71.0))
+        .text_size(px(13.0))
+        .line_height(px(20.0))
+        .text_color(theme::t().text_2)
+        .child(text)
 }
 
 // --- 轮次导航栏（web TurnNavigator，上游 0.1.2-alpha.3） ---------------------
@@ -2581,7 +2962,9 @@ impl Render for ChatView {
 
         let this = cx.entity();
         if self.tab == CenterTab::Trajectory {
-            return self.render_trajectory(&this, content_w).into_any_element();
+            // 轨迹通栏（上游 views.module.css .root width:100%），不吃对话
+            // 内容列的 680~920 限宽
+            return self.render_trajectory(&this, width, cx).into_any_element();
         }
 
         let chat_list_state = self.chat_list.clone();

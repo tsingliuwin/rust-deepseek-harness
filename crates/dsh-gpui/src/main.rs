@@ -194,6 +194,19 @@ struct ToolDetail {
     error: bool,
 }
 
+/// 轨迹台账消息/用户 cell 的详情载荷（上游 message record 详情面的
+/// rustdsh 子集：正文 + 思考 + usage；tool cell 走 ToolDetail）。
+#[derive(Clone, PartialEq)]
+struct MessageDetail {
+    /// 台账全局序号（选中环匹配键）。
+    index: usize,
+    kind_label: &'static str,
+    turn: u64,
+    text: String,
+    reasoning: Option<String>,
+    usage: Option<(u64, u64, Option<u64>)>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum CenterTab {
     Conversation,
@@ -1403,6 +1416,8 @@ struct AppView {
     sidebar_collapsed: bool,
     sidebar_width: f32,
     details_open: bool,
+    /// 轨迹消息/用户 cell 详情（与 selected_tool 互斥）
+    selected_message: Option<MessageDetail>,
     details_width: f32,
     viewport: f32,
     // 详情选中
@@ -1591,6 +1606,7 @@ impl AppView {
             sidebar_width: SIDEBAR_DEFAULT,
             // web ui-layout init：details 0 = 启动收起，布局不持久化
             details_open: false,
+            selected_message: None,
             details_width: DETAILS_DEFAULT,
             viewport: 1280.0,
             selected_tool: None,
@@ -1800,6 +1816,7 @@ impl AppView {
         self.sync_fs_sandbox();
         self.agent.set_session(session);
         self.selected_tool = None;
+        self.selected_message = None;
         // 回放 + 折叠态/列表重置都在 ChatView 内完成（含虚拟列表 reset：
         // 条目整体换血，splice 会保留旧测高，scroll_to_reveal 按陈旧高度
         // 算偏移会落进空白区——切后看不到内容）
@@ -1845,6 +1862,7 @@ impl AppView {
         self.sync_fs_sandbox();
         self.agent.set_session(Session::new(id.clone()));
         self.selected_tool = None;
+        self.selected_message = None;
         self.chat.update(cx, |c, cx| {
             c.reset_empty();
             cx.notify();
@@ -1883,6 +1901,7 @@ impl AppView {
     fn enter_blank_draft(&mut self, cx: &mut Context<Self>) {
         self.agent.set_session(Session::new(self.alloc_session_id()));
         self.selected_tool = None;
+        self.selected_message = None;
         self.chat.update(cx, |c, cx| {
             c.reset_empty();
             cx.notify();
@@ -1990,6 +2009,7 @@ impl AppView {
         }
         self.agent.set_session(Session::new(new_id.clone()));
         self.selected_tool = None;
+        self.selected_message = None;
         self.chat.update(cx, |c, cx| {
             c.reset_empty();
             cx.notify();
@@ -3999,18 +4019,55 @@ impl AppView {
     fn render_details(&self, width: f32, this: Entity<AppView>) -> Div {
         let t = this.clone();
         let mut body = div().id("details-body").flex_1().min_h_0().overflow_y_scroll().px_4().py_3();
-        match &self.selected_tool {
-            None => {
+        match (&self.selected_tool, &self.selected_message) {
+            (_, Some(m)) => {
+                // 消息/用户 cell 详情：种类行 + 思考 + 正文 + usage
+                body = body
+                    .child(detail_section(
+                        "种类",
+                        div()
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .text_color(theme::t().text)
+                            .child(format!("{} · 第 {} 轮 · #{}", m.kind_label, m.turn, m.index)),
+                    ))
+                    .when_some(m.reasoning.clone(), |b, r| {
+                        b.child(detail_section("思考", prose_card(r, theme::t().text_2)))
+                    })
+                    .child(detail_section(
+                        "内容",
+                        if m.text.trim().is_empty() {
+                            prose_card("（仅工具调用）".into(), theme::t().caption)
+                        } else {
+                            prose_card(m.text.clone(), theme::t().text)
+                        },
+                    ))
+                    .when_some(m.usage, |b, u| {
+                        b.child(detail_section(
+                            "Token 用量",
+                            prose_card(
+                                format!(
+                                    "输入 {} · 输出 {} · 思考 {}",
+                                    u.0,
+                                    u.1,
+                                    u.2.map(|v| v.to_string()).unwrap_or_else(|| "—".into())
+                                ),
+                                theme::t().text_2,
+                            ),
+                        ))
+                    });
+            }
+            (None, None) => {
                 body = body.child(
                     div()
                         .py_2()
                         .text_size(px(13.0))
                         .line_height(px(20.0))
                         .text_color(theme::t().text_3)
-                        .child("点击消息流中的工具行查看详情"),
+                        .child("点击台账或消息流中的工具/消息行查看详情"),
                 );
             }
-            Some(tool) => {
+            (Some(tool), None) => {
                 body = body
                     .child(detail_section("工具", div().text_color(theme::t().text).child(tool.name.clone())))
                     .child(detail_section(
@@ -4075,6 +4132,19 @@ impl AppView {
 
 
 
+
+/// 详情面板散文块（消息正文/思考：13/20 逐行 div 保换行——gpui 0.2.2 无
+/// pre-wrap；工具面走 code_card）。
+fn prose_card(text: String, color: Rgba) -> Div {
+    div()
+        .v_flex()
+        .text_size(px(13.0))
+        .line_height(px(20.0))
+        .text_color(color)
+        .children(text.split('\n').map(|l| {
+            div().child(if l.is_empty() { "\u{00A0}".to_string() } else { l.to_string() })
+        }))
+}
 
 /// 视图菜单分组 label（web Menu label：caption 色小字）。
 /// web increasedForkTitle：`标题 (N)` / `标题（N）` 后缀自增，无后缀补 ` (1)`。

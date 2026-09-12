@@ -12,9 +12,9 @@ use crate::layout;
 use crate::theme;
 use crate::widgets::{self, dot_sep, state_dot, tip};
 use crate::{
-    AppView, CenterTab, ChatEntry, ContextInfo, MsgBlock, Role, ToolBlock, ToolDetail,
-    TranscriptView, TurnUsage, format_latency_seconds, format_message_clock, format_run_duration,
-    format_tokens_compact, format_tokens_exact, format_tps, now_ms,
+    AppView, CenterTab, ChatEntry, ContextInfo, MessageDetail, MsgBlock, Role, ToolBlock,
+    ToolDetail, TranscriptView, TurnUsage, format_latency_seconds, format_message_clock,
+    format_run_duration, format_tokens_compact, format_tokens_exact, format_tps, now_ms,
 };
 use dsh_session_projection::turn_outline::{
     PROMPT_PREVIEW_LIMIT, RESPONSE_PREVIEW_LIMIT, preview_parts,
@@ -22,6 +22,8 @@ use dsh_session_projection::turn_outline::{
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::ButtonVariants;
+// uniform_list 句柄的 offset() 在该 trait 上（吸顶算式读滚动偏移用）
+use gpui_component::scroll::ScrollbarHandle;
 use gpui_component::{Icon, IconName, StyledExt};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -277,8 +279,8 @@ pub(crate) struct ChatView {
     running: bool,
     turn_started_at: Option<Instant>,
     pub(crate) tab: CenterTab,
-    /// 轨迹 tab 滚动句柄（Inspect pill 跳转 scroll_to_item）
-    traj_scroll: ScrollHandle,
+    /// 轨迹 tab 虚拟化列表滚动句柄（Inspect pill 跳转 scroll_to_item）
+    traj_ul: UniformListScrollHandle,
     /// 当前（或最近）轮次号（web turn-process 的分组键）
     ui_turn: u64,
     /// 仍打开的轮次（TurnStarted→TurnEnded；打开的轮次不折叠）
@@ -358,7 +360,7 @@ impl ChatView {
             running: false,
             turn_started_at: None,
             tab: CenterTab::Conversation,
-            traj_scroll: ScrollHandle::new(),
+            traj_ul: UniformListScrollHandle::new(),
             ui_turn: 0,
             turn_open: None,
             turn_expanded: Default::default(),
@@ -1760,7 +1762,7 @@ open: false,
                                 .on_click(move |_, _, cx| {
                                     t_insp.update(cx, |v, cx| {
                                         v.tab = CenterTab::Trajectory;
-                                        v.traj_scroll.scroll_to_item(traj_ix);
+                                        v.traj_ul.scroll_to_item(traj_ix, ScrollStrategy::Top);
                                         cx.notify();
                                     });
                                 })
@@ -2129,71 +2131,112 @@ open: false,
     /// 轨迹 tab：轮次分组的事件台账（上游 ui-trajectory TrajectoryTable 的
     /// GPUI 对应物）。行 = 38px 卡片 cell（序号 + 种类 tag 药丸 + 摘要 +
     /// 右 320px 指标栏）；每轮一条 44px 吸顶轮头条（列标签 输入/输出/思考/时间）。
-    /// 滚动容器在本方法内（track_scroll 接 Inspect pill 的 scroll_to_item；
-    /// 行必须是其直接子节点才能按行号跳转）。
-    fn render_trajectory(&self, this: &Entity<Self>, width: f32, cx: &App) -> Stateful<Div> {
-        // --- 台账行派生（user / message / tool 三类 cell，全局 #序号连续）---
-        let cells = self.traj_cells();
-        // 轮次分段：[轮号, 起始行下标, 行数]（cells 按轮连续）
-        let mut sections: Vec<(u64, usize, usize)> = Vec::new();
-        for (ci, c) in cells.iter().enumerate() {
-            match sections.last_mut() {
-                Some(last) if last.0 == c.turn => last.2 += 1,
-                _ => sections.push((c.turn, ci, 1)),
-            }
-        }
+    /// 滚动走 uniform_list 虚拟化（上游 web 同有 virtualSpacer）：只渲染视口
+    /// 内 item，整表重排的帧成本消失；Inspect pill 经 scroll_to_item 跳转。
+    fn render_trajectory(&self, this: &Entity<Self>, width: f32, _cx: &App) -> Stateful<Div> {
+        // --- 平坦行模型 + 累积顶边（item 高度由 mb 几何固定：52/48/60）---
+        let (rows_model, tops) = self.traj_rows();
+        let cells_rc: Rc<Vec<TrajCell>> = Rc::new(self.traj_cells());
+        let rows_rc: Rc<Vec<TrajRow>> = Rc::new(rows_model);
         let t = theme::t();
-        let selected = self.app.read_with(cx, |a, _| a.selected_tool.clone());
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (si, &(turn, start, count)) in sections.iter().enumerate() {
-            rows.push(self.traj_turn_header(turn, width).bar().into_any_element());
-            for c in &cells[start..start + count] {
-                rows.push(
-                    self.traj_cell_row(c, selected.as_ref(), this, si)
-                        .into_any_element(),
-                );
-            }
-        }
+        let lane = TRAJ_LANE_MAX_PX.min(width);
         // --- 吸顶轮头覆盖层（CSS position:sticky 的 GPUI 等价：固定行高可算
         // 出各段偏移；轮头过视口顶即贴顶，段尾临近随段尾上移、不越出父段）---
-        let scrolled = -self.traj_scroll.offset().y.to_f64() as f32;
-        let mut y = TRAJ_PAD_PX;
+        let scrolled = -self.traj_ul.offset().y.to_f64() as f32;
+        // 轮头位置表：(轮号, 顶边)；段尾 = 下一轮头顶边，末段 = 表尾总高
+        let headers: Vec<(u64, f32)> = rows_rc
+            .iter()
+            .zip(tops.iter())
+            .filter_map(|(r, &top)| match r {
+                TrajRow::Header(turn) => Some((*turn, top)),
+                _ => None,
+            })
+            .collect();
+        let total_h = match (rows_rc.last(), tops.last()) {
+            (Some(TrajRow::Header(_)), Some(&top)) => top + TRAJ_HEADER_PX + TRAJ_BODY_PAD_T_PX,
+            (Some(TrajRow::Cell(_)), Some(&top)) => top + TRAJ_CELL_PX + TRAJ_BODY_PAD_B_PX,
+            _ => 0.0,
+        };
         let mut sticky: Option<(u64, f32)> = None;
-        for &(turn, _start, count) in &sections {
-            let section_h = TRAJ_HEADER_PX + count as f32 * TRAJ_CELL_PX;
-            let header_top = y;
-            let section_bottom = y + section_h;
+        for (k, &(turn, header_top)) in headers.iter().enumerate() {
+            let section_bottom = headers.get(k + 1).map(|h| h.1).unwrap_or(total_h);
             // CSS sticky top:0：轮头过视口顶才画覆盖层；贴顶后恒 0，段尾
-            // 临近（bottom-44-scrolled < 0）随段尾上移、不越出父段。
+            // 临近随段尾上移、不越出父段。
             if scrolled > header_top && scrolled < section_bottom {
                 let top = (header_top - scrolled)
                     .max(0.0)
                     .min(section_bottom - TRAJ_HEADER_PX - scrolled);
                 sticky = Some((turn, top));
             }
-            y += section_h;
         }
-        // 台账行通栏（上游表格行占满面板宽）；轮头条内容道限 880 居中。
-        let lane = TRAJ_LANE_MAX_PX.min(width);
+        // --- 虚拟化列表：item 渲染只取视口 range ---
+        let ul_this = this.clone();
+        let ul_cells = Rc::clone(&cells_rc);
+        let ul_rows = Rc::clone(&rows_rc);
+        let list = gpui::uniform_list(
+            "traj-list",
+            rows_rc.len(),
+            move |range, _window, cx| {
+                let (selected, selected_msg) = ul_this.read_with(cx, |v, cx2| {
+                    v.app.read_with(cx2, |a, _| {
+                        (
+                            a.selected_tool.clone(),
+                            a.selected_message.as_ref().map(|m| m.index),
+                        )
+                    })
+                });
+                range
+                    .map(|ix| match ul_rows[ix] {
+                        TrajRow::Header(turn) => ul_this
+                            .read_with(cx, |v, _| v.traj_turn_header(turn, 0.0))
+                            // uniform_list item 不继承交叉轴 stretch：通栏
+                            // 铺底必须显式 w_full（否则 fit-content 缩左半）
+                            .bar()
+                            .w_full()
+                            .mb(px(TRAJ_BODY_PAD_T_PX))
+                            .into_any_element(),
+                        TrajRow::Cell(ci) => {
+                            let last_in_turn =
+                                matches!(ul_rows.get(ix + 1), Some(TrajRow::Header(_)) | None);
+                            let row = ul_this.read_with(cx, |v, _| {
+                                v.traj_cell_row(
+                                    &ul_cells[ci],
+                                    selected.as_ref(),
+                                    &ul_this,
+                                    0,
+                                    lane,
+                                    selected_msg,
+                                )
+                            });
+                            div()
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    row.mb(px(if last_in_turn {
+                                        TRAJ_BODY_PAD_B_PX
+                                    } else {
+                                        TRAJ_CELL_GAP_PX
+                                    })),
+                                )
+                                .into_any_element()
+                        }
+                    })
+                    .collect()
+            },
+        )
+        .track_scroll(self.traj_ul.clone())
+        .w_full()
+        .h_full();
+        // 轮头通栏铺底 + 内层 880 居中道；行卡 848（道内 padding 16）居中——
+        // 行右 320px 指标栏与轮头列标签同靠居中道右缘（lane-24）对齐。
         let mut col = div()
             .id("traj-col")
             .relative()
             .h_full()
             .w_full()
-            .child(
-                div()
-                    .id("traj-scroll")
-                    .h_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.traj_scroll)
-                    .w_full()
-                    .max_w(px(width))
-                    .mx_auto()
-                    .v_flex()
-                    .py_4()
-                    .children(rows),
-            );
-        if cells.is_empty() {
+            .child(list);
+        if cells_rc.is_empty() {
             col = col.child(
                 div()
                     .absolute()
@@ -2223,6 +2266,34 @@ open: false,
 
     /// 台账 cell 派生：user/context/notice → 用户 cell；assistant → 消息 cell
     /// （带 usage 三指标与 llm 用时）+ 逐工具 cell。序号全局连续（上游 #index）。
+    /// 台账平坦行模型（虚拟化与吸顶算式同源）：轮头 item 52px（44 条 +
+    /// 8 进轮体）、cell item 48px（38 + 10 gap）、轮尾 cell 60px（38 + 22）。
+    fn traj_rows(&self) -> (Vec<TrajRow>, Vec<f32>) {
+        let cells = self.traj_cells();
+        let mut rows: Vec<TrajRow> = Vec::new();
+        let mut tops: Vec<f32> = Vec::new();
+        let mut y = 0.0f32;
+        let mut last_turn: Option<u64> = None;
+        for (ci, c) in cells.iter().enumerate() {
+            if last_turn != Some(c.turn) {
+                rows.push(TrajRow::Header(c.turn));
+                tops.push(y);
+                y += TRAJ_HEADER_PX + TRAJ_BODY_PAD_T_PX;
+                last_turn = Some(c.turn);
+            }
+            rows.push(TrajRow::Cell(ci));
+            tops.push(y);
+            let last_in_turn = cells.get(ci + 1).map(|n| n.turn != c.turn).unwrap_or(true);
+            y += TRAJ_CELL_PX
+                + if last_in_turn {
+                    TRAJ_BODY_PAD_B_PX
+                } else {
+                    TRAJ_CELL_GAP_PX
+                };
+        }
+        (rows, tops)
+    }
+
     fn traj_cells(&self) -> Vec<TrajCell> {
         let mut cells: Vec<TrajCell> = Vec::new();
         for entry in &self.entries {
@@ -2240,6 +2311,12 @@ open: false,
                 .map(|s| s.as_str().replace('\n', " "))
                 .collect::<Vec<_>>()
                 .join(" ");
+            // 详情面板原文（保留换行）
+            let raw = texts
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
             match entry.role {
                 Role::User | Role::Context | Role::Notice => {
                     if joined.trim().is_empty() {
@@ -2250,17 +2327,61 @@ open: false,
                         kind: TrajKind::User,
                         index: cells.len() + 1,
                         text: joined,
+                        dim: false,
+                        detail_text: raw,
+                        reasoning: None,
                         metrics: None,
                         time_ms: None,
                         tool: None,
                     });
                 }
                 Role::Assistant | Role::Error => {
+                    // 上游消息行摘要回退链（layout.ts）：text → reasoning 预览
+                    // → 有工具调用时「仅工具调用」（layout.toolCallOnly）；
+                    // 缺这条链时纯工具调用步在台账里是空白行。
+                    let reasoning = entry
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            MsgBlock::Reasoning { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .map(|s| s.replace('\n', " "))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    // 详情「思考」节原文（保留换行）
+                    let reasoning_raw = entry
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            MsgBlock::Reasoning { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let reasoning_opt = if reasoning_raw.trim().is_empty() {
+                        None
+                    } else {
+                        Some(reasoning_raw)
+                    };
+                    let has_tool = entry.blocks.iter().any(|b| matches!(b, MsgBlock::Tool(_)));
+                    let (text, dim) = if !joined.trim().is_empty() {
+                        (joined, false)
+                    } else if !reasoning.trim().is_empty() {
+                        (reasoning, false)
+                    } else if has_tool {
+                        ("仅工具调用".to_string(), true)
+                    } else {
+                        (joined, false)
+                    };
                     cells.push(TrajCell {
                         turn: entry.turn,
                         kind: TrajKind::Message,
                         index: cells.len() + 1,
-                        text: joined,
+                        text,
+                        dim,
+                        detail_text: raw,
+                        reasoning: reasoning_opt,
                         metrics: entry
                             .usage
                             .as_ref()
@@ -2277,6 +2398,9 @@ open: false,
                                 kind: TrajKind::Tool,
                                 index: cells.len() + 1,
                                 text: widgets::display_path(&summary, &self.cwd),
+                                dim: false,
+                                detail_text: String::new(),
+                                reasoning: None,
                                 metrics: None,
                                 time_ms: None,
                                 tool: Some(tool.clone()),
@@ -2328,6 +2452,8 @@ open: false,
         selected: Option<&ToolDetail>,
         this: &Entity<Self>,
         _section: usize,
+        lane: f32,
+        selected_msg: Option<usize>,
     ) -> Stateful<Div> {
         let t = theme::t();
         let (tag_label, tag_fg, tag_bg) = match c.kind {
@@ -2338,21 +2464,26 @@ open: false,
         let is_sel = match (&c.tool, selected) {
             (Some(tool), Some(sel)) => sel.name == tool.name && sel.arguments == tool.arguments,
             _ => false,
-        };
-        // 选中环：上游 .selected 是 inset 2px 品牌环；GPUI 无 inset shadow，
-        // 用 2px 品牌边框等价（border-box，行高不变）。
+        } || selected_msg == Some(c.index);
+        // 选中环：上游 .selected 是 inset 2px 品牌环（不改布局）；GPUI 无
+        // inset shadow，用 absolute inset_0 的 2px 环覆盖层等价——行边框恒
+        // 0.5px，选中不产生 0.5→2px 的内容内缩跳动。
         let mut row = div()
             .id(("traj", c.index as u64))
+            .relative()
             .flex()
             // 滚动列是定高 column 容器：子项默认 flex_shrink=1 会把 38px 行
             // 按溢出比例压扁（实测压到 14px），固定行高必须 flex_none。
             .flex_none()
             .items_center()
-            .border(px(if is_sel { 2.0 } else { 0.5 }))
-            .border_color(if is_sel { t.accent.into() } else { t.border_l4 })
+            .border(px(0.5))
+            .border_color(t.border_l4)
             .rounded(px(8.0))
             .bg(t.layer3)
             .h(px(TRAJ_CELL_PX))
+            // 行卡 = 880 道内缩 16×2（上游 .body padding 0 16）；居中由调用
+            // 方 w_full + justify_center 外壳承担（item 内 margin 不可靠）
+            .w(px((lane - 32.0).max(0.0)))
             .overflow_hidden()
             .pl(px(20.0))
             .pr(px(8.0))
@@ -2377,6 +2508,35 @@ open: false,
                         };
                         v.app.update(cx, |a, cx| {
                             a.selected_tool = Some(detail);
+                            a.selected_message = None;
+                            a.details_open = true;
+                            cx.notify();
+                        });
+                    });
+                });
+        } else {
+            // 消息/用户 cell 点击开详情（上游 message record 详情面）；
+            // 与工具选中互斥
+            let detail = MessageDetail {
+                index: c.index,
+                kind_label: match c.kind {
+                    TrajKind::User => "用户",
+                    _ => "消息",
+                },
+                turn: c.turn,
+                text: c.detail_text.clone(),
+                reasoning: c.reasoning.clone(),
+                usage: c.metrics,
+            };
+            let th = this.clone();
+            row = row
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::t().hover))
+                .on_click(move |_, _, cx| {
+                    th.update(cx, |v, cx| {
+                        v.app.update(cx, |a, cx| {
+                            a.selected_message = Some(detail.clone());
+                            a.selected_tool = None;
                             a.details_open = true;
                             cx.notify();
                         });
@@ -2439,7 +2599,12 @@ open: false,
                             .text_ellipsis()
                             .text_size(px(13.0))
                             .line_height(px(20.0))
-                            .text_color(t.text)
+                            // 上游工具行内容等宽 12px（[data-kind='tool']
+                            // .contentText），消息/用户行比例 13px
+                            .when(c.kind == TrajKind::Tool, |s| {
+                                s.font_family(widgets::theme_mono()).text_size(px(12.0))
+                            })
+                            .text_color(if c.dim { t.text_3 } else { t.text })
                             .child(c.text.clone()),
                     ),
             )
@@ -2479,6 +2644,18 @@ open: false,
                         None => "—".to_string(),
                     })),
             );
+        // 选中环覆盖层最后渲染（画在行内容之上）；无 click handler，点击
+        // 冒泡到行自身的 on_click。
+        if is_sel {
+            row = row.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded(px(8.0))
+                    .border(px(2.0))
+                    .border_color(t.accent),
+            );
+        }
         row
     }
 }
@@ -2486,9 +2663,12 @@ open: false,
 /// 台账行高规格（上游 TrajectoryCell/TrajectoryTurnHeader module.css 实值）。
 const TRAJ_CELL_PX: f32 = 38.0;
 const TRAJ_HEADER_PX: f32 = 44.0;
-const TRAJ_PAD_PX: f32 = 16.0;
 /// 轮头条内容道最大宽（上游 .inner max-width: 880px）。
 const TRAJ_LANE_MAX_PX: f32 = 880.0;
+/// 轮体规格（上游 TrajectoryTurn .body：gap 10、padding 8/16/22）。
+const TRAJ_CELL_GAP_PX: f32 = 10.0;
+const TRAJ_BODY_PAD_T_PX: f32 = 8.0;
+const TRAJ_BODY_PAD_B_PX: f32 = 22.0;
 
 /// 轨迹台账 cell（上游 TrajectoryCellProps 的 rustdsh 子集）。
 struct TrajCell {
@@ -2497,6 +2677,12 @@ struct TrajCell {
     /// 全局序号（上游 #index，1 起）。
     index: usize,
     text: String,
+    /// 回退摘要行（「仅工具调用」等），三级色渲染（上游 .toolCallOnly）。
+    dim: bool,
+    /// 详情面板用原文（保留换行；text 是单行省略版）。
+    detail_text: String,
+    /// 思考块拼接（消息 cell 详情「思考」节）。
+    reasoning: Option<String>,
     /// 消息行 usage 三指标（输入/输出/思考）。
     metrics: Option<(u64, u64, Option<u64>)>,
     /// 时长列（消息行 = 轮 llm 用时；rustdsh 日志无事件级时间戳，工具行恒 —）。
@@ -2509,6 +2695,13 @@ enum TrajKind {
     User,
     Message,
     Tool,
+}
+
+/// 台账平坦行（uniform_list 虚拟化 item）：轮头条或 cell（cells 下标）。
+#[derive(Clone, Copy)]
+enum TrajRow {
+    Header(u64),
+    Cell(usize),
 }
 
 /// 指标/时间列单元（71px 定宽三级色，上游 .metric/.time）。
@@ -2530,10 +2723,10 @@ struct TrajHeader {
 }
 
 impl TrajHeader {
+    /// 通栏铺底（上游 .root width:100%），内层 880 居中道 px16（.inner）：
+    /// 列标签 mr8 使右缘 = lane-24，与行卡（lane-16 右缘、pr8）同线。
     fn bar(&self) -> Div {
         let t = theme::t();
-        // 流内靠 v_flex 交叉轴 stretch 取满列宽（滚动内容盒里百分比宽
-        // 会退化成 fit-content）；吸顶覆盖层父宽确定，另补 w_full。
         div()
             .flex_none()
             .h(px(TRAJ_HEADER_PX))
@@ -2574,7 +2767,7 @@ impl TrajHeader {
             )
     }
 
-    /// 吸顶覆盖层包装（父宽由 absolute 左右锚定确定，百分比宽可用）。
+    /// 吸顶覆盖层包装：通栏宽（外层 absolute 左右锚定），内层道自动居中。
     fn sticky_overlay(&self, lane: f32) -> Div {
         let _ = lane;
         self.bar().w_full()

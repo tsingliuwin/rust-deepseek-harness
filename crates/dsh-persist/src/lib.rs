@@ -18,6 +18,7 @@ pub use attachments::{attachments_root_from_sessions_root, file_leaf_name, Attac
 
 use dsh_llm::{
     CallId, ContentBlock, FileAttachmentRef, Message, MessageId, MessageSource, Role, SessionId,
+    TokenUsage,
 };
 use dsh_session::{EpochHeader, HeaderReason, Session, SessionEvent};
 use std::fs::{self, File};
@@ -1060,7 +1061,11 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
                 step: num(data, "step"),
                 message: msg,
                 interrupted: false,
-                usage: None,
+                // 轨迹指标列数据源：web 行形 usage 驼峰与 TokenUsage serde
+                // 同构；曾恒 None 致历史会话指标列空。
+                usage: d
+                    .get("usage")
+                    .and_then(|u| serde_json::from_value::<TokenUsage>(u.clone()).ok()),
             })
         }
         "tool/result" => {

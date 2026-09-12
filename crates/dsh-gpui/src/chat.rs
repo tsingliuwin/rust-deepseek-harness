@@ -331,6 +331,8 @@ pub(crate) struct ChatView {
     tool_starts: HashMap<String, Instant>,
     /// 当前步首事件秒表（step 窗起点；AssistantMessage 收割）
     step_start_inst: Option<Instant>,
+    /// 轮内步计数（实时「步骤 N」组头；TurnStarted 归零）
+    ui_step: u64,
     /// 本轮累计工具耗时（LLM 时间 = 轮用时 − 工具时间）
     turn_tool_time: Duration,
     /// 本轮 token 累计（TurnEnded 冻结进消息 footer 的统计快照）
@@ -407,6 +409,7 @@ impl ChatView {
             heights_dirty: Cell::new(false),
             tool_starts: Default::default(),
             step_start_inst: None,
+            ui_step: 0,
             turn_tool_time: Duration::ZERO,
             turn_usage: TurnUsage::default(),
             turn_first_token: None,
@@ -650,6 +653,7 @@ impl ChatView {
                     // 失败轮次在历史里也要可见（实时路径由 AgentEvent::Error
                     // 入列；回放此前只有用户气泡、轮次看起来凭空蒸发）
                     self.entries.push(ChatEntry {
+                        step: None,
                         step_duration_ms: None,
                         role: Role::Error,
                         blocks: vec![MsgBlock::Text(format!("[{}] {}", failure.code, failure.message))],
@@ -703,6 +707,7 @@ impl ChatView {
                         // 轨迹指标列数据源：事件级 usage 落条目快照
                         // （计时字段日志无承载，留 0 → 时长列按缺省 — 渲染）
                         self.entries.push(ChatEntry {
+                            step: None,
                             step_duration_ms: None,
                             role: Role::Assistant,
                             blocks,
@@ -733,6 +738,9 @@ impl ChatView {
                                 .map(|(t, st)| t.saturating_sub(*st))
                                 .filter(|v| *v > 0);
                         }
+                        if let Some(e) = self.entries.last_mut() {
+                            e.step = Some(*step);
+                        }
                         last_msg_time = msg_t;
                     }
                 }
@@ -754,6 +762,7 @@ impl ChatView {
                         continue;
                     }
                     self.entries.push(ChatEntry {
+                        step: None,
                         step_duration_ms: None,
                         role: Role::Context,
                         blocks: vec![MsgBlock::Text(text)],
@@ -812,6 +821,7 @@ impl ChatView {
                     {
                         let info = crate::context_info(context_kind, plugin, form, summary, changes_paths, reference_labels, name);
                         self.entries.push(ChatEntry {
+                            step: None,
                             step_duration_ms: None,
                             role: Role::Context,
                             blocks: vec![MsgBlock::Text(text)],
@@ -828,6 +838,7 @@ impl ChatView {
                         blocks.push(MsgBlock::Text(text));
                     }
                     self.entries.push(ChatEntry {
+                        step: None,
                         step_duration_ms: None,
                         role: Role::User,
                         blocks,
@@ -870,6 +881,7 @@ impl ChatView {
                 }
                 SessionEvent::Compaction { .. } => {
                     self.entries.push(ChatEntry {
+step: None,
 step_duration_ms: None, role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: cur_turn, context: None,
 open: false,
 });
@@ -887,6 +899,7 @@ open: false,
         let new = !matches!(self.entries.last(), Some(e) if e.role == Role::Assistant && !e.done);
         if new {
             self.entries.push(ChatEntry {
+                step: None,
                 step_duration_ms: None,
                 role: Role::Assistant,
                 blocks: Vec::new(),
@@ -932,6 +945,7 @@ open: false,
             blocks.push(MsgBlock::Text(t));
         }
         self.entries.push(ChatEntry {
+            step: None,
             step_duration_ms: None,
             role: Role::User,
             blocks,
@@ -947,6 +961,7 @@ open: false,
     /// @ 文件引用的上下文注入行入列。
     pub(crate) fn push_context_entry(&mut self, info: ContextInfo, text: String) {
         self.entries.push(ChatEntry {
+            step: None,
             step_duration_ms: None,
             role: Role::Context,
             blocks: vec![MsgBlock::Text(text)],
@@ -995,6 +1010,7 @@ open: false,
                 self.turn_first_token = None;
                 self.tool_starts.clear();
                 self.step_start_inst = None;
+                self.ui_step = 0;
                 self.heights_dirty.set(false);
             }
             AgentEvent::TextDelta { text } => {
@@ -1052,10 +1068,14 @@ open: false,
             }
             AgentEvent::AssistantMessage { usage, .. } => {
                 self.stats_steps += 1;
+                self.ui_step += 1;
                 if let Some(st) = self.step_start_inst.take() {
                     if let Some(e) = self.entries.last_mut() {
                         e.step_duration_ms = Some(st.elapsed().as_millis() as u64).filter(|v| *v > 0);
+                        e.step = Some(self.ui_step);
                     }
+                } else if let Some(e) = self.entries.last_mut() {
+                    e.step = Some(self.ui_step);
                 }
                 if let Some(u) = &usage {
                     self.stats_input_tokens += u.input_tokens;
@@ -1154,6 +1174,7 @@ open: false,
                 self.running = false;
                 self.turn_started_at = None;
                 self.entries.push(ChatEntry {
+                    step: None,
                     step_duration_ms: None,
                     role: Role::Error,
                     blocks: vec![MsgBlock::Text(message)],
@@ -1166,6 +1187,7 @@ open: false,
             }
             AgentEvent::Compacted { .. } => {
                 self.entries.push(ChatEntry {
+step: None,
 step_duration_ms: None, role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: self.ui_turn, context: None,
 open: false,
 });
@@ -2290,6 +2312,7 @@ open: false,
         let total_h = match (rows_rc.last(), tops.last()) {
             (Some(TrajRow::Header(_)), Some(&top)) => top + TRAJ_HEADER_PX + TRAJ_BODY_PAD_T_PX,
             (Some(TrajRow::Cell(_)), Some(&top)) => top + TRAJ_CELL_PX + TRAJ_BODY_PAD_B_PX,
+            (Some(TrajRow::Group(..)), Some(&top)) => top + TRAJ_GROUP_PX + TRAJ_CELL_GAP_PX,
             (Some(TrajRow::TurnSummary(..)), Some(&top)) => top + TRAJ_SUMMARY_PX + TRAJ_BODY_PAD_B_PX,
             (Some(TrajRow::AssistantSummary(..)), Some(&top)) => {
                 top + TRAJ_SUMMARY_PX + TRAJ_BODY_PAD_B_PX
@@ -2418,6 +2441,47 @@ open: false,
                                 })
                                 .w_full()
                                 .mb(px(TRAJ_BODY_PAD_T_PX))
+                                .into_any_element()
+                        }
+                        TrajRow::Group(title, desc) => {
+                            let title = title.clone();
+                            let desc = desc.clone();
+                            div()
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .h(px(TRAJ_GROUP_PX))
+                                        .w(px((lane - 32.0).max(0.0)))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(24.0))
+                                        .px(px(20.0))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(px(13.0))
+                                                .line_height(px(20.0))
+                                                .text_color(t.text)
+                                                .child(title),
+                                        )
+                                        .when(!desc.is_empty(), |d| {
+                                            d.child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .overflow_hidden()
+                                                    .whitespace_nowrap()
+                                                    .text_ellipsis()
+                                                    .text_size(px(13.0))
+                                                    .line_height(px(20.0))
+                                                    .text_color(t.text_3)
+                                                    .child(desc),
+                                            )
+                                        })
+                                        .mb(px(TRAJ_CELL_GAP_PX)),
+                                )
                                 .into_any_element()
                         }
                         TrajRow::TurnSummary(t0, text) => {
@@ -2820,41 +2884,100 @@ open: false,
                     }
                 }
             }
-            // 折叠助手：消息行 + 其后工具行 → 单条摘要行
-            let tool_run = cells[ci..]
-                .iter()
-                .skip(1)
-                .take_while(|n| n.kind == TrajKind::Tool)
-                .count();
-            if c.kind == TrajKind::Message
-                && tool_run > 0
-                && collapsed_assistants.contains(&c.index)
-            {
-                let last_in_turn = cells
-                    .get(ci + tool_run + 1)
-                    .map(|n| n.turn != c.turn)
-                    .unwrap_or(true);
-                rows.push(TrajRow::AssistantSummary(c.index, c.text.clone()));
+            // --- 组头（上游 Message / 步骤 N 组）：user 系 cell 归消息组
+            // （连续合并）；带步号的消息 cell 连同其后工具行归步骤组 ---
+            let is_msg_group_head =
+                c.kind == TrajKind::User || (c.kind == TrajKind::Message && c.step.is_none());
+            let is_step_head = c.kind == TrajKind::Message && c.step.is_some();
+            let group_len = if is_step_head {
+                1 + cells[ci + 1..]
+                    .iter()
+                    .take_while(|n| n.turn == c.turn && n.kind == TrajKind::Tool)
+                    .count()
+            } else if is_msg_group_head {
+                cells[ci..]
+                    .iter()
+                    .take_while(|n| {
+                        n.turn == c.turn
+                            && (n.kind == TrajKind::User
+                                || (n.kind == TrajKind::Message && n.step.is_none()))
+                    })
+                    .count()
+                    .max(1)
+            } else {
+                // 孤儿工具行（理论上不出现）：单独成组
+                1
+            };
+            let group_cells = &cells[ci..ci + group_len];
+            let desc_ms: u64 = group_cells.iter().filter_map(|n| n.time_ms).sum();
+            let title: String = if is_step_head {
+                format!("步骤 {}", c.step.unwrap_or(1))
+            } else {
+                "消息".to_string()
+            };
+            rows.push(TrajRow::Group(
+                title,
+                if desc_ms > 0 {
+                    format!(
+                        "{} 毫秒",
+                        desc_ms
+                            .to_string()
+                            .as_bytes()
+                            .rchunks(3)
+                            .rev()
+                            .map(|b| std::str::from_utf8(b).unwrap_or_default())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                } else {
+                    String::new()
+                },
+            ));
+            tops.push(y);
+            y += TRAJ_GROUP_PX + TRAJ_CELL_GAP_PX;
+            // 组内行：助手折叠时消息行 + 其后工具行 → 单条摘要行
+            let mut gi = 0usize;
+            while gi < group_len {
+                let gc = &cells[ci + gi];
+                let tool_run = cells[ci + gi..]
+                    .iter()
+                    .skip(1)
+                    .take_while(|n| n.kind == TrajKind::Tool)
+                    .count();
+                if gc.kind == TrajKind::Message
+                    && tool_run > 0
+                    && collapsed_assistants.contains(&gc.index)
+                {
+                    let last_in_turn = cells
+                        .get(ci + gi + tool_run + 1)
+                        .map(|n| n.turn != gc.turn)
+                        .unwrap_or(true);
+                    rows.push(TrajRow::AssistantSummary(gc.index, gc.text.clone()));
+                    tops.push(y);
+                    y += TRAJ_SUMMARY_PX
+                        + if last_in_turn {
+                            TRAJ_BODY_PAD_B_PX
+                        } else {
+                            TRAJ_CELL_GAP_PX
+                        };
+                    gi += tool_run + 1;
+                    continue;
+                }
+                rows.push(TrajRow::Cell(ci + gi));
                 tops.push(y);
-                y += TRAJ_SUMMARY_PX
+                let last_in_turn = cells
+                    .get(ci + gi + 1)
+                    .map(|n| n.turn != gc.turn)
+                    .unwrap_or(true);
+                y += TRAJ_CELL_PX
                     + if last_in_turn {
                         TRAJ_BODY_PAD_B_PX
                     } else {
                         TRAJ_CELL_GAP_PX
                     };
-                ci += tool_run + 1;
-                continue;
+                gi += 1;
             }
-            rows.push(TrajRow::Cell(ci));
-            tops.push(y);
-            let last_in_turn = cells.get(ci + 1).map(|n| n.turn != c.turn).unwrap_or(true);
-            y += TRAJ_CELL_PX
-                + if last_in_turn {
-                    TRAJ_BODY_PAD_B_PX
-                } else {
-                    TRAJ_CELL_GAP_PX
-                };
-            ci += 1;
+            ci += group_len;
         }
         (rows, tops)
     }
@@ -2893,6 +3016,7 @@ open: false,
                         index: cells.len() + 1,
                         text: joined,
                         dim: false,
+                        step: None,
                         detail_text: raw,
                         reasoning: None,
                         metrics: None,
@@ -2945,6 +3069,7 @@ open: false,
                         index: cells.len() + 1,
                         text,
                         dim,
+                        step: entry.step,
                         detail_text: raw,
                         reasoning: reasoning_opt,
                         metrics: entry
@@ -2964,6 +3089,7 @@ open: false,
                                 index: cells.len() + 1,
                                 text: widgets::display_path(&summary, &self.cwd),
                                 dim: false,
+                                step: None,
                                 detail_text: String::new(),
                                 reasoning: None,
                                 metrics: None,
@@ -2993,15 +3119,11 @@ open: false,
                 seen += 1;
             }
         }
-        let mut headers = 0usize;
-        let mut last: Option<u64> = None;
-        for c in cells.iter().take(p + 1) {
-            if last != Some(c.turn) {
-                headers += 1;
-                last = Some(c.turn);
-            }
-        }
-        p + headers
+        // 行模型含轮头/组头/摘要行：直接定位目标 cell 的行号
+        let (rows, _) = self.traj_rows("");
+        rows.iter()
+            .position(|r| matches!(r, TrajRow::Cell(x) if *x == p))
+            .unwrap_or(p)
     }
 
     /// 44px 轮头条（上游 TrajectoryTurnHeader）：轮次标题 + 四列标签。
@@ -3236,6 +3358,8 @@ const TRAJ_BODY_PAD_T_PX: f32 = 8.0;
 const TRAJ_BODY_PAD_B_PX: f32 = 22.0;
 /// 折叠摘要行高（上游 collapsed-summary td 20px）。
 const TRAJ_SUMMARY_PX: f32 = 20.0;
+/// 组头行高（上游 TrajectoryGroupHeader .root 36px）。
+const TRAJ_GROUP_PX: f32 = 36.0;
 
 /// 轨迹台账 cell（上游 TrajectoryCellProps 的 rustdsh 子集）。
 struct TrajCell {
@@ -3246,6 +3370,8 @@ struct TrajCell {
     text: String,
     /// 回退摘要行（「仅工具调用」等），三级色渲染（上游 .toolCallOnly）。
     dim: bool,
+    /// 轮内步号（步骤组分组键；user 系与工具行为 None）
+    step: Option<u64>,
     /// 详情面板用原文（保留换行；text 是单行省略版）。
     detail_text: String,
     /// 思考块拼接（消息 cell 详情「思考」节）。
@@ -3269,6 +3395,8 @@ enum TrajKind {
 enum TrajRow {
     Header(u64),
     Cell(usize),
+    /// Message / 步骤 N 组头（上游 TrajectoryGroupHeader，36px）
+    Group(String, String),
     /// 折叠轮摘要行（上游 collapsedSummary turn，20px）
     TurnSummary(u64, String),
     /// 折叠助手摘要行（上游 collapsedSummary assistant，20px；携带消息 cell 序号）

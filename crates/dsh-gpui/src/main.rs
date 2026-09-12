@@ -174,6 +174,8 @@ struct ChatEntry {
     /// 步窗时长（step/start → assistant/message；回放取日志 time，
     /// 实时取 ChatView 秒表）——轨迹台账时间列消息行数据源。
     step_duration_ms: Option<u64>,
+    /// 轮内步号（轨迹「步骤 N」组头分组键；user/notice 为 None）
+    step: Option<u64>,
 }
 
 /// One session shown in the sidebar list.

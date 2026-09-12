@@ -220,6 +220,8 @@ struct ChatSnap {
     running: bool,
     tab: CenterTab,
     stats: crate::chat::SessionStats,
+    /// 草稿 '/' 前缀的命令菜单过滤词（会话态才有）。
+    slash_query: Option<String>,
 }
 
 
@@ -1346,6 +1348,10 @@ struct AppView {
     hero_ws_menu: bool,
     /// composer 模型菜单开合（模型牌点击弹出）
     model_menu: bool,
+    /// composer 命令菜单开合（上游 input.commands：加号 + '/' 前缀触发）
+    command_menu: bool,
+    /// 命令菜单动作反馈（导出结果等；行内条显示，发送/重开菜单时清）
+    command_notice: Option<String>,
     /// composer 统计 pill 的对话框互斥开合（web StatsPills exclusive slot）
     stat_dialog: Option<StatDialogKind>,
     rename_input: Entity<InputState>,
@@ -1565,6 +1571,8 @@ impl AppView {
             renaming_session: None,
             hero_ws_menu: false,
             model_menu: false,
+            command_menu: false,
+            command_notice: None,
             stat_dialog: None,
             rename_input,
             attachments: Vec::new(),
@@ -1817,6 +1825,8 @@ impl AppView {
         self.agent.set_session(session);
         self.selected_tool = None;
         self.selected_message = None;
+        self.command_menu = false;
+        self.command_notice = None;
         // 回放 + 折叠态/列表重置都在 ChatView 内完成（含虚拟列表 reset：
         // 条目整体换血，splice 会保留旧测高，scroll_to_reveal 按陈旧高度
         // 算偏移会落进空白区——切后看不到内容）
@@ -1863,6 +1873,8 @@ impl AppView {
         self.agent.set_session(Session::new(id.clone()));
         self.selected_tool = None;
         self.selected_message = None;
+        self.command_menu = false;
+        self.command_notice = None;
         self.chat.update(cx, |c, cx| {
             c.reset_empty();
             cx.notify();
@@ -1902,6 +1914,8 @@ impl AppView {
         self.agent.set_session(Session::new(self.alloc_session_id()));
         self.selected_tool = None;
         self.selected_message = None;
+        self.command_menu = false;
+        self.command_notice = None;
         self.chat.update(cx, |c, cx| {
             c.reset_empty();
             cx.notify();
@@ -2010,6 +2024,8 @@ impl AppView {
         self.agent.set_session(Session::new(new_id.clone()));
         self.selected_tool = None;
         self.selected_message = None;
+        self.command_menu = false;
+        self.command_notice = None;
         self.chat.update(cx, |c, cx| {
             c.reset_empty();
             cx.notify();
@@ -2079,8 +2095,96 @@ impl AppView {
         out
     }
 
-    /// 发送统一入口（发送按钮与回车共用）：先派生 @ 引用的上下文注入，
-    /// 再走普通用户消息。entries 入列走 ChatView；标题/落盘是宿主职责。
+    /// 附件多选文件对话框（回形针与命令菜单 /file 共用；上游隐藏
+    /// `<input type=file multiple>` 的 GPUI 等价）。
+    fn pick_attachments(t: &WeakEntity<Self>, cx: &mut App) {
+        let t = t.clone();
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                let _ = t.update(cx, |v, cx| {
+                    v.add_attachment_paths(paths, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// /export 下载日志：当前会话的全部 session*.jsonl.zstd 拷贝到用户
+    /// 「下载」目录，文件名带会话号前缀（上游导出 ZIP 的本地形态；不走
+    /// 目录对话框——gpui prompt_for_paths 的目录返回值在 Windows 上落地
+    /// 不可靠，实测 copy Ok 而文件不落盘）。
+    fn export_session_log(this: &Entity<Self>, cx: &mut App) {
+        let sid = this.read_with(cx, |v, _| v.current_session_id().0.clone());
+        let cwd = this.read_with(cx, |v, _| v.current_cwd.clone());
+        let t = this.clone();
+        cx.spawn(async move |cx| {
+            // project_key 返回值自带 `--…--` 包裹（web projectKey 语义），
+            // 勿再手工包层——曾双重包裹致路径不存在、导出恒「未找到」
+            let session_dir = sessions_dir()
+                .join(dsh_persist::project_key(&cwd))
+                .join(&sid);
+            // 导出落 ~/.dsh/exports/（紧邻会话日志树——宿主进程对该树的
+            // 写入实证可见；曾试 Downloads/工作区 target 目录，copy 返回
+            // Ok 且字节数核验通过，但产物在文件系统上不可见，疑似系统层
+            // 对该进程的目录级写入拦截，见提交说明）
+            let exports = dsh_home().join("exports");
+            let _ = std::fs::create_dir_all(&exports);
+            let mut done: Vec<(String, u64)> = Vec::new();
+            let mut first_err: Option<String> = None;
+            if let Ok(entries) = std::fs::read_dir(&session_dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    let is_log = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("session"))
+                        && p.extension().and_then(|x| x.to_str()) == Some("zstd");
+                    if !is_log {
+                        continue;
+                    }
+                    let Some(name) = p.file_name() else { continue };
+                    let dest = exports.join(format!("{}-{}", sid, name.to_string_lossy()));
+                    // 不用 fs::copy（CopyFileW）：本机实测其 Ok 而产物不落
+                    // 盘（目录创建/read+write 均正常），见提交说明
+                    match std::fs::read(&p)
+                        .and_then(|bytes| std::fs::write(&dest, bytes))
+                        .ok()
+                        .and_then(|_| std::fs::metadata(&dest).ok().map(|m| m.len()))
+                    {
+                        Some(len) => done.push((dest.to_string_lossy().to_string(), len)),
+                        None => {
+                            first_err.get_or_insert_with(|| {
+                                format!("{}: 写出失败", name.to_string_lossy())
+                            });
+                        }
+                    }
+                }
+            }
+            let msg = match (done.len(), done.first()) {
+                (0, _) => format!(
+                    "未找到可导出的会话日志（源 {}{}）",
+                    session_dir.display(),
+                    first_err.map(|e| format!("，{e}")).unwrap_or_default()
+                ),
+                (n, Some((path, len))) => {
+                    format!("已导出 {n} 个会话日志（{path}，{len} 字节）")
+                }
+                _ => unreachable!(),
+            };
+            let _ = t.update(cx, |v, cx| {
+                v.command_notice = Some(msg);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 回形针多选后逐个加入附件栏：立即后台写入内容寻址存储
     /// （上游为带进度/取消的后台上传队列；本地无传输，Uploading 仅瞬态）。
     fn add_attachment_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
@@ -2186,6 +2290,8 @@ impl AppView {
     }
 
     fn dispatch_user_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.command_menu = false;
+        self.command_notice = None;
         for (path, content) in self.resolve_file_references(text) {
             let name = std::path::Path::new(&path)
                 .file_name()
@@ -2943,12 +3049,23 @@ impl Render for AppView {
         self.center_width = cw;
         let _ = sw;
         let has_text = !self.input.read_with(cx, |s, _| s.value().trim().is_empty());
+        // 命令菜单 '/' 前缀触发（上游 input-trigger）：草稿以 / 开头即开
+        // 菜单，后续文本作过滤词；仅会话态（hero 无命令面）
+        let slash_query: Option<String> = if self.chat.read_with(cx, |c, _| c.is_empty()) {
+            None
+        } else {
+            let draft = self.input.read_with(cx, |s, _| s.value().trim_start().to_string());
+            draft
+                .starts_with('/')
+                .then(|| draft[1..].trim().to_lowercase())
+        };
         // ChatView 快照：header/composer 的渲染输入（子实体状态一次读取）
         let snap = self.chat.read_with(cx, |c, _| ChatSnap {
             empty: c.is_empty(),
             running: c.running(),
             tab: c.tab(),
             stats: c.session_stats(),
+            slash_query,
         });
 
         let this = cx.entity();
@@ -3262,7 +3379,7 @@ impl AppView {
             .v_flex()
             .bg(theme::t().bg_base)
             .pb_2()
-            .child(self.composer_card(this.clone(), has_text, card_w, snap.running, locked));
+            .child(self.composer_card(this.clone(), has_text, card_w, snap.running, locked, snap.slash_query.as_deref()));
         // web StatsPills（0.1.5-alpha.1）：输入卡下方两个图标 pill——
         // 仪表 pill（轮/步 + 输出速度）开「会话统计」对话框，数据 pill
         // （总 token + 缓存命中）开「Token 用量」对话框；互斥开合（exclusive
@@ -3521,7 +3638,7 @@ impl AppView {
                                     ),
                             ),
                     )
-                    .child(self.composer_card(this, has_text, layout::composer_card_width(center_w), snap.running, snap.empty && self.current_workspace.is_none()))
+                    .child(self.composer_card(this, has_text, layout::composer_card_width(center_w), snap.running, snap.empty && self.current_workspace.is_none(), None))
                     // 下拉面板挂在栈层级（输入卡之后渲染 → 绘制在其上，
                     // 对齐 web .workspaceRow z-index:10 的效果）；遮罩提供
                     // 点击外部关闭
@@ -3700,8 +3817,231 @@ impl AppView {
     }
 
     /// 输入卡（web InputBar .card）：r22、白 6% 描边、850 表面、
+    /// 命令菜单弹层（上游 ui-input-trigger MenuView + ui-commands
+    /// sectionRows 实值）：r20 菜单底 + elevation-prominent、p4、max-h 400；
+    /// 行 40/r10/14-22、图标 16 三级、名称 + /别名 + 右对齐描述、段头
+    /// 12-18 三级；过滤态平铺去段头、无匹配「无选项」。面内子集：
+    /// goal/plan/feedback/permission 无后端面不落行（偏差固化）。
+    fn command_menu_element(&self, this: &Entity<AppView>, query: Option<&str>) -> Div {
+        let t = theme::t();
+        struct CmdRow {
+            section: &'static str,
+            name: &'static str,
+            label: &'static str,
+            desc: Option<&'static str>,
+        }
+        const ROWS: &[CmdRow] = &[
+            CmdRow { section: "添加", name: "file", label: "文件", desc: None },
+            CmdRow { section: "指令", name: "compact", label: "压缩", desc: Some("压缩以上对话内容") },
+            CmdRow { section: "指令", name: "model", label: "模型", desc: Some("选择本会话使用的模型") },
+            CmdRow { section: "指令", name: "export", label: "下载日志", desc: Some("将当前会话日志导出到本地目录") },
+        ];
+        let filter = query.unwrap_or("");
+        let visible: Vec<&CmdRow> = if filter.is_empty() {
+            ROWS.iter().collect()
+        } else {
+            ROWS.iter()
+                .filter(|r| r.name.contains(filter) || r.label.contains(filter))
+                .collect()
+        };
+        let mut menu = div()
+            .id("command-menu")
+            .absolute()
+            .left(px(8.0))
+            .right(px(8.0))
+            .bottom(px(56.0))
+            .max_h(px(400.0))
+            .overflow_y_scroll()
+            .occlude()
+            .v_flex()
+            .p(px(4.0))
+            .rounded(px(20.0))
+            .bg(theme::t().menu)
+            .shadow(theme::elevation_prominent());
+        if visible.is_empty() {
+            return div().child(menu.child(
+                div()
+                    .h(px(40.0))
+                    .flex()
+                    .items_center()
+                    .px(px(10.0))
+                    .text_size(px(14.0))
+                    .line_height(px(22.0))
+                    .text_color(t.text_3)
+                    .child("无选项"),
+            ));
+        }
+        let mut last_section: Option<&'static str> = None;
+        for r in visible {
+            // 段头仅非过滤态（上游 sectionRows 是空查询形态）
+            if filter.is_empty() && last_section != Some(r.section) {
+                last_section = Some(r.section);
+                menu = menu.child(
+                    div()
+                        .min_h(px(26.0))
+                        .px(px(10.0))
+                        .pt(px(6.0))
+                        .pb(px(2.0))
+                        .text_size(px(12.0))
+                        .line_height(px(18.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(t.text_3)
+                        .child(r.section),
+                );
+            }
+            // 图标近似：file=回形针 svg（上游同款）；compact=Minimize、
+            // model=Bot、export=文档 svg（IconCompact/Download 缺位）
+            let icon_el: AnyElement = match r.name {
+                "file" => {
+                    gpui::svg().path("icons/paperclip.svg").size(px(16.0)).text_color(t.text_3).into_any_element()
+                }
+                "model" => {
+                    Icon::new(IconName::Bot).size(px(16.0)).text_color(t.text_3).into_any_element()
+                }
+                "export" => gpui::svg()
+                    .path("icons/document-file.svg")
+                    .size(px(16.0))
+                    .text_color(t.text_3)
+                    .into_any_element(),
+                _ => {
+                    Icon::new(IconName::Minimize).size(px(16.0)).text_color(t.text_3).into_any_element()
+                }
+            };
+            let name = r.name;
+            let label = r.label;
+            let desc = r.desc;
+            let t_row = this.clone();
+            menu = menu.child(
+                div()
+                    .id(SharedString::from(format!("cmd-{}", name)))
+                    .h(px(40.0))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px(px(10.0))
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::t().hover))
+                    .on_click(move |_, window, cx| {
+                        match name {
+                            "file" => Self::pick_attachments(&t_row.downgrade(), cx),
+                            "compact" => t_row.update(cx, |v, cx| {
+                                v.command_menu = false;
+                                v.agent.compact_now();
+                                cx.notify();
+                            }),
+                            "model" => t_row.update(cx, |v, cx| {
+                                v.command_menu = false;
+                                v.model_menu = true;
+                                cx.notify();
+                            }),
+                            _ => Self::export_session_log(&t_row, cx),
+                        }
+                        // '/' 草稿消费：选中命令后清输入并收菜单
+                        t_row.update(cx, |v, cx| {
+                            if v
+                                .input
+                                .read_with(cx, |s, _| s.value().trim_start().starts_with('/'))
+                            {
+                                v.input.update(cx, |s, c| s.set_value("", window, c));
+                            }
+                            v.command_menu = false;
+                        });
+                    })
+                    .child(icon_el)
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(160.0))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(14.0))
+                            .line_height(px(22.0))
+                            .text_color(t.text)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(100.0))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(14.0))
+                            .line_height(px(22.0))
+                            .text_color(t.text_3)
+                            .child(format!("/{}", name)),
+                    )
+                    .when_some(desc, |d, ds| {
+                        d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .justify_end()
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_size(px(14.0))
+                                        .line_height(px(22.0))
+                                        .text_color(t.text_3)
+                                        .child(ds),
+                                ),
+                        )
+                    }),
+            );
+        }
+        // 点击外部关闭（同 model 菜单模式）：定位壳捕获菜单 bounds，
+        // canvas 在 paint 阶段注册窗口级 mousedown，落点在 bounds 外即收
+        // 菜单；'/' 草稿态同时清输入（放弃命令）
+        let menu_bounds = Arc::new(std::sync::Mutex::new(None::<Bounds<Pixels>>));
+        let t_dismiss = this.clone();
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .on_children_prepainted({
+                let mb = menu_bounds.clone();
+                move |children, _, _| {
+                    *mb.lock().unwrap() = children.first().cloned();
+                }
+            })
+            .child(menu)
+            .child(div().absolute().child(canvas(
+                move |_, _, _| {},
+                move |_, _, window, _| {
+                    let bounds = menu_bounds.lock().unwrap().clone().unwrap_or_default();
+                    window.on_mouse_event(
+                        move |event: &MouseDownEvent, phase: DispatchPhase, window, cx| {
+                            if phase == DispatchPhase::Bubble && !bounds.contains(&event.position) {
+                                t_dismiss.update(cx, |v, cx| {
+                                    v.command_menu = false;
+                                    let slash = v
+                                        .input
+                                        .read_with(cx, |s, _| s.value().trim_start().starts_with('/'));
+                                    if slash {
+                                        v.input
+                                            .update(cx, |s, c| s.set_value("", window, c));
+                                    }
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    );
+                },
+            )))
+    }
+
+    /// 输入卡（web InputBar .card）：r22、白 6% 描边、850 表面、
     /// 文本在上（16/24），控件行在下（+ / 模式 | 模型 / 发送）。
-    fn composer_card(&self, this: Entity<AppView>, has_text: bool, card_w: f32, running: bool, locked: bool) -> Stateful<Div> {
+    fn composer_card(&self, this: Entity<AppView>, has_text: bool, card_w: f32, running: bool, locked: bool, slash_query: Option<&str>) -> Stateful<Div> {
         let t_model_menu = this.clone();
 
         // 模型菜单（模型牌弹出）：各提供方分组 + 模型行，当前项带勾
@@ -3812,31 +4152,35 @@ impl AppView {
             );
             model_menu_el = Some(overlay.into_any_element());
         }
+        // 命令菜单（上游 input.commands）：加号或 '/' 前缀打开
+        let mut command_menu_el: Option<AnyElement> = None;
+        if !locked && (self.command_menu || slash_query.is_some()) {
+            command_menu_el =
+                Some(self.command_menu_element(&this, slash_query).into_any_element());
+        }
 
         let left = div()
             .flex()
             .items_center()
             .gap_4()
-            .child(icon_btn("composer-add", IconName::Plus, theme::t().text, "添加附件", |_, _, _| {}))
+            .child({
+                // 加号 = 命令菜单开关（上游 input.commands；locked 态无效）
+                let t_cmd = this.downgrade();
+                icon_btn("composer-add", IconName::Plus, theme::t().text, "添加文件或调用指令", move |_, _, cx| {
+                    if locked {
+                        return;
+                    }
+                    t_cmd.update(cx, |v, cx| {
+                        v.command_menu = !v.command_menu;
+                        v.model_menu = false;
+                        cx.notify();
+                    });
+                })
+            })
             .child(svg_icon_btn("composer-attach", "icons/paperclip.svg", theme::t().text, "添加附件", {
                 let t_attach = this.downgrade();
                 move |_, _, cx| {
-                    let t_attach = t_attach.clone();
-                    // 回形针 → 多选文件对话框（上游隐藏 <input type=file multiple>）
-                    let rx = cx.prompt_for_paths(PathPromptOptions {
-                        files: true,
-                        directories: false,
-                        multiple: true,
-                        prompt: None,
-                    });
-                    cx.spawn(async move |cx| {
-                        if let Ok(Ok(Some(paths))) = rx.await {
-                            let _ = t_attach.update(cx, |v, cx| {
-                                v.add_attachment_paths(paths, cx);
-                            });
-                        }
-                    })
-                    .detach();
+                    Self::pick_attachments(&t_attach, cx);
                 }
             }))
             .child(
@@ -3982,6 +4326,18 @@ impl AppView {
                         .child(self.upload_notice.unwrap_or_default()),
                 )
             })
+            // 命令菜单动作反馈（导出结果等；中性三级色，区别于拦截红）
+            .when(self.command_notice.is_some(), |d| {
+                d.child(
+                    div()
+                        .px(px(16.0))
+                        .pb(px(2.0))
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
+                        .text_color(theme::t().text_3)
+                        .child(self.command_notice.clone().unwrap_or_default()),
+                )
+            })
             .child(if locked {
                 // web：inert 态编辑器不挂载，占位文案即引导。高度必须
                 // 等于 Input 单行外壳（input_py 8×2 + 行高 20 = 36），
@@ -4013,6 +4369,7 @@ impl AppView {
                     .child(right),
             )
             .children(model_menu_el)
+            .children(command_menu_el)
     }
 
     /// 右侧详情面板（DetailsPanel）。

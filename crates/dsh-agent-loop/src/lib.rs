@@ -472,6 +472,14 @@ impl ReactLoopAgent {
         if dsh_compaction::estimate_tokens(&msgs) <= config.threshold_tokens {
             return;
         }
+        self.compact_pairs(assembly, &pairs).await;
+    }
+
+    /// 影子区压缩核心（自动阈值路径与手动 /compact 共用）：边界选择 →
+    /// 辅助摘要 → 落 `SessionEvent::Compaction` + UI 通知；失败静默。
+    async fn compact_pairs(&self, assembly: &PromptAssembly, pairs: &[(u64, Message)]) {
+        let config = { self.options.read().unwrap().compaction };
+        let msgs: Vec<Message> = pairs.iter().map(|(_, m)| m.clone()).collect();
         let boundary = dsh_compaction::select_boundary(&msgs, config.keep_recent);
         if boundary == 0 {
             return;
@@ -511,6 +519,28 @@ impl ReactLoopAgent {
             }
             Err(_) => {}
         }
+    }
+
+    /// 手动压缩（上游 /compact 指令位）：无视 token 阈值立即压缩影子区。
+    /// 仅空闲态生效（发起后与新轮并发的小窗口与 steer 同语义，接受）；
+    /// 会话过小（≤ keep_recent 条消息）或摘要失败静默跳过。
+    pub fn compact_now(self: &Arc<Self>) {
+        if self.status() != AgentStatus::Idle {
+            return;
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let config = { this.options.read().unwrap().compaction };
+            let pairs = {
+                let s = this.session.lock().unwrap();
+                s.derive_messages_with_seqs()
+            };
+            if pairs.len() <= config.keep_recent {
+                return;
+            }
+            let assembly = this.assemble_prompt();
+            this.compact_pairs(&assembly, &pairs).await;
+        });
     }
 
     async fn run_turn(&self) {

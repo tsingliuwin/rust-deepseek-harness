@@ -906,6 +906,20 @@ open: false,
                 self.running = true;
                 self.turn_started_at = Some(Instant::now());
                 self.stats_turns += 1;
+                // 用户条目在发送时入列，此刻 ui_turn 还是上一轮（首发送为 0）
+                // ——回戳尾随的 user/context/notice 条目到本轮，否则台账裂出
+                // 「第 0 轮」独占段、后续发送的用户泡挂到上一轮头下。
+                for e in self.entries.iter_mut().rev() {
+                    match e.role {
+                        Role::User | Role::Context | Role::Notice => {
+                            if e.turn >= turn {
+                                break;
+                            }
+                            e.turn = turn;
+                        }
+                        _ => break,
+                    }
+                }
                 self.ui_turn = turn;
                 self.turn_open = Some(turn);
                 self.turn_tool_time = Duration::ZERO;
@@ -951,7 +965,7 @@ open: false,
             }
             AgentEvent::AssistantMessage { usage, .. } => {
                 self.stats_steps += 1;
-                if let Some(u) = usage {
+                if let Some(u) = &usage {
                     self.stats_input_tokens += u.input_tokens;
                     self.stats_output_tokens += u.output_tokens;
                     if let Some(cr) = u.cache_read_tokens { self.stats_cache_read += cr; }
@@ -975,6 +989,27 @@ open: false,
                         (None, b) => b,
                         (a, None) => a,
                     };
+                }
+                // 步结（上游台账步粒度）：本步 usage 冻结进流式条目并 done，
+                // 下一步 delta 经 last_assistant 开新条目——实时台账与回放
+                // 的每步形态一致（此前整轮折一条、运行中指标列恒空）。
+                if let Some(e) = self.entries.last_mut() {
+                    if e.role == Role::Assistant && !e.done {
+                        e.done = true;
+                        if let Some(u) = &usage {
+                            e.usage = Some(TurnUsage {
+                                input_tokens: u.input_tokens,
+                                output_tokens: u.output_tokens,
+                                cache_read: u.cache_read_tokens,
+                                cache_write: u.cache_write_tokens,
+                                reasoning: u.reasoning_tokens,
+                                run_ms: 0,
+                                llm_ms: 0,
+                                ttft_ms: None,
+                                route: String::new(),
+                            });
+                        }
+                    }
                 }
             }
             AgentEvent::TurnEnded { turn, .. } => {
@@ -1011,7 +1046,9 @@ open: false,
                 if let Some(e) = self.entries.last_mut() {
                     e.done = true;
                     e.elapsed = elapsed;
-                    if has_usage {
+                    // 步结条目保留步级 usage（与回放同形）；轮总量只补无
+                    // usage 的条目（异常轮无步结事件时的兜底）
+                    if has_usage && e.usage.is_none() {
                         e.usage = Some(usage);
                     }
                     e.ended_at_ms = Some(now_ms());

@@ -127,6 +127,15 @@ pub enum SessionEvent {
     /// 会话标题（log-only，latest-wins；不进模型可见面）。
     /// web SessionTitleEventData 的 title 部分（messageSeqs/source 不落盘）。
     SessionTitle { title: String },
+    /// 权限预设切换意图（log-only：web `permission/preset`，data.preset；
+    /// 旋钮事件随后，不入模型面）。
+    PermissionPreset { preset: String },
+    /// 沙箱档位覆盖（log-only：web `sandbox/mode`，data.mode；fs 工具
+    /// 三档承载，回放恢复）。
+    SandboxModeSwitch { mode: String },
+    /// 审批策略覆盖（log-only：web `approval/policy`，data.policy；
+    /// rustdsh 无审批管线，事件为跨端互通与回放保留）。
+    ApprovalPolicy { policy: String },
     /// 一次 provider 路由重试等待排定前的持久记录（web `llm/retry`，
     /// LlmRetryEventData：normal 模式带 maxRetries，always 模式不带）。
     LlmRetry {

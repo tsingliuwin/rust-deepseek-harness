@@ -80,6 +80,86 @@ impl FsPolicy for WorkspaceContainment {
     }
 }
 
+/// 权限预设的沙箱档位（web SandboxMode 三值；`permission/preset` 旋钮
+/// 的执行承载——上游 confined call 在 bash 与 fs 两面生效，rustdsh 落
+/// fs 工具强制 + shell 提示词叙述的等价，见 main.rs 偏差说明）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FsMode {
+    /// 只读：写一律拒绝。
+    ReadOnly,
+    /// 工作区内写（默认）。
+    WorkspaceWrite,
+    /// 全放行。
+    DangerFullAccess,
+}
+
+impl FsMode {
+    /// web 行形值解析（`sandbox/mode` data.mode）。
+    pub fn from_web(value: &str) -> Option<Self> {
+        match value {
+            "read-only" => Some(Self::ReadOnly),
+            "workspace-write" => Some(Self::WorkspaceWrite),
+            "danger-full-access" => Some(Self::DangerFullAccess),
+            _ => None,
+        }
+    }
+
+    /// web 行形值。
+    pub fn as_web(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
+/// 三档可切策略：包装工作区包含（根集合仍由宿主按工作区喂），随
+/// 权限预设 `set_mode` 切档；fs 工具经 `Arc<dyn FsPolicy>` 持有。
+pub struct SwitchablePolicy {
+    mode: RwLock<FsMode>,
+    containment: WorkspaceContainment,
+}
+
+impl SwitchablePolicy {
+    pub fn new(mode: FsMode, roots: Vec<PathBuf>) -> Self {
+        Self { mode: RwLock::new(mode), containment: WorkspaceContainment::new(roots) }
+    }
+
+    /// 权限预设切换档位。
+    pub fn set_mode(&self, mode: FsMode) {
+        *self.mode.write().unwrap() = mode;
+    }
+
+    /// 当前档位。
+    pub fn mode(&self) -> FsMode {
+        *self.mode.read().unwrap()
+    }
+
+    /// 宿主切换工作区时更新根集合（仅 workspace-write 档消费）。
+    pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        self.containment.set_roots(roots);
+    }
+}
+
+impl FsPolicy for SwitchablePolicy {
+    fn allow_write(&self, path: &Path) -> bool {
+        match self.mode() {
+            FsMode::ReadOnly => false,
+            FsMode::WorkspaceWrite => self.containment.allow_write(path),
+            FsMode::DangerFullAccess => true,
+        }
+    }
+
+    fn deny_reason(&self) -> &'static str {
+        match self.mode() {
+            FsMode::ReadOnly => "write denied: the session is read-only (permission preset)",
+            FsMode::WorkspaceWrite => self.containment.deny_reason(),
+            FsMode::DangerFullAccess => "write denied",
+        }
+    }
+}
+
 /// 展开 `~` / `~/` 前缀。
 fn expand_home(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
@@ -279,5 +359,42 @@ mod tests {
             .unwrap_or_default();
         assert!(text.contains("is a directory") && text.contains("op=list"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    #[test]
+    fn switchable_policy_three_modes() {
+        let tmp = std::env::temp_dir().join(format!("dsh-fs-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let inside = tmp.join("in.txt");
+        let outside = std::env::temp_dir().join(format!("dsh-fs-mode-out-{}.txt", std::process::id()));
+        let policy = SwitchablePolicy::new(FsMode::WorkspaceWrite, vec![tmp.clone()]);
+        // workspace-write：内可写、外拒
+        assert!(policy.allow_write(&inside));
+        assert!(!policy.allow_write(&outside));
+        // read-only：内外全拒
+        policy.set_mode(FsMode::ReadOnly);
+        assert!(!policy.allow_write(&inside));
+        assert!(!policy.allow_write(&outside));
+        // danger-full-access：外也可写
+        policy.set_mode(FsMode::DangerFullAccess);
+        assert!(policy.allow_write(&outside));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn fs_mode_web_roundtrip() {
+        assert_eq!(FsMode::from_web("read-only"), Some(FsMode::ReadOnly));
+        assert_eq!(FsMode::from_web("workspace-write"), Some(FsMode::WorkspaceWrite));
+        assert_eq!(
+            FsMode::from_web("danger-full-access"),
+            Some(FsMode::DangerFullAccess)
+        );
+        assert_eq!(FsMode::from_web("nope"), None);
+        assert_eq!(FsMode::WorkspaceWrite.as_web(), "workspace-write");
     }
 }

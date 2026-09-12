@@ -15,6 +15,20 @@ const LOCAL: &[(&str, &[u8])] = &[
     ("icons/document-file.svg", include_bytes!("../assets/icons/document-file.svg")),
     ("icons/clock.svg", include_bytes!("../assets/icons/clock.svg")),
     ("icons/database.svg", include_bytes!("../assets/icons/database.svg")),
+    // 权限预设盾标（上游 PermissionSelect permissionGlyphs 三态 + 纯轮廓）
+    ("icons/shield.svg", include_bytes!("../assets/icons/shield.svg")),
+    (
+        "icons/permission-readonly.svg",
+        include_bytes!("../assets/icons/permission-readonly.svg"),
+    ),
+    (
+        "icons/permission-workspace.svg",
+        include_bytes!("../assets/icons/permission-workspace.svg"),
+    ),
+    (
+        "icons/permission-full.svg",
+        include_bytes!("../assets/icons/permission-full.svg"),
+    ),
     ("filetype/code-body.svg", include_bytes!("../assets/filetype/code-body.svg")),
     ("filetype/excel-body.svg", include_bytes!("../assets/filetype/excel-body.svg")),
     ("filetype/html-body.svg", include_bytes!("../assets/filetype/html-body.svg")),

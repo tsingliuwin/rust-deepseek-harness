@@ -1013,11 +1013,57 @@ fn migrate_legacy() {
     let _ = std::fs::remove_file(&legacy_creds);
 }
 
+/// 内置权限预设表（上游部署表三行：read-only = read-only+ask、
+/// workspace-write = workspace-write+ask、danger-full-access =
+/// danger-full-access+never；approval 在 rustdsh 无审批管线，事件互通保留）。
+const PERMISSION_PRESETS: &[(&str, &str, &str, &str)] = &[
+    // (key, 预设名, sandbox/mode, approval/policy)
+    ("read-only", "仅可查看", "read-only", "ask"),
+    ("workspace-write", "工作区内修改", "workspace-write", "ask"),
+    ("danger-full-access", "完全权限", "danger-full-access", "never"),
+];
+
+/// 预设 key → (key, 名, sandbox, approval)；未知 key 回落 workspace-write。
+fn preset_spec(key: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    PERMISSION_PRESETS
+        .iter()
+        .find(|p| p.0 == key)
+        .copied()
+        .unwrap_or(PERMISSION_PRESETS[1])
+}
+
+/// 预设中文名（chip 与下拉行）。
+fn preset_label(key: &str) -> &'static str {
+    preset_spec(key).1
+}
+
+/// 预设 key → 盾标 svg（上游 PermissionSelect permissionGlyphs 三态）。
+fn permission_glyph(preset: &str) -> &'static str {
+    match preset {
+        "read-only" => "icons/permission-readonly.svg",
+        "danger-full-access" => "icons/permission-full.svg",
+        _ => "icons/permission-workspace.svg",
+    }
+}
+
+/// 新会话默认预设（上游 PERMISSION_SETTINGS_NAMESPACE `permission` 的
+/// defaultPreset；无设置/值非法回落 workspace-write）。
+pub(crate) fn default_permission_preset() -> String {
+    load_settings_doc()
+        .get("permission")
+        .and_then(|p| p.get("defaultPreset"))
+        .and_then(|v| v.as_str())
+        .filter(|s| PERMISSION_PRESETS.iter().any(|p| p.0 == *s))
+        .unwrap_or("workspace-write")
+        .to_string()
+}
+
 /// tool:shell 提示词节文本：cwd 已是工作区根（免 cd）+ 长命令先落盘再检视
 /// 的纪律 + 按 shell 实际风味给语法提示。回应真实会话里的两类浪费：
 /// bash 语法经 cmd /C 碎裂（; / 引号 / %）、cargo test 重跑 3 遍只为换
-/// 视角看输出。
-fn shell_section_text(root: &str) -> String {
+/// 视角看输出。末尾按权限预设档位注入叙述（上游 prompt narration 的
+/// rustdsh 承载——shell 无 OS 级沙箱，靠叙述约束只读/工作区档的写行为）。
+fn shell_section_text(root: &str, mode: dsh_fs::FsMode) -> String {
     let mut text = String::new();
     if !root.is_empty() {
         text.push_str(&format!("Workspace root: {root}\n"));
@@ -1043,6 +1089,20 @@ fn shell_section_text(root: &str) -> String {
          just to see another slice of its output. Prefer the grep and glob tools over \
          shell grep/find, and the fs tool over shell dir/ls.",
     );
+    text.push_str(match mode {
+        dsh_fs::FsMode::ReadOnly => {
+            "\nPermission: the session is READ-ONLY. The fs tool denies every write. \
+             Do not attempt to modify, create, delete, or move files; use read/list/exists \
+             only, and do not run shell commands that change anything on disk."
+        }
+        dsh_fs::FsMode::WorkspaceWrite => {
+            "\nPermission: workspace-write. Writes are confined to the workspace root \
+             (the fs tool denies anything outside); keep every file change inside it."
+        }
+        dsh_fs::FsMode::DangerFullAccess => {
+            "\nPermission: full access — file operations are unrestricted."
+        }
+    });
     text
 }
 
@@ -1317,7 +1377,7 @@ struct AppView {
     /// 子 agent 工具句柄（路由切换时同步）
     subagent: Arc<dsh_subagent::SubagentTool>,
     /// fs 沙箱句柄（工作区切换时同步写根）
-    fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
+    fs_sandbox: Arc<dsh_fs::SwitchablePolicy>,
     /// 系统提示词句柄（工作区切换时重建 workspace 相关 section）
     prompt: Arc<dsh_system_prompt::SystemPrompt>,
     /// tool:shell section 句柄（随工作区切换重建）
@@ -1348,6 +1408,16 @@ struct AppView {
     hero_ws_menu: bool,
     /// composer 模型菜单开合（模型牌点击弹出）
     model_menu: bool,
+    /// 权限预设菜单开合（Workspace Write chip 下拉）
+    permission_menu: bool,
+    /// 完全权限风险确认模态开合（上游 RiskConfirmation 门）
+    full_access_confirm: bool,
+    /// 风险确认的知情勾选
+    full_access_ack: bool,
+    /// 当前会话有效权限预设（web permission/preset；默认 workspace-write）
+    permission_preset: String,
+    /// 当前会话有效审批策略（web approval/policy；无审批管线，互通保留）
+    approval_policy: String,
     /// composer 命令菜单开合（上游 input.commands：加号 + '/' 前缀触发）
     command_menu: bool,
     /// 命令菜单动作反馈（导出结果等；行内条显示，发送/重开菜单时清）
@@ -1475,7 +1545,7 @@ impl AppView {
         agent: Arc<ReactLoopAgent>,
         deps: AppDeps,
         subagent: Arc<dsh_subagent::SubagentTool>,
-        fs_sandbox: Arc<dsh_fs::WorkspaceContainment>,
+        fs_sandbox: Arc<dsh_fs::SwitchablePolicy>,
         workdir: dsh_tools::Workdir,
         persist_cwd: Arc<std::sync::Mutex<String>>,
         sessions: Vec<SessionMeta>,
@@ -1571,6 +1641,11 @@ impl AppView {
             renaming_session: None,
             hero_ws_menu: false,
             model_menu: false,
+            permission_menu: false,
+            full_access_confirm: false,
+            full_access_ack: false,
+            permission_preset: "workspace-write".into(),
+            approval_policy: "ask".into(),
             command_menu: false,
             command_notice: None,
             stat_dialog: None,
@@ -1822,11 +1897,35 @@ impl AppView {
             self.chat.update(cx, |ch, _| ch.cwd = c);
         }
         self.sync_fs_sandbox();
+        // 权限旋钮恢复（上游 permissions 投影 fold）：三类事件各取最后值，
+        // 沙箱档即时生效（fs 工具层 + shell 节叙述）；无事件回落用户默认
+        {
+            self.permission_preset = default_permission_preset();
+            let mut preset: Option<String> = None;
+            let mut approval: Option<String> = None;
+            for e in session.entries() {
+                match &e.event {
+                    SessionEvent::PermissionPreset { preset: p } => preset = Some(p.clone()),
+                    SessionEvent::ApprovalPolicy { policy } => approval = Some(policy.clone()),
+                    _ => {}
+                }
+            }
+            if let Some(p) = preset {
+                self.permission_preset = p;
+            }
+            let (_, _, sandbox, ap) = preset_spec(&self.permission_preset);
+            self.approval_policy = approval.unwrap_or_else(|| ap.to_string());
+            if let Some(m) = dsh_fs::FsMode::from_web(sandbox) {
+                self.fs_sandbox.set_mode(m);
+            }
+        }
         self.agent.set_session(session);
         self.selected_tool = None;
         self.selected_message = None;
         self.command_menu = false;
         self.command_notice = None;
+        self.permission_menu = false;
+        self.full_access_confirm = false;
         // 回放 + 折叠态/列表重置都在 ChatView 内完成（含虚拟列表 reset：
         // 条目整体换血，splice 会保留旧测高，scroll_to_reveal 按陈旧高度
         // 算偏移会落进空白区——切后看不到内容）
@@ -1871,6 +1970,22 @@ impl AppView {
         self.current_cwd = cwd.clone();
         self.sync_fs_sandbox();
         self.agent.set_session(Session::new(id.clone()));
+        // 新会话 pin（上游 pinInitialPermission）：用户默认预设落三事件
+        {
+            let default_preset = default_permission_preset();
+            let (_, _, sandbox, approval) = preset_spec(&default_preset);
+            self.agent
+                .append_session_event(SessionEvent::PermissionPreset { preset: default_preset.clone() });
+            self.agent
+                .append_session_event(SessionEvent::SandboxModeSwitch { mode: sandbox.to_string() });
+            self.agent
+                .append_session_event(SessionEvent::ApprovalPolicy { policy: approval.to_string() });
+            self.permission_preset = default_preset;
+            self.approval_policy = approval.to_string();
+            if let Some(m) = dsh_fs::FsMode::from_web(sandbox) {
+                self.fs_sandbox.set_mode(m);
+            }
+        }
         self.selected_tool = None;
         self.selected_message = None;
         self.command_menu = false;
@@ -2957,7 +3072,7 @@ impl AppView {
         *self.shell_section.borrow_mut() = Some(self.prompt.add_section(dsh_system_prompt::PromptSection {
             name: "tool:shell".into(),
             order: self.prompt.get_section_order(dsh_system_prompt::PromptSectionOrderName::ToolBash),
-            text: shell_section_text(root),
+            text: shell_section_text(root, self.fs_sandbox.mode()),
         }));
         if let Some(dispose) = self.workspace_instructions.borrow_mut().take() {
             dispose();
@@ -2979,6 +3094,35 @@ impl AppView {
     fn set_route(&mut self, provider: &str, model: &str) {
         self.agent.set_provider_and_model(provider, model);
         self.subagent.set_route(provider, model);
+    }
+
+    /// 权限预设切换（上游 PermissionPresetService.apply 的写路径）：写
+    /// preset 事件 + 变化的旋钮事件（沙箱档即时生效 fs 工具层，approval
+    /// 为跨端互通），shell 节叙述随档位重建。
+    fn switch_permission(&mut self, preset: &str, cx: &mut Context<Self>) {
+        self.permission_menu = false;
+        if preset == self.permission_preset {
+            cx.notify();
+            return;
+        }
+        let (_, _, sandbox, approval) = preset_spec(preset);
+        self.agent
+            .append_session_event(SessionEvent::PermissionPreset { preset: preset.to_string() });
+        if sandbox != self.fs_sandbox.mode().as_web() {
+            self.agent
+                .append_session_event(SessionEvent::SandboxModeSwitch { mode: sandbox.to_string() });
+            self.fs_sandbox
+                .set_mode(dsh_fs::FsMode::from_web(sandbox).unwrap_or(dsh_fs::FsMode::WorkspaceWrite));
+        }
+        if approval != self.approval_policy {
+            self.agent
+                .append_session_event(SessionEvent::ApprovalPolicy { policy: approval.to_string() });
+            self.approval_policy = approval.to_string();
+        }
+        self.permission_preset = preset.to_string();
+        // 上游 prompt narration：shell 节按档位告知模型写边界
+        self.refresh_workspace_sections(&self.current_cwd.clone());
+        cx.notify();
     }
 
     /// composer 模型菜单选择：切路由并持久化 agent-default-model。
@@ -3005,6 +3149,34 @@ impl AppView {
         self.persist_settings();
     }
 
+
+    /// 设置页权限行（上游 settings.permission defaultPreset）：写原始
+    /// yaml 的 permission.defaultPreset（新会话 pin 消费）；运行中会话不动。
+    fn set_default_permission_preset(&self, key: &str) {
+        let mut doc = load_settings_doc();
+        let perm = match doc.get_mut("permission") {
+            Some(v) => v,
+            None => {
+                if let Some(map) = doc.as_mapping_mut() {
+                    map.insert(
+                        serde_yaml::Value::String("permission".into()),
+                        serde_yaml::Value::Mapping(Default::default()),
+                    );
+                    map.get_mut(serde_yaml::Value::String("permission".into()))
+                        .expect("just inserted")
+                } else {
+                    return;
+                }
+            }
+        };
+        if let Some(map) = perm.as_mapping_mut() {
+            map.insert(
+                serde_yaml::Value::String("defaultPreset".into()),
+                serde_yaml::Value::String(key.to_string()),
+            );
+        }
+        save_settings_doc(&doc);
+    }
 
     /// 写盘：settings.yaml + .credentials.yaml（与 web 共享同一份文档）。
     fn persist_settings(&self) {
@@ -3248,6 +3420,7 @@ impl AppView {
     fn render_center(&self, width: f32, this: Entity<AppView>, has_text: bool, snap: &ChatSnap) -> Div {
         let t = this.clone();
         let mut center = div()
+            .relative()
             .h_full()
             .w(px(width))
             .min_w_0()
@@ -3262,7 +3435,7 @@ impl AppView {
 
         // 主体：hero（空会话）/ 对话/轨迹（ChatView entity）
         if snap.empty && !snap.running {
-            center = center.child(self.render_hero(this, has_text, width, snap));
+            center = center.child(self.render_hero(this.clone(), has_text, width, snap));
         } else {
             // 对话/轨迹主体都是 ChatView entity：对话 = 虚拟列表（折叠派生
             // 缓存、滚轮转发、贴底药丸在其内部），轨迹 = 工具台账。delta
@@ -3271,7 +3444,158 @@ impl AppView {
                 .child(div().flex_1().min_h_0().child(self.chat.clone()))
                 .child(self.render_composer_area(t, has_text, width, snap));
         }
+        // 完全权限风险确认门（上游 RiskConfirmation，居中模态）
+        if self.full_access_confirm {
+            center = center.child(self.full_access_modal(&this));
+        }
         center
+    }
+
+    /// 完全权限风险确认模态（上游 RiskConfirmation 文案）：遮罩 + 居中
+    /// 卡；知情勾选后「启用完全权限」才可点。
+    fn full_access_modal(&self, this: &Entity<AppView>) -> Stateful<Div> {
+        let t_cancel = this.clone();
+        let t_enable = this.clone();
+        let t_ack = this.clone();
+        let ack = self.full_access_ack;
+        div()
+            .id("full-access-confirm")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+            .child(
+                div()
+                    .id("full-access-card")
+                    .w(px(420.0))
+                    .p(px(20.0))
+                    .rounded(px(16.0))
+                    .bg(theme::t().menu)
+                    .shadow(theme::elevation_prominent())
+                    .v_flex()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .line_height(px(22.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::t().text)
+                            .child("确认启用完全权限？"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .text_color(theme::t().text_2)
+                            .child("启用完全权限后，智能体将减少确认步骤，并且可以直接执行更多操作，包括敏感操作、文件修改或外部命令。仅建议在你信任当前任务时使用。"),
+                    )
+                    .child(
+                        div()
+                            .id("full-access-ack")
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                t_ack.update(cx, |v, cx| {
+                                    v.full_access_ack = !v.full_access_ack;
+                                    cx.notify();
+                                });
+                            })
+                            .child(
+                                div()
+                                    .size(px(16.0))
+                                    .rounded(px(4.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .map(|d| {
+                                        if ack {
+                                            d.bg(theme::t().accent)
+                                        } else {
+                                            d.border(px(1.0)).border_color(theme::t().border_l3)
+                                        }
+                                    })
+                                    .when(ack, |d| {
+                                        d.child(
+                                            Icon::new(IconName::Check)
+                                                .size(px(12.0))
+                                                .text_color(gpui::white()),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .line_height(px(20.0))
+                                    .text_color(theme::t().text_2)
+                                    .child("我已了解风险，并愿意继续"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("fa-cancel")
+                                    .h(px(30.0))
+                                    .px(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(8.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::t().hover))
+                                    .on_click(move |_, _, cx| {
+                                        t_cancel.update(cx, |v, cx| {
+                                            v.full_access_confirm = false;
+                                            v.full_access_ack = false;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .text_size(px(13.0))
+                                    .text_color(theme::t().text_2)
+                                    .child("取消"),
+                            )
+                            .child(
+                                div()
+                                    .id("fa-enable")
+                                    .h(px(30.0))
+                                    .px(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(8.0))
+                                    .map(|d| {
+                                        if ack {
+                                            d.bg(theme::t().accent)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme::t().accent_hover))
+                                        } else {
+                                            d.bg(theme::t().accent).opacity(0.5)
+                                        }
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        if !ack {
+                                            return;
+                                        }
+                                        t_enable.update(cx, |v, cx| {
+                                            v.full_access_confirm = false;
+                                            v.full_access_ack = false;
+                                            v.switch_permission("danger-full-access", cx);
+                                            cx.notify();
+                                        });
+                                    })
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(gpui::white())
+                                    .child("启用完全权限"),
+                            ),
+                    ),
+            )
     }
 
     /// 会话 header：标题行 + 对话/轨迹 tab（ConversationRoot .header）。
@@ -3833,6 +4157,7 @@ impl AppView {
         const ROWS: &[CmdRow] = &[
             CmdRow { section: "添加", name: "file", label: "文件", desc: None },
             CmdRow { section: "指令", name: "compact", label: "压缩", desc: Some("压缩以上对话内容") },
+            CmdRow { section: "指令", name: "permission", label: "权限", desc: Some("切换权限预设（沙箱模式与审批策略）") },
             CmdRow { section: "指令", name: "model", label: "模型", desc: Some("选择本会话使用的模型") },
             CmdRow { section: "指令", name: "export", label: "下载日志", desc: Some("将当前会话日志导出到本地目录") },
         ];
@@ -3903,6 +4228,11 @@ impl AppView {
                     .size(px(16.0))
                     .text_color(t.text_3)
                     .into_any_element(),
+                "permission" => gpui::svg()
+                    .path("icons/shield.svg")
+                    .size(px(16.0))
+                    .text_color(t.text_3)
+                    .into_any_element(),
                 _ => {
                     Icon::new(IconName::Minimize).size(px(16.0)).text_color(t.text_3).into_any_element()
                 }
@@ -3933,6 +4263,11 @@ impl AppView {
                             "model" => t_row.update(cx, |v, cx| {
                                 v.command_menu = false;
                                 v.model_menu = true;
+                                cx.notify();
+                            }),
+                            "permission" => t_row.update(cx, |v, cx| {
+                                v.command_menu = false;
+                                v.permission_menu = true;
                                 cx.notify();
                             }),
                             _ => Self::export_session_log(&t_row, cx),
@@ -4158,6 +4493,72 @@ impl AppView {
             command_menu_el =
                 Some(self.command_menu_element(&this, slash_query).into_any_element());
         }
+        // 权限预设菜单（上游 PermissionSelect 的 Menu）：三行 + 当前勾选；
+        // 完全权限行走风险确认门
+        let mut permission_menu_el: Option<AnyElement> = None;
+        if self.permission_menu {
+            let mut menu = div()
+                .id("permission-menu")
+                .absolute()
+                .left(px(96.0))
+                .bottom(px(56.0))
+                .w(px(204.0))
+                .occlude()
+                .v_flex()
+                .p(px(4.0))
+                .rounded(px(20.0))
+                .bg(theme::t().menu)
+                .shadow(theme::elevation_prominent());
+            for (key, label, _, _) in PERMISSION_PRESETS {
+                let selected = *key == self.permission_preset;
+                let t_pick = this.clone();
+                let key_s = (*key).to_string();
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!("perm-{}", key)))
+                        .h(px(34.0))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px(px(10.0))
+                        .rounded(px(10.0))
+                        .text_size(px(theme::FONT_ROW))
+                        .line_height(px(22.0))
+                        .text_color(theme::t().text)
+                        .hover(|s| s.bg(theme::t().hover))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            t_pick.update(cx, |v, cx| {
+                                v.permission_menu = false;
+                                if key_s == "danger-full-access"
+                                    && v.permission_preset != "danger-full-access"
+                                {
+                                    // 上游 RiskConfirmation：完全权限需显式确认
+                                    v.full_access_confirm = true;
+                                } else {
+                                    v.switch_permission(&key_s, cx);
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            svg()
+                                .path(permission_glyph(key))
+                                .size(px(16.0))
+                                .text_color(theme::t().text_3),
+                        )
+                        .child(div().flex_1().child((*label).to_string()))
+                        .when(selected, |d| {
+                            d.child(
+                                Icon::new(IconName::Check)
+                                    .size(px(16.0))
+                                    .text_color(theme::t().text),
+                            )
+                        }),
+                );
+            }
+            permission_menu_el = Some(menu.into_any_element());
+        }
 
         let left = div()
             .flex()
@@ -4183,7 +4584,10 @@ impl AppView {
                     Self::pick_attachments(&t_attach, cx);
                 }
             }))
-            .child(
+            .child({
+                // 上游 PermissionSelect trigger:当前档位盾标 + 预设名 +
+                // chevron,点击开预设菜单(locked 态无效)
+                let t_perm = this.downgrade();
                 div()
                     .id("composer-mode")
                     .flex()
@@ -4192,17 +4596,35 @@ impl AppView {
                     .h(px(28.0))
                     .px_2()
                     .rounded(px(8.0))
-                    .child(Icon::new(IconName::Eye).size(px(14.0)).text_color(theme::t().text_2))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::t().hover))
+                    .on_click(move |_, _, cx| {
+                        if locked {
+                            return;
+                        }
+                        t_perm.update(cx, |v, cx| {
+                            v.permission_menu = !v.permission_menu;
+                            v.model_menu = false;
+                            v.command_menu = false;
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        svg()
+                            .path(permission_glyph(&self.permission_preset))
+                            .size(px(14.0))
+                            .text_color(theme::t().text_2),
+                    )
                     .child(
                         div()
                             .text_size(px(theme::FONT_TAB))
                             .line_height(px(20.0))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::t().text_2)
-                            .child("Workspace Write"),
+                            .child(preset_label(&self.permission_preset).to_string()),
                     )
-                    .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption)),
-            );
+                    .child(Icon::new(IconName::ChevronDown).size(px(12.0)).text_color(theme::t().caption))
+            });
 
         let mut right = div()
             .flex()
@@ -4370,6 +4792,7 @@ impl AppView {
             )
             .children(model_menu_el)
             .children(command_menu_el)
+            .children(permission_menu_el)
     }
 
     /// 右侧详情面板（DetailsPanel）。
@@ -4690,7 +5113,10 @@ fn main() {
     // 随工作区/会话切换经 AppView 同步
     let workdir = dsh_tools::Workdir::new();
     // fs 沙箱：写限定在当前工作区根之下（随工作区切换经 AppView 同步）
-    let fs_sandbox = Arc::new(dsh_fs::WorkspaceContainment::new(Vec::new()));
+    let fs_sandbox = Arc::new(dsh_fs::SwitchablePolicy::new(
+        dsh_fs::FsMode::WorkspaceWrite,
+        Vec::new(),
+    ));
     let _fs = tools.register(Arc::new(FsTool::new(fs_sandbox.clone()).with_workdir(workdir.clone()))).unwrap();
     let _shell = tools.register(Arc::new(ShellTool::default().with_workdir(workdir.clone()))).unwrap();
     let _web = tools.register(Arc::new(WebTool::new())).unwrap();
@@ -4746,7 +5172,10 @@ fn main() {
     let shell_section = std::cell::RefCell::new(Some(prompt.add_section(dsh_system_prompt::PromptSection {
         name: "tool:shell".into(),
         order: prompt.get_section_order(dsh_system_prompt::PromptSectionOrderName::ToolBash),
-        text: shell_section_text(&workdir.get().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()),
+        text: shell_section_text(
+            &workdir.get().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            dsh_fs::FsMode::WorkspaceWrite,
+        ),
     })));
     // 工作区指令（AGENTS.md 兼容）section：随工作区切换重建；启动时尚无
     // 工作区，先注册空壳位次，首次 sync_fs_sandbox 换成实际内容

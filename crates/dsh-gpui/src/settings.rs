@@ -390,6 +390,23 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
         },
     );
 
+    // 权限默认预设行（上游 settings.permission defaultPreset）：三段选择
+    // 写 settings.yaml，供新会话 pin 消费
+    let t_perm = this.clone();
+    let default_perm = crate::default_permission_preset();
+    let permission = segmented(
+        "set-permission",
+        &[
+            ("仅可查看", default_perm == "read-only", true),
+            ("工作区内修改", default_perm == "workspace-write", true),
+            ("完全权限", default_perm == "danger-full-access", true),
+        ],
+        move |i, _, _, cx| {
+            let key = ["read-only", "workspace-write", "danger-full-access"][i];
+            t_perm.update(cx, |v, _| v.set_default_permission_preset(key));
+        },
+    );
+
     let t3 = this.clone();
     let enter = segmented(
         "set-enter",
@@ -454,7 +471,7 @@ fn general_page(app: &AppView, this: &Entity<AppView>) -> Div {
         .child(settings_row(
             "权限",
             "选择新会话的默认权限模式",
-            select_chip("set-permission", "Workspace Write"),
+            permission,
             false,
         ))
         .child(settings_row("语言", "界面语言", language, false))

@@ -1135,6 +1135,27 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
                 .unwrap_or_default()
                 .to_string(),
         }),
+        "permission/preset" => Some(SessionEvent::PermissionPreset {
+            preset: data?
+                .get("preset")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        "sandbox/mode" => Some(SessionEvent::SandboxModeSwitch {
+            mode: data?
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        "approval/policy" => Some(SessionEvent::ApprovalPolicy {
+            policy: data?
+                .get("policy")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
         "compaction/summary" => {
             let d = data?;
             // v2 富形：{compactionId, summary, shadowedRange, shadowedSeqs,
@@ -1544,6 +1565,19 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         SessionEvent::SessionTitle { title } => Some(row(
             "session/title",
             serde_json::json!({"title": title, "messageSeqs": [], "source": {"kind": "fallback"}}),
+        )),
+        // 权限三旋钮（web 行形：data.{preset|mode|policy}）
+        SessionEvent::PermissionPreset { preset } => Some(row(
+            "permission/preset",
+            serde_json::json!({"preset": preset}),
+        )),
+        SessionEvent::SandboxModeSwitch { mode } => Some(row(
+            "sandbox/mode",
+            serde_json::json!({"mode": mode}),
+        )),
+        SessionEvent::ApprovalPolicy { policy } => Some(row(
+            "approval/policy",
+            serde_json::json!({"policy": policy}),
         )),
         // 重试链（web llm/retry：normal 模式带 maxRetries，always 模式不带）
         SessionEvent::LlmRetry {
@@ -2306,6 +2340,38 @@ mod replay_tests {
                 }
             }
             other => panic!("expected AssistantMessage, got {other:?}"),
+        }
+    }
+
+    /// 权限三旋钮事件 web 行形往返（data.{preset|mode|policy}，互通 web）。
+    #[test]
+    fn permission_knob_events_roundtrip() {
+        let cases = [
+            (
+                SessionEvent::PermissionPreset { preset: "workspace-write".into() },
+                "permission/preset",
+                "preset",
+                "workspace-write",
+            ),
+            (
+                SessionEvent::SandboxModeSwitch { mode: "read-only".into() },
+                "sandbox/mode",
+                "mode",
+                "read-only",
+            ),
+            (
+                SessionEvent::ApprovalPolicy { policy: "never".into() },
+                "approval/policy",
+                "policy",
+                "never",
+            ),
+        ];
+        for (event, ty, field, value) in cases {
+            let row = event_to_web_line(&event, 1, 1).expect("knob event must serialize");
+            assert_eq!(row["type"], ty);
+            assert_eq!(row["data"][field], serde_json::json!(value));
+            let back = web_line_to_event(&row).expect("knob event must parse back");
+            assert_eq!(back, event);
         }
     }
 }

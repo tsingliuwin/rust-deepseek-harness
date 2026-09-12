@@ -32,6 +32,9 @@ fn main() {
                         dsh_session::SessionEvent::LlmRetry { .. } => "llm/retry",
                         dsh_session::SessionEvent::LlmRetryStarted { .. } => "llm/retry-started",
                         dsh_session::SessionEvent::Compaction { .. } => "compaction",
+                        dsh_session::SessionEvent::PermissionPreset { .. } => "permission/preset",
+                        dsh_session::SessionEvent::SandboxModeSwitch { .. } => "sandbox/mode",
+                        dsh_session::SessionEvent::ApprovalPolicy { .. } => "approval/policy",
                     };
                     *counts.entry(k).or_insert(0) += 1;
                 }

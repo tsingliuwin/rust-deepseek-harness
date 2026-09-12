@@ -43,6 +43,7 @@ use dsh_web::WebTool;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::{Icon, IconName, Root, StyledExt, TitleBar};
+use dsh_gpui::ToolBlock;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,23 +51,6 @@ use std::time::{Duration, Instant};
 // --- 参考 ui-layout/columns.ts 列宽契约 ---------------------------------------
 
 // --- 消息块模型 ---------------------------------------------------------------
-
-/// 工具调用块（web 版 ToolRow）。
-#[derive(Clone)]
-struct ToolBlock {
-    id: String,
-    name: String,
-    arguments: String,
-    result: Option<String>,
-    error: bool,
-    open: bool,
-    /// 读取/差异/搜索卡的 8 行折叠展开态（web 每实例 useState 的对应物）
-    expanded: bool,
-    /// 搜索卡里被折叠的文件组下标（升序；web collapsed Set 的对应物）
-    collapsed_groups: Vec<usize>,
-    /// 调用时长（调用所在 message → tool/result；轨迹台账时间列工具行）
-    duration_ms: Option<u64>,
-}
 
 /// 附件视图块（用户消息混合附件；上游 PresentedAttachment：64px 图片
 /// tile 与 240×64 文件卡）
@@ -4611,7 +4595,7 @@ impl AppView {
                         if locked {
                             return;
                         }
-                        t_perm.update(cx, |v, cx| {
+                        let _ = t_perm.update(cx, |v, cx| {
                             v.permission_menu = !v.permission_menu;
                             v.model_menu = false;
                             v.command_menu = false;

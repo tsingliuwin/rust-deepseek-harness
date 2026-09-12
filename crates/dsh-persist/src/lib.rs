@@ -2390,3 +2390,44 @@ mod replay_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod time_roundtrip_tests {
+    use super::*;
+
+    /// 信封 time 承载：写侧保留事件 time_ms（回放再落盘往返稳定），
+    /// 读侧回传 Some——轨迹时长列的日志数据源。
+    #[test]
+    fn envelope_time_roundtrips() {
+        let event = SessionEvent::AssistantMessage {
+            turn: 1,
+            step: 2,
+            message: dsh_llm::Message::assistant(
+                vec![dsh_llm::ContentBlock::text("hi")],
+                "mock",
+                "mock",
+            ),
+            interrupted: false,
+            usage: None,
+            time_ms: Some(1_788_672_421_453),
+        };
+        let row = event_to_web_line(&event, 7, 999).expect("must map");
+        assert_eq!(row["time"], serde_json::json!(1_788_672_421_453u64));
+        let back = web_line_to_event(&row).expect("must parse back");
+        match back {
+            SessionEvent::AssistantMessage { time_ms, .. } => {
+                assert_eq!(time_ms, Some(1_788_672_421_453));
+            }
+            other => panic!("expected AssistantMessage, got {other:?}"),
+        }
+        // 实时事件无承载 → 写侧用传入的落盘时刻
+        let live = SessionEvent::StepStart { turn: 1, step: 1, time_ms: None };
+        let row = event_to_web_line(&live, 8, 1234).expect("must map");
+        assert_eq!(row["time"], serde_json::json!(1234u64));
+        let back = web_line_to_event(&row).expect("must parse back");
+        match back {
+            SessionEvent::StepStart { time_ms, .. } => assert_eq!(time_ms, Some(1234)),
+            other => panic!("expected StepStart, got {other:?}"),
+        }
+    }
+}

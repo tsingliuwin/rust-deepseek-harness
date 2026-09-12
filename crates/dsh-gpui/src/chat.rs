@@ -12,9 +12,14 @@ use crate::layout;
 use crate::theme;
 use crate::widgets::{self, dot_sep, state_dot, tip};
 use crate::{
-    AppView, CenterTab, ChatEntry, ContextInfo, MessageDetail, MsgBlock, Role, ToolBlock,
-    ToolDetail, TranscriptView, TurnUsage, format_latency_seconds, format_message_clock,
-    format_run_duration, format_tokens_compact, format_tokens_exact, format_tps, now_ms,
+    AppView, CenterTab, ChatEntry, ContextInfo, MessageDetail, MsgBlock, Role, ToolDetail,
+    TranscriptView, TurnUsage, format_latency_seconds, format_message_clock, format_run_duration,
+    format_tokens_compact, format_tokens_exact, format_tps, now_ms,
+};
+use dsh_gpui::{
+    ToolBlock, TrajCell, TrajKind, TrajRow, TRAJ_BODY_PAD_B_PX, TRAJ_BODY_PAD_T_PX,
+    TRAJ_CELL_GAP_PX, TRAJ_CELL_PX, TRAJ_GROUP_PX, TRAJ_HEADER_PX, TRAJ_LANE_MAX_PX,
+    TRAJ_SUMMARY_PX, traj_layout,
 };
 use dsh_session_projection::turn_outline::{
     PROMPT_PREVIEW_LIMIT, RESPONSE_PREVIEW_LIMIT, preview_parts,
@@ -2849,137 +2854,15 @@ open: false,
 
     fn traj_rows(&self, query: &str) -> (Vec<TrajRow>, Vec<f32>) {
         let cells = self.traj_visible_cells(query);
-        let query_active = !query.is_empty();
-        let collapsed_turns = if query_active {
-            Default::default()
+        let (collapsed_turns, collapsed_assistants) = if query.is_empty() {
+            (
+                self.traj_collapsed_turns.clone(),
+                self.traj_collapsed_assistants.clone(),
+            )
         } else {
-            self.traj_collapsed_turns.clone()
+            (Default::default(), Default::default())
         };
-        let collapsed_assistants = if query_active {
-            Default::default()
-        } else {
-            self.traj_collapsed_assistants.clone()
-        };
-        let mut rows: Vec<TrajRow> = Vec::new();
-        let mut tops: Vec<f32> = Vec::new();
-        let mut y = 0.0f32;
-        let mut last_turn: Option<u64> = None;
-        let mut ci = 0usize;
-        while ci < cells.len() {
-            let c = &cells[ci];
-            if last_turn != Some(c.turn) {
-                rows.push(TrajRow::Header(c.turn));
-                tops.push(y);
-                y += TRAJ_HEADER_PX + TRAJ_BODY_PAD_T_PX;
-                last_turn = Some(c.turn);
-                // 折叠轮：整轮换一条 20px 摘要行
-                if collapsed_turns.contains(&c.turn) {
-                    let turn_cells = cells[ci..].iter().take_while(|n| n.turn == c.turn).count();
-                    if turn_cells > 1 {
-                        rows.push(TrajRow::TurnSummary(c.turn, c.text.clone()));
-                        tops.push(y);
-                        y += TRAJ_SUMMARY_PX + TRAJ_BODY_PAD_B_PX;
-                        ci += turn_cells;
-                        continue;
-                    }
-                }
-            }
-            // --- 组头（上游 Message / 步骤 N 组）：user 系 cell 归消息组
-            // （连续合并）；带步号的消息 cell 连同其后工具行归步骤组 ---
-            let is_msg_group_head =
-                c.kind == TrajKind::User || (c.kind == TrajKind::Message && c.step.is_none());
-            let is_step_head = c.kind == TrajKind::Message && c.step.is_some();
-            let group_len = if is_step_head {
-                1 + cells[ci + 1..]
-                    .iter()
-                    .take_while(|n| n.turn == c.turn && n.kind == TrajKind::Tool)
-                    .count()
-            } else if is_msg_group_head {
-                cells[ci..]
-                    .iter()
-                    .take_while(|n| {
-                        n.turn == c.turn
-                            && (n.kind == TrajKind::User
-                                || (n.kind == TrajKind::Message && n.step.is_none()))
-                    })
-                    .count()
-                    .max(1)
-            } else {
-                // 孤儿工具行（理论上不出现）：单独成组
-                1
-            };
-            let group_cells = &cells[ci..ci + group_len];
-            let desc_ms: u64 = group_cells.iter().filter_map(|n| n.time_ms).sum();
-            let title: String = if is_step_head {
-                format!("步骤 {}", c.step.unwrap_or(1))
-            } else {
-                "消息".to_string()
-            };
-            rows.push(TrajRow::Group(
-                title,
-                if desc_ms > 0 {
-                    format!(
-                        "{} 毫秒",
-                        desc_ms
-                            .to_string()
-                            .as_bytes()
-                            .rchunks(3)
-                            .rev()
-                            .map(|b| std::str::from_utf8(b).unwrap_or_default())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )
-                } else {
-                    String::new()
-                },
-            ));
-            tops.push(y);
-            y += TRAJ_GROUP_PX + TRAJ_CELL_GAP_PX;
-            // 组内行：助手折叠时消息行 + 其后工具行 → 单条摘要行
-            let mut gi = 0usize;
-            while gi < group_len {
-                let gc = &cells[ci + gi];
-                let tool_run = cells[ci + gi..]
-                    .iter()
-                    .skip(1)
-                    .take_while(|n| n.kind == TrajKind::Tool)
-                    .count();
-                if gc.kind == TrajKind::Message
-                    && tool_run > 0
-                    && collapsed_assistants.contains(&gc.index)
-                {
-                    let last_in_turn = cells
-                        .get(ci + gi + tool_run + 1)
-                        .map(|n| n.turn != gc.turn)
-                        .unwrap_or(true);
-                    rows.push(TrajRow::AssistantSummary(gc.index, gc.text.clone()));
-                    tops.push(y);
-                    y += TRAJ_SUMMARY_PX
-                        + if last_in_turn {
-                            TRAJ_BODY_PAD_B_PX
-                        } else {
-                            TRAJ_CELL_GAP_PX
-                        };
-                    gi += tool_run + 1;
-                    continue;
-                }
-                rows.push(TrajRow::Cell(ci + gi));
-                tops.push(y);
-                let last_in_turn = cells
-                    .get(ci + gi + 1)
-                    .map(|n| n.turn != gc.turn)
-                    .unwrap_or(true);
-                y += TRAJ_CELL_PX
-                    + if last_in_turn {
-                        TRAJ_BODY_PAD_B_PX
-                    } else {
-                        TRAJ_CELL_GAP_PX
-                    };
-                gi += 1;
-            }
-            ci += group_len;
-        }
-        (rows, tops)
+        traj_layout(&cells, &collapsed_turns, &collapsed_assistants)
     }
 
     fn traj_cells(&self) -> Vec<TrajCell> {
@@ -3347,62 +3230,6 @@ open: false,
     }
 }
 
-/// 台账行高规格（上游 TrajectoryCell/TrajectoryTurnHeader module.css 实值）。
-const TRAJ_CELL_PX: f32 = 38.0;
-const TRAJ_HEADER_PX: f32 = 44.0;
-/// 轮头条内容道最大宽（上游 .inner max-width: 880px）。
-const TRAJ_LANE_MAX_PX: f32 = 880.0;
-/// 轮体规格（上游 TrajectoryTurn .body：gap 10、padding 8/16/22）。
-const TRAJ_CELL_GAP_PX: f32 = 10.0;
-const TRAJ_BODY_PAD_T_PX: f32 = 8.0;
-const TRAJ_BODY_PAD_B_PX: f32 = 22.0;
-/// 折叠摘要行高（上游 collapsed-summary td 20px）。
-const TRAJ_SUMMARY_PX: f32 = 20.0;
-/// 组头行高（上游 TrajectoryGroupHeader .root 36px）。
-const TRAJ_GROUP_PX: f32 = 36.0;
-
-/// 轨迹台账 cell（上游 TrajectoryCellProps 的 rustdsh 子集）。
-struct TrajCell {
-    turn: u64,
-    kind: TrajKind,
-    /// 全局序号（上游 #index，1 起）。
-    index: usize,
-    text: String,
-    /// 回退摘要行（「仅工具调用」等），三级色渲染（上游 .toolCallOnly）。
-    dim: bool,
-    /// 轮内步号（步骤组分组键；user 系与工具行为 None）
-    step: Option<u64>,
-    /// 详情面板用原文（保留换行；text 是单行省略版）。
-    detail_text: String,
-    /// 思考块拼接（消息 cell 详情「思考」节）。
-    reasoning: Option<String>,
-    /// 消息行 usage 三指标（输入/输出/思考）。
-    metrics: Option<(u64, u64, Option<u64>)>,
-    /// 时长列（消息行 = 轮 llm 用时；rustdsh 日志无事件级时间戳，工具行恒 —）。
-    time_ms: Option<u64>,
-    tool: Option<ToolBlock>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum TrajKind {
-    User,
-    Message,
-    Tool,
-}
-
-/// 台账平坦行（uniform_list 虚拟化 item）：轮头条或 cell（cells 下标）。
-#[derive(Clone)]
-enum TrajRow {
-    Header(u64),
-    Cell(usize),
-    /// Message / 步骤 N 组头（上游 TrajectoryGroupHeader，36px）
-    Group(String, String),
-    /// 折叠轮摘要行（上游 collapsedSummary turn，20px）
-    TurnSummary(u64, String),
-    /// 折叠助手摘要行（上游 collapsedSummary assistant，20px；携带消息 cell 序号）
-    AssistantSummary(usize, String),
-}
-
 /// 工具栏按钮（上游 .toggle/.action：20px、12 字、三级色、hover 底；
 /// pressed 态着底——轮次/调用为整表折叠态，时长为时间条模式）。
 fn traj_tool_btn(
@@ -3478,6 +3305,8 @@ fn traj_summary_row(turn: u64, idx: Option<usize>, text: String) -> Stateful<Div
         )
 }
 
+
+/// 台账平坦行模型（纯函数：组头/折叠摘要/行高几何；单测直接驱动）。
 /// 指标/时间列单元（71px 定宽三级色，上游 .metric/.time）。
 fn traj_metric(text: String) -> Div {
     div()

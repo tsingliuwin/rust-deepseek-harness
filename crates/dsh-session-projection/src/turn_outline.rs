@@ -232,6 +232,7 @@ mod tests {
 
     fn assistant_message(turn: u64, text: &str) -> dsh_session::SessionEvent {
         SessionEvent::AssistantMessage {
+            time_ms: None,
             turn,
             step: 1,
             message: Message::new(

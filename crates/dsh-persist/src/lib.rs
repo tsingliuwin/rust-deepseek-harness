@@ -957,6 +957,8 @@ fn blocks_to_web(blocks: &[ContentBlock]) -> serde_json::Value {
 pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
     let ty = v.get("type")?.as_str()?;
     let data = v.get("data");
+    // 信封 time（epoch ms）回传：轨迹时长列的日志数据源
+    let env_time = v.get("time").and_then(|t| t.as_u64());
     match ty {
         "turn/start" => Some(SessionEvent::TurnStart {
             turn: num(data, "turn"),
@@ -971,6 +973,7 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
         "step/start" => Some(SessionEvent::StepStart {
             turn: num(data, "turn"),
             step: num(data, "step"),
+            time_ms: env_time,
         }),
         "user/message" => {
             let d = data?;
@@ -1066,6 +1069,7 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
                 usage: d
                     .get("usage")
                     .and_then(|u| serde_json::from_value::<TokenUsage>(u.clone()).ok()),
+                time_ms: env_time,
             })
         }
         "tool/result" => {
@@ -1094,6 +1098,7 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
                     turn: num(data, "turn"),
                     step: num(data, "step"),
                     message: msg,
+                    time_ms: env_time,
                 });
             }
             // legacy 平铺形（rustdsh 旧写形）：{toolCallId, content, isError}
@@ -1119,6 +1124,7 @@ pub fn web_line_to_event(v: &serde_json::Value) -> Option<SessionEvent> {
                 turn: 0,
                 step: 0,
                 message: msg,
+                time_ms: env_time,
             })
         }
         // 我们自己的压缩/步末事件（step/end 落盘保证 seq 1:1 对齐，
@@ -1415,6 +1421,13 @@ fn num(data: Option<&serde_json::Value>, key: &str) -> u64 {
 /// 我们的事件 → web v2 信封行（None = 不落盘的辅助事件；chunk 由
 /// SessionRecorder 缓冲，结算行内嵌 stream，不在此构造）。
 pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde_json::Value> {
+    // 回放再落盘保留原信封 time（往返稳定）；实时事件无承载用落盘时刻
+    let time = match ev {
+        SessionEvent::StepStart { time_ms: Some(t), .. }
+        | SessionEvent::AssistantMessage { time_ms: Some(t), .. }
+        | SessionEvent::ToolResult { time_ms: Some(t), .. } => *t,
+        _ => time,
+    };
     let row = |ty: &str, data: serde_json::Value| {
         serde_json::json!({"type": ty, "seq": seq, "time": time, "data": data})
     };
@@ -1429,7 +1442,7 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
                 "reason": serde_json::to_value(reason).unwrap_or(serde_json::json!({"kind": "completed"})),
             }),
         )),
-        SessionEvent::StepStart { turn, step } => Some(row(
+        SessionEvent::StepStart { turn, step, .. } => Some(row(
             "step/start",
             serde_json::json!({"turn": turn, "step": step}),
         )),
@@ -1508,6 +1521,7 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
             message,
             interrupted,
             usage,
+            ..
         } => {
             let mut data = serde_json::json!({
                 "turn": turn,
@@ -1525,7 +1539,7 @@ pub fn event_to_web_line(ev: &SessionEvent, seq: u64, time: u64) -> Option<serde
         }
         // v2：chunk 不再是事件（缓冲后内嵌结算行）
         SessionEvent::AssistantChunk { .. } => None,
-        SessionEvent::ToolResult { turn, step, message } => {
+        SessionEvent::ToolResult { turn, step, message, .. } => {
             // v2 形：{turn, step, message:{id, role:'user', content, source}}
             Some(row(
                 "tool/result",
@@ -2310,6 +2324,7 @@ mod replay_tests {
             message,
             interrupted: false,
             usage: None,
+            time_ms: None,
         };
         let row = event_to_web_line(&event, 7, 1234).expect("assistant/message must map");
         assert_eq!(row["type"], "assistant/message");

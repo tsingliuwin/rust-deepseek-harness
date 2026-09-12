@@ -606,7 +606,7 @@ impl ReactLoopAgent {
 
             let assembly = self.assemble_prompt();
             // 上游 agent.ts 落盘序：step/start → system commits → user 批。
-            self.append_event(SessionEvent::StepStart { turn, step });
+            self.append_event(SessionEvent::StepStart { turn, step, time_ms: None });
             // v3 system prompt 面节点：rustdsh 的 provider 路线走请求 system
             // 参数（非 in-history），按上游 SystemPromptProjection 归一化语义
             // ——无 head 则 append（空 prompt 也保留 head），变化则精确替换
@@ -721,6 +721,7 @@ impl ReactLoopAgent {
                             message: message.clone(),
                             interrupted: true,
                             usage: assembler.usage().cloned(),
+                            time_ms: None,
                         });
                     }
                     return StepEnd::Concluded(TurnEndReason::Aborted { cancel_cause: dsh_session::CancelCause::Legacy });
@@ -783,6 +784,7 @@ impl ReactLoopAgent {
                 message: message.clone(),
                 interrupted: false,
                 usage: usage.clone(),
+                time_ms: None,
             });
             self.emit_ui(AgentEvent::AssistantMessage { message: message.clone(), usage });
 
@@ -855,7 +857,7 @@ impl ReactLoopAgent {
             concluded |= result.concludes_turn;
 
             let msg = Message::tool_result(id.clone(), result.content.clone(), result.is_error);
-            self.append_event(SessionEvent::ToolResult { turn, step, message: msg });
+            self.append_event(SessionEvent::ToolResult { turn, step, message: msg, time_ms: None });
             self.emit_ui(AgentEvent::ToolResult {
                 tool_call_id: id.clone(),
                 is_error: result.is_error,

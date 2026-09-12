@@ -64,6 +64,8 @@ struct ToolBlock {
     expanded: bool,
     /// 搜索卡里被折叠的文件组下标（升序；web collapsed Set 的对应物）
     collapsed_groups: Vec<usize>,
+    /// 调用时长（调用所在 message → tool/result；轨迹台账时间列工具行）
+    duration_ms: Option<u64>,
 }
 
 /// 附件视图块（用户消息混合附件；上游 PresentedAttachment：64px 图片
@@ -169,6 +171,9 @@ struct ChatEntry {
     context: Option<ContextInfo>,
     /// 折叠行展开态（上下文注入行用）
     open: bool,
+    /// 步窗时长（step/start → assistant/message；回放取日志 time，
+    /// 实时取 ChatView 秒表）——轨迹台账时间列消息行数据源。
+    step_duration_ms: Option<u64>,
 }
 
 /// One session shown in the sidebar list.
@@ -1561,6 +1566,7 @@ impl AppView {
         workspaces: Vec<WorkspaceInfo>,
         rename_input: Entity<InputState>,
         search_input: Entity<InputState>,
+        traj_search: Entity<InputState>,
         adopt_key: Entity<InputState>,
         adopt_base: Entity<InputState>,
         dc_route: Entity<InputState>,
@@ -1603,6 +1609,7 @@ impl AppView {
                 Some(dsh_persist::attachments_root_from_sessions_root(
                     &sessions_dir(),
                 )),
+                traj_search.clone(),
                 cx,
             )
         });
@@ -5408,6 +5415,9 @@ fn main() {
                 let search_input = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).placeholder("搜索会话…")
                 });
+                let traj_search = cx.new(|cx: &mut Context<InputState>| {
+                    InputState::new(window, cx).placeholder("搜索")
+                });
                 let adopt_key = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx).masked(true).placeholder("输入 API 密钥，或留空使用环境认证")
                 });
@@ -5468,6 +5478,7 @@ fn main() {
                         startup_workspaces.clone(),
                         rename_input.clone(),
                         search_input.clone(),
+                        traj_search.clone(),
                         adopt_key.clone(),
                         adopt_base.clone(),
                         dc_route.clone(),

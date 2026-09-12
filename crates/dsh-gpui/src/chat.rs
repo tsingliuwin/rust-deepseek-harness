@@ -24,6 +24,7 @@ use gpui::*;
 use gpui_component::button::ButtonVariants;
 // uniform_list 句柄的 offset() 在该 trait 上（吸顶算式读滚动偏移用）
 use gpui_component::scroll::ScrollbarHandle;
+use gpui_component::input::{Input, InputState};
 use gpui_component::{Icon, IconName, StyledExt};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -281,6 +282,22 @@ pub(crate) struct ChatView {
     pub(crate) tab: CenterTab,
     /// 轨迹 tab 虚拟化列表滚动句柄（Inspect pill 跳转 scroll_to_item）
     traj_ul: UniformListScrollHandle,
+    /// 轨迹工具栏搜索框（上游 TrajectoryToolbar search 席）
+    traj_search: Entity<InputState>,
+    /// 折叠轮集合（上游 collapsedTurns；轮头/摘要行点击切换）
+    traj_collapsed_turns: std::collections::HashSet<u64>,
+    /// 折叠助手消息 cell 序号集（上游 collapsedAssistants）
+    traj_collapsed_assistants: std::collections::HashSet<usize>,
+    /// 时间条拖选锚点（strip 内 px；None = 未拖）
+    traj_tl_anchor: Option<f32>,
+    /// 时间条拖选当前端（commit 后为聚焦区间）
+    traj_tl_current: Option<f32>,
+    /// 时间条已提交聚焦区间（strip 内 px 序域）
+    traj_tl_range: Option<(f32, f32)>,
+    /// 时间条实际时长模式（上游 actualDuration 开关）
+    traj_tl_actual: bool,
+    /// 时间条 strip 的窗口 bounds（拖选换算相对坐标）
+    traj_tl_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     /// 当前（或最近）轮次号（web turn-process 的分组键）
     ui_turn: u64,
     /// 仍打开的轮次（TurnStarted→TurnEnded；打开的轮次不折叠）
@@ -312,6 +329,8 @@ pub(crate) struct ChatView {
     heights_dirty: Cell<bool>,
     /// 本轮工具调用计时（call_id → 起始时刻）
     tool_starts: HashMap<String, Instant>,
+    /// 当前步首事件秒表（step 窗起点；AssistantMessage 收割）
+    step_start_inst: Option<Instant>,
     /// 本轮累计工具耗时（LLM 时间 = 轮用时 − 工具时间）
     turn_tool_time: Duration,
     /// 本轮 token 累计（TurnEnded 冻结进消息 footer 的统计快照）
@@ -350,6 +369,7 @@ impl ChatView {
         route_label: String,
         transcript_view: TranscriptView,
         attachments_root: Option<std::path::PathBuf>,
+        traj_search: Entity<InputState>,
         cx: &mut Context<Self>,
     ) -> Self {
         let view = Self {
@@ -361,6 +381,14 @@ impl ChatView {
             turn_started_at: None,
             tab: CenterTab::Conversation,
             traj_ul: UniformListScrollHandle::new(),
+            traj_search,
+            traj_collapsed_turns: Default::default(),
+            traj_collapsed_assistants: Default::default(),
+            traj_tl_anchor: None,
+            traj_tl_current: None,
+            traj_tl_range: None,
+            traj_tl_actual: false,
+            traj_tl_bounds: Default::default(),
             ui_turn: 0,
             turn_open: None,
             turn_expanded: Default::default(),
@@ -378,6 +406,7 @@ impl ChatView {
             chat_reset_pending: false,
             heights_dirty: Cell::new(false),
             tool_starts: Default::default(),
+            step_start_inst: None,
             turn_tool_time: Duration::ZERO,
             turn_usage: TurnUsage::default(),
             turn_first_token: None,
@@ -608,6 +637,9 @@ impl ChatView {
         let session = self.agent.session();
         let session = session.lock().unwrap();
         let mut cur_turn = 0u64;
+        let mut step_starts: std::collections::HashMap<(u64, u64), u64> =
+            std::collections::HashMap::new();
+        let mut last_msg_time: Option<u64> = None;
         for entry in session.entries() {
             match &entry.event {
                 SessionEvent::TurnStart { turn } => {
@@ -618,6 +650,7 @@ impl ChatView {
                     // 失败轮次在历史里也要可见（实时路径由 AgentEvent::Error
                     // 入列；回放此前只有用户气泡、轮次看起来凭空蒸发）
                     self.entries.push(ChatEntry {
+                        step_duration_ms: None,
                         role: Role::Error,
                         blocks: vec![MsgBlock::Text(format!("[{}] {}", failure.code, failure.message))],
                         done: true,
@@ -627,7 +660,7 @@ impl ChatView {
                         open: false,
                     });
                 }
-                SessionEvent::AssistantMessage { usage, message, .. } => {
+                SessionEvent::AssistantMessage { usage, message, step, time_ms, .. } => {
                     self.stats_steps += 1;
                     if let Some(u) = &usage {
                         self.stats_input_tokens += u.input_tokens;
@@ -652,6 +685,7 @@ impl ChatView {
                             ContentBlock::ToolCall { id, name, arguments } => {
                                 self.stats_tools += 1;
                                 blocks.push(MsgBlock::Tool(ToolBlock {
+                                    duration_ms: None,
                                     id: id.0.clone(),
                                     name: name.clone(),
                                     arguments: arguments.clone(),
@@ -669,6 +703,7 @@ impl ChatView {
                         // 轨迹指标列数据源：事件级 usage 落条目快照
                         // （计时字段日志无承载，留 0 → 时长列按缺省 — 渲染）
                         self.entries.push(ChatEntry {
+                            step_duration_ms: None,
                             role: Role::Assistant,
                             blocks,
                             done: true,
@@ -689,6 +724,16 @@ impl ChatView {
                             context: None,
                             open: false,
                         });
+                        // 时间列消息行：step/start → 本 message 的步窗；
+                        // 并记本步 message 时刻供 tool/result 算调用窗
+                        let msg_t: Option<u64> = *time_ms;
+                        if let Some(e) = self.entries.last_mut() {
+                            e.step_duration_ms = msg_t
+                                .zip(step_starts.get(&(cur_turn, *step)))
+                                .map(|(t, st)| t.saturating_sub(*st))
+                                .filter(|v| *v > 0);
+                        }
+                        last_msg_time = msg_t;
                     }
                 }
                 SessionEvent::ToolCall { .. } => { self.stats_tools += 1; }
@@ -709,6 +754,7 @@ impl ChatView {
                         continue;
                     }
                     self.entries.push(ChatEntry {
+                        step_duration_ms: None,
                         role: Role::Context,
                         blocks: vec![MsgBlock::Text(text)],
                         done: true,
@@ -766,6 +812,7 @@ impl ChatView {
                     {
                         let info = crate::context_info(context_kind, plugin, form, summary, changes_paths, reference_labels, name);
                         self.entries.push(ChatEntry {
+                            step_duration_ms: None,
                             role: Role::Context,
                             blocks: vec![MsgBlock::Text(text)],
                             done: true,
@@ -781,6 +828,7 @@ impl ChatView {
                         blocks.push(MsgBlock::Text(text));
                     }
                     self.entries.push(ChatEntry {
+                        step_duration_ms: None,
                         role: Role::User,
                         blocks,
                         done: true,
@@ -790,7 +838,10 @@ impl ChatView {
                         open: false,
                     });
                 }
-                SessionEvent::ToolResult { message, .. } => {
+                SessionEvent::StepStart { turn, step, time_ms: Some(t), .. } => {
+                    step_starts.insert((*turn, *step), *t);
+                }
+                SessionEvent::ToolResult { message, time_ms, .. } => {
                     if let Some(ContentBlock::ToolResult { tool_call_id, content, is_error }) =
                         message.content.first()
                     {
@@ -802,10 +853,24 @@ impl ChatView {
                             })
                             .collect();
                         attach_tool_result(self.entries.last_mut(), &tool_call_id.0, &result_text, is_error.unwrap_or(false));
+                        // 时间列工具行：调用所在 message → 本 result 的窗
+                        if let (Some(t), Some(owner)) = (time_ms, last_msg_time) {
+                            if let Some(e) = self.entries.last_mut() {
+                                let dur = Some(t.saturating_sub(owner)).filter(|v| *v > 0);
+                                for b in e.blocks.iter_mut() {
+                                    if let MsgBlock::Tool(tb) = b
+                                        && tb.id == tool_call_id.0
+                                    {
+                                        tb.duration_ms = dur;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 SessionEvent::Compaction { .. } => {
-                    self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: cur_turn, context: None,
+                    self.entries.push(ChatEntry {
+step_duration_ms: None, role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: cur_turn, context: None,
 open: false,
 });
                 }
@@ -822,6 +887,7 @@ open: false,
         let new = !matches!(self.entries.last(), Some(e) if e.role == Role::Assistant && !e.done);
         if new {
             self.entries.push(ChatEntry {
+                step_duration_ms: None,
                 role: Role::Assistant,
                 blocks: Vec::new(),
                 done: false,
@@ -866,6 +932,7 @@ open: false,
             blocks.push(MsgBlock::Text(t));
         }
         self.entries.push(ChatEntry {
+            step_duration_ms: None,
             role: Role::User,
             blocks,
             done: true,
@@ -880,6 +947,7 @@ open: false,
     /// @ 文件引用的上下文注入行入列。
     pub(crate) fn push_context_entry(&mut self, info: ContextInfo, text: String) {
         self.entries.push(ChatEntry {
+            step_duration_ms: None,
             role: Role::Context,
             blocks: vec![MsgBlock::Text(text)],
             done: true,
@@ -926,24 +994,29 @@ open: false,
                 self.turn_usage = TurnUsage::default();
                 self.turn_first_token = None;
                 self.tool_starts.clear();
+                self.step_start_inst = None;
                 self.heights_dirty.set(false);
             }
             AgentEvent::TextDelta { text } => {
                 if self.turn_first_token.is_none() {
                     self.turn_first_token = Some(Instant::now());
                 }
+                self.step_start_inst.get_or_insert_with(Instant::now);
                 self.push_text(&text);
             }
             AgentEvent::ReasoningDelta { text } => {
                 if self.turn_first_token.is_none() {
                     self.turn_first_token = Some(Instant::now());
                 }
+                self.step_start_inst.get_or_insert_with(Instant::now);
                 self.push_reasoning(&text);
             }
             AgentEvent::ToolCall { tool_call_id, name, arguments: args } => {
                 self.stats_tools += 1;
+                self.step_start_inst.get_or_insert_with(Instant::now);
                 self.tool_starts.insert(tool_call_id.0.clone(), Instant::now());
                 self.last_assistant().blocks.push(MsgBlock::Tool(ToolBlock {
+                    duration_ms: None,
                     id: tool_call_id.0,
                     name,
                     arguments: args,
@@ -955,8 +1028,22 @@ open: false,
                 }));
             }
             AgentEvent::ToolResult { tool_call_id, is_error } => {
+                let call_dur = self
+                    .tool_starts
+                    .get(&tool_call_id.0)
+                    .map(|st| st.elapsed().as_millis() as u64)
+                    .filter(|v| *v > 0);
                 if let Some(start) = self.tool_starts.remove(&tool_call_id.0) {
                     self.turn_tool_time += start.elapsed();
+                }
+                if let Some(e) = self.entries.last_mut() {
+                    for b in e.blocks.iter_mut() {
+                        if let MsgBlock::Tool(tb) = b
+                            && tb.id == tool_call_id.0
+                        {
+                            tb.duration_ms = call_dur;
+                        }
+                    }
                 }
                 // 实时结果文本从会话日志回读（事件本身只带 id/error）。
                 let result = self.latest_tool_result_text(&tool_call_id.0);
@@ -965,6 +1052,11 @@ open: false,
             }
             AgentEvent::AssistantMessage { usage, .. } => {
                 self.stats_steps += 1;
+                if let Some(st) = self.step_start_inst.take() {
+                    if let Some(e) = self.entries.last_mut() {
+                        e.step_duration_ms = Some(st.elapsed().as_millis() as u64).filter(|v| *v > 0);
+                    }
+                }
                 if let Some(u) = &usage {
                     self.stats_input_tokens += u.input_tokens;
                     self.stats_output_tokens += u.output_tokens;
@@ -1062,6 +1154,7 @@ open: false,
                 self.running = false;
                 self.turn_started_at = None;
                 self.entries.push(ChatEntry {
+                    step_duration_ms: None,
                     role: Role::Error,
                     blocks: vec![MsgBlock::Text(message)],
                     done: true,
@@ -1072,7 +1165,8 @@ open: false,
 });
             }
             AgentEvent::Compacted { .. } => {
-                self.entries.push(ChatEntry { role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: self.ui_turn, context: None,
+                self.entries.push(ChatEntry {
+step_duration_ms: None, role: Role::Notice, blocks: vec![], done: true, elapsed: None, usage: None, ended_at_ms: None, turn: self.ui_turn, context: None,
 open: false,
 });
             }
@@ -2170,10 +2264,14 @@ open: false,
     /// 右 320px 指标栏）；每轮一条 44px 吸顶轮头条（列标签 输入/输出/思考/时间）。
     /// 滚动走 uniform_list 虚拟化（上游 web 同有 virtualSpacer）：只渲染视口
     /// 内 item，整表重排的帧成本消失；Inspect pill 经 scroll_to_item 跳转。
-    fn render_trajectory(&self, this: &Entity<Self>, width: f32, _cx: &App) -> Stateful<Div> {
-        // --- 平坦行模型 + 累积顶边（item 高度由 mb 几何固定：52/48/60）---
-        let (rows_model, tops) = self.traj_rows();
-        let cells_rc: Rc<Vec<TrajCell>> = Rc::new(self.traj_cells());
+    fn render_trajectory(&self, this: &Entity<Self>, width: f32, cx: &App) -> Stateful<Div> {
+        // --- 工具栏搜索词（过滤/折叠 bypass 的开关）---
+        let query = self
+            .traj_search
+            .read_with(cx, |s, _| s.value().trim().to_lowercase());
+        // --- 平坦行模型 + 累积顶边（item 高度由 mb 几何固定：52/48/60/42/40）---
+        let (rows_model, tops) = self.traj_rows(&query);
+        let cells_rc: Rc<Vec<TrajCell>> = Rc::new(self.traj_visible_cells(&query));
         let rows_rc: Rc<Vec<TrajRow>> = Rc::new(rows_model);
         let t = theme::t();
         let lane = TRAJ_LANE_MAX_PX.min(width);
@@ -2192,6 +2290,10 @@ open: false,
         let total_h = match (rows_rc.last(), tops.last()) {
             (Some(TrajRow::Header(_)), Some(&top)) => top + TRAJ_HEADER_PX + TRAJ_BODY_PAD_T_PX,
             (Some(TrajRow::Cell(_)), Some(&top)) => top + TRAJ_CELL_PX + TRAJ_BODY_PAD_B_PX,
+            (Some(TrajRow::TurnSummary(..)), Some(&top)) => top + TRAJ_SUMMARY_PX + TRAJ_BODY_PAD_B_PX,
+            (Some(TrajRow::AssistantSummary(..)), Some(&top)) => {
+                top + TRAJ_SUMMARY_PX + TRAJ_BODY_PAD_B_PX
+            }
             _ => 0.0,
         };
         let mut sticky: Option<(u64, f32)> = None;
@@ -2206,6 +2308,74 @@ open: false,
                 sticky = Some((turn, top));
             }
         }
+        // --- 时间条（上游 TrajectoryTimeline 子集）：三泳道 span（user/
+        // message/tool）+ 轮界刻度 + 拖选聚焦；sequence 等宽 / 时长按比例 ---
+        struct TlSpan {
+            idx: usize,
+            x0: f32,
+            x1: f32,
+            lane: u8,
+            kind: TrajKind,
+        }
+        let strip_w = width;
+        // spans 取未折叠的可见 cell（上游 timelineTurns 用未折叠布局）
+        let span_cells: Vec<(usize, TrajKind, Option<u64>)> = cells_rc
+            .iter()
+            .enumerate()
+            .map(|(ci, c)| (ci, c.kind, c.time_ms))
+            .collect();
+        let total_dur: f32 = span_cells
+            .iter()
+            .map(|(_, _, d)| d.unwrap_or(0).max(1) as f32)
+            .sum::<f32>()
+            .max(1.0);
+        let n = span_cells.len().max(1) as f32;
+        let mut spans: Vec<TlSpan> = Vec::with_capacity(span_cells.len());
+        let mut x = 0.0f32;
+        for (ci, kind, dur) in &span_cells {
+            let w = if self.traj_tl_actual {
+                (dur.unwrap_or(0).max(1) as f32 / total_dur * strip_w).max(2.0)
+            } else {
+                strip_w / n
+            };
+            spans.push(TlSpan {
+                idx: *ci,
+                x0: x,
+                x1: x + w,
+                lane: match kind {
+                    TrajKind::User => 0,
+                    TrajKind::Message => 1,
+                    TrajKind::Tool => 2,
+                },
+                kind: *kind,
+            });
+            x += w;
+        }
+        // 轮界刻度：Header 行对应的 x（其前 span 数 × 槽宽 / 累积宽）
+        let mut ticks: Vec<f32> = Vec::new();
+        {
+            let mut acc = 0.0f32;
+            let mut last_turn: Option<u64> = None;
+            for (sp, (_, kind, _)) in spans.iter().zip(span_cells.iter()) {
+                let turn_of = cells_rc[sp.idx].turn;
+                let _ = kind;
+                if last_turn != Some(turn_of) {
+                    ticks.push(sp.x0);
+                    last_turn = Some(turn_of);
+                }
+                acc = sp.x1;
+            }
+            let _ = acc;
+        }
+        let spans_rc: Rc<Vec<TlSpan>> = Rc::new(spans);
+        let focus: Option<std::collections::HashSet<usize>> = self.traj_tl_range.map(|(a, b)| {
+            spans_rc
+                .iter()
+                .filter(|sp| sp.x0 <= b && sp.x1 >= a)
+                .map(|sp| sp.idx)
+                .collect()
+        });
+        let focus_rc = Rc::new(focus);
         // --- 虚拟化列表：item 渲染只取视口 range ---
         let ul_this = this.clone();
         let ul_cells = Rc::clone(&cells_rc);
@@ -2223,16 +2393,81 @@ open: false,
                     })
                 });
                 range
-                    .map(|ix| match ul_rows[ix] {
-                        TrajRow::Header(turn) => ul_this
-                            .read_with(cx, |v, _| v.traj_turn_header(turn, 0.0))
-                            // uniform_list item 不继承交叉轴 stretch：通栏
-                            // 铺底必须显式 w_full（否则 fit-content 缩左半）
-                            .bar()
-                            .w_full()
-                            .mb(px(TRAJ_BODY_PAD_T_PX))
-                            .into_any_element(),
-                        TrajRow::Cell(ci) => {
+                    .map(|ix| match &ul_rows[ix] {
+                        TrajRow::Header(t0) => {
+                            let turn = *t0;
+                            // 轮头点击 = 折叠/展开本轮（可折叠轮才接）
+                            let t_toggle = ul_this.clone();
+                            ul_this
+                                .read_with(cx, |v, _| v.traj_turn_header(turn, 0.0))
+                                // uniform_list item 不继承交叉轴 stretch：通栏
+                                // 铺底必须显式 w_full（否则 fit-content 缩左半）
+                                .bar()
+                                .id(("traj-head", turn))
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    t_toggle.update(cx, |v, cx| {
+                                        let cells = v.traj_visible_cells("");
+                                        if v.traj_collapsible_turns(&cells).contains(&turn) {
+                                            if !v.traj_collapsed_turns.remove(&turn) {
+                                                v.traj_collapsed_turns.insert(turn);
+                                            }
+                                            cx.notify();
+                                        }
+                                    });
+                                })
+                                .w_full()
+                                .mb(px(TRAJ_BODY_PAD_T_PX))
+                                .into_any_element()
+                        }
+                        TrajRow::TurnSummary(t0, text) => {
+                            let turn = *t0;
+                            let text = text.clone();
+                            let t_exp = ul_this.clone();
+                            div()
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    traj_summary_row(turn, None, text)
+                                        .on_click(move |_, _, cx| {
+                                            t_exp.update(cx, |v, cx| {
+                                                v.traj_collapsed_turns.remove(&turn);
+                                                cx.notify();
+                                            });
+                                        })
+                                        .mb(px(TRAJ_BODY_PAD_B_PX)),
+                                )
+                                .into_any_element()
+                        }
+                        TrajRow::AssistantSummary(i0, text) => {
+                            let idx = *i0;
+                            let text = text.clone();
+                            let last_in_turn =
+                                matches!(ul_rows.get(ix + 1), Some(TrajRow::Header(_)) | None);
+                            let t_exp = ul_this.clone();
+                            div()
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .child(
+                                    traj_summary_row(0, Some(idx), text)
+                                        .on_click(move |_, _, cx| {
+                                            t_exp.update(cx, |v, cx| {
+                                                v.traj_collapsed_assistants.remove(&idx);
+                                                cx.notify();
+                                            });
+                                        })
+                                        .mb(px(if last_in_turn {
+                                            TRAJ_BODY_PAD_B_PX
+                                        } else {
+                                            TRAJ_CELL_GAP_PX
+                                        })),
+                                )
+                                .into_any_element()
+                        }
+                        TrajRow::Cell(c0) => {
+                            let ci = *c0;
                             let last_in_turn =
                                 matches!(ul_rows.get(ix + 1), Some(TrajRow::Header(_)) | None);
                             let row = ul_this.read_with(cx, |v, _| {
@@ -2249,6 +2484,11 @@ open: false,
                                 .w_full()
                                 .flex()
                                 .justify_center()
+                                // 时间条聚焦：区间外行变淡（上游 outside .24）
+                                .when(
+                                    matches!(focus_rc.as_ref(), Some(f) if !f.contains(&ci)),
+                                    |d| d.opacity(0.24),
+                                )
                                 .child(
                                     row.mb(px(if last_in_turn {
                                         TRAJ_BODY_PAD_B_PX
@@ -2265,6 +2505,206 @@ open: false,
         .track_scroll(self.traj_ul.clone())
         .w_full()
         .h_full();
+
+        // --- 工具栏（上游 TrajectoryToolbar：32px 吸顶条；折叠开关 + 搜索）---
+        let cells_for_toggle = cells_rc.clone();
+        let all_turns_collapsed = {
+            let coll = self.traj_collapsible_turns(&cells_for_toggle);
+            !coll.is_empty() && coll.iter().all(|t| self.traj_collapsed_turns.contains(t))
+        };
+        let all_calls_collapsed = {
+            let coll = self.traj_collapsible_assistants(&cells_for_toggle);
+            !coll.is_empty()
+                && coll.iter().all(|i| self.traj_collapsed_assistants.contains(i))
+        };
+        let t_turns = this.clone();
+        let t_calls = this.clone();
+        let t_dur = this.clone();
+        let toolbar = div()
+            .flex_none()
+            .h(px(32.0))
+            .w_full()
+            .border_b(px(0.5))
+            .border_color(t.border_l2)
+            .bg(theme::t().bg_base)
+            .flex()
+            .items_center()
+            .px(px(6.0))
+            .gap(px(2.0))
+            .child(traj_tool_btn(
+                "traj-tb-duration",
+                "时长",
+                self.traj_tl_actual,
+                move |_, _, cx| {
+                    t_dur.update(cx, |v, cx| {
+                        v.traj_tl_actual = !v.traj_tl_actual;
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(traj_tool_btn(
+                "traj-tb-turns",
+                "轮次",
+                all_turns_collapsed,
+                move |_, _, cx| {
+                    t_turns.update(cx, |v, cx| {
+                        let cells = v.traj_visible_cells("");
+                        let coll = v.traj_collapsible_turns(&cells);
+                        let all = !coll.is_empty()
+                            && coll.iter().all(|t| v.traj_collapsed_turns.contains(t));
+                        if all {
+                            for t in coll {
+                                v.traj_collapsed_turns.remove(&t);
+                            }
+                        } else {
+                            for t in coll {
+                                v.traj_collapsed_turns.insert(t);
+                            }
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(traj_tool_btn(
+                "traj-tb-calls",
+                "调用",
+                all_calls_collapsed,
+                move |_, _, cx| {
+                    t_calls.update(cx, |v, cx| {
+                        let cells = v.traj_visible_cells("");
+                        let coll = v.traj_collapsible_assistants(&cells);
+                        let all = !coll.is_empty()
+                            && coll.iter().all(|i| v.traj_collapsed_assistants.contains(i));
+                        if all {
+                            v.traj_collapsed_assistants.clear();
+                        } else {
+                            for i in coll {
+                                v.traj_collapsed_assistants.insert(i);
+                            }
+                        }
+                        cx.notify();
+                    });
+                },
+            ))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .w(px(164.0))
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .px(px(6.0))
+                    .gap(px(4.0))
+                    .border(px(0.5))
+                    .border_color(t.border_l4)
+                    .rounded(px(4.0))
+                    .bg(theme::t().layer1)
+                    .child(Icon::new(IconName::Search).size(px(11.0)).text_color(t.caption))
+                    .child(Input::new(&self.traj_search).appearance(false).w_full()),
+            );
+        let tl_bounds = self.traj_tl_bounds.clone();
+        let t_down = this.clone();
+        let t_move = this.clone();
+        let t_up = this.clone();
+        let anchor = self.traj_tl_anchor;
+        let current = self.traj_tl_current;
+        let mut strip = div()
+            .relative()
+            .w_full()
+            .h(px(50.0))
+            .flex_none()
+            .border_b(px(0.5))
+            .border_color(t.border_l2)
+            .bg(theme::t().bg_base)
+            .on_children_prepainted({
+                let tb = tl_bounds.clone();
+                move |children, _, _| {
+                    *tb.borrow_mut() = children.first().cloned();
+                }
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let tl_b = tl_bounds.clone();
+                move |ev: &MouseDownEvent, _window, cx| {
+                let Some(b) = tl_b.borrow().clone() else { return };
+                let rel = f32::from(ev.position.x) - f32::from(b.origin.x);
+                t_down.update(cx, |v, cx| {
+                    v.traj_tl_anchor = Some(rel);
+                    v.traj_tl_current = Some(rel);
+                    cx.notify();
+                });
+                }
+            })
+            .on_mouse_move({
+                let tl_b = tl_bounds.clone();
+                move |ev: &MouseMoveEvent, _, cx| {
+                if ev.pressed_button.is_none() {
+                    return;
+                }
+                let Some(b) = tl_b.borrow().clone() else { return };
+                let rel = f32::from(ev.position.x) - f32::from(b.origin.x);
+                t_move.update(cx, |v, cx| {
+                    if v.traj_tl_anchor.is_some() {
+                        v.traj_tl_current = Some(rel);
+                        cx.notify();
+                    }
+                });
+                }
+            })
+            .on_mouse_up(MouseButton::Left, move |_: &MouseUpEvent, _window, cx| {
+                t_up.update(cx, |v, cx| {
+                    if let (Some(a), Some(b)) = (v.traj_tl_anchor, v.traj_tl_current) {
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        v.traj_tl_range = if hi - lo < 4.0 { None } else { Some((lo, hi)) };
+                    }
+                    v.traj_tl_anchor = None;
+                    v.traj_tl_current = None;
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .id("traj-tl-lanes")
+                    .absolute()
+                    .inset_0()
+                    .children(spans_rc.iter().map(|sp| {
+                        let color = match sp.kind {
+                            TrajKind::User => t.green,
+                            TrajKind::Message => t.tag_message_fg,
+                            TrajKind::Tool => t.warn_label,
+                        };
+                        div()
+                            .absolute()
+                            .left(px(sp.x0))
+                            .w(px((sp.x1 - sp.x0).max(1.0)))
+                            .top(px(7.0 + sp.lane as f32 * 14.0))
+                            .h(px(8.0))
+                            .rounded(px(2.0))
+                            .bg(color)
+                    }))
+                    .children(ticks.iter().map(|tx| {
+                        div()
+                            .absolute()
+                            .left(px(*tx))
+                            .top(px(4.0))
+                            .bottom(px(4.0))
+                            .w(px(1.0))
+                            .bg(t.border_l3)
+                    })),
+            );
+        if let (Some(a), Some(b)) = (anchor, current) {
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            strip = strip.child(
+                div()
+                    .absolute()
+                    .left(px(lo))
+                    .w(px((hi - lo).max(1.0)))
+                    .top_0()
+                    .bottom_0()
+                    .border(px(1.0))
+                    .border_color(t.accent)
+                    .bg(gpui::hsla(0.6, 0.6, 0.5, 0.12)),
+            );
+        }
         // 轮头通栏铺底 + 内层 880 居中道；行卡 848（道内 padding 16）居中——
         // 行右 320px 指标栏与轮头列标签同靠居中道右缘（lane-24）对齐。
         let mut col = div()
@@ -2272,6 +2712,9 @@ open: false,
             .relative()
             .h_full()
             .w_full()
+            .v_flex()
+            .child(toolbar)
+            .child(strip)
             .child(list);
         if cells_rc.is_empty() {
             col = col.child(
@@ -2305,18 +2748,102 @@ open: false,
     /// （带 usage 三指标与 llm 用时）+ 逐工具 cell。序号全局连续（上游 #index）。
     /// 台账平坦行模型（虚拟化与吸顶算式同源）：轮头 item 52px（44 条 +
     /// 8 进轮体）、cell item 48px（38 + 10 gap）、轮尾 cell 60px（38 + 22）。
-    fn traj_rows(&self) -> (Vec<TrajRow>, Vec<f32>) {
+    /// 搜索过滤后的 cell 视图（上游 filterRecords：仅匹配项、重分段）。
+    fn traj_visible_cells(&self, q: &str) -> Vec<TrajCell> {
         let cells = self.traj_cells();
+        if q.is_empty() {
+            return cells;
+        }
+        cells
+            .into_iter()
+            .filter(|c| c.text.to_lowercase().contains(q))
+            .collect()
+    }
+
+    /// 可折叠轮（上游 collapsibleTurnIds：可见 cell > 1 的轮）。
+    fn traj_collapsible_turns(&self, cells: &[TrajCell]) -> std::collections::HashSet<u64> {
+        let mut counts: std::collections::HashMap<u64, usize> = Default::default();
+        for c in cells {
+            *counts.entry(c.turn).or_default() += 1;
+        }
+        counts.into_iter().filter(|(_, n)| *n > 1).map(|(t, _)| t).collect()
+    }
+
+    /// 可折叠助手（上游 collapsibleAssistantIds：后随工具 cell 的消息 cell 序号）。
+    fn traj_collapsible_assistants(&self, cells: &[TrajCell]) -> std::collections::HashSet<usize> {
+        cells
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| {
+                c.kind == TrajKind::Message
+                    && cells.get(i + 1).is_some_and(|n| n.kind == TrajKind::Tool)
+            })
+            .map(|(i, c)| (i, c))
+            .map(|(_, c)| c.index)
+            .collect()
+    }
+
+    fn traj_rows(&self, query: &str) -> (Vec<TrajRow>, Vec<f32>) {
+        let cells = self.traj_visible_cells(query);
+        let query_active = !query.is_empty();
+        let collapsed_turns = if query_active {
+            Default::default()
+        } else {
+            self.traj_collapsed_turns.clone()
+        };
+        let collapsed_assistants = if query_active {
+            Default::default()
+        } else {
+            self.traj_collapsed_assistants.clone()
+        };
         let mut rows: Vec<TrajRow> = Vec::new();
         let mut tops: Vec<f32> = Vec::new();
         let mut y = 0.0f32;
         let mut last_turn: Option<u64> = None;
-        for (ci, c) in cells.iter().enumerate() {
+        let mut ci = 0usize;
+        while ci < cells.len() {
+            let c = &cells[ci];
             if last_turn != Some(c.turn) {
                 rows.push(TrajRow::Header(c.turn));
                 tops.push(y);
                 y += TRAJ_HEADER_PX + TRAJ_BODY_PAD_T_PX;
                 last_turn = Some(c.turn);
+                // 折叠轮：整轮换一条 20px 摘要行
+                if collapsed_turns.contains(&c.turn) {
+                    let turn_cells = cells[ci..].iter().take_while(|n| n.turn == c.turn).count();
+                    if turn_cells > 1 {
+                        rows.push(TrajRow::TurnSummary(c.turn, c.text.clone()));
+                        tops.push(y);
+                        y += TRAJ_SUMMARY_PX + TRAJ_BODY_PAD_B_PX;
+                        ci += turn_cells;
+                        continue;
+                    }
+                }
+            }
+            // 折叠助手：消息行 + 其后工具行 → 单条摘要行
+            let tool_run = cells[ci..]
+                .iter()
+                .skip(1)
+                .take_while(|n| n.kind == TrajKind::Tool)
+                .count();
+            if c.kind == TrajKind::Message
+                && tool_run > 0
+                && collapsed_assistants.contains(&c.index)
+            {
+                let last_in_turn = cells
+                    .get(ci + tool_run + 1)
+                    .map(|n| n.turn != c.turn)
+                    .unwrap_or(true);
+                rows.push(TrajRow::AssistantSummary(c.index, c.text.clone()));
+                tops.push(y);
+                y += TRAJ_SUMMARY_PX
+                    + if last_in_turn {
+                        TRAJ_BODY_PAD_B_PX
+                    } else {
+                        TRAJ_CELL_GAP_PX
+                    };
+                ci += tool_run + 1;
+                continue;
             }
             rows.push(TrajRow::Cell(ci));
             tops.push(y);
@@ -2327,6 +2854,7 @@ open: false,
                 } else {
                     TRAJ_CELL_GAP_PX
                 };
+            ci += 1;
         }
         (rows, tops)
     }
@@ -2423,7 +2951,7 @@ open: false,
                             .usage
                             .as_ref()
                             .map(|u| (u.input_tokens, u.output_tokens, u.reasoning)),
-                        time_ms: entry.usage.as_ref().map(|u| u.llm_ms).filter(|v| *v > 0),
+                        time_ms: entry.step_duration_ms,
                         tool: None,
                     });
                     for block in &entry.blocks {
@@ -2439,7 +2967,7 @@ open: false,
                                 detail_text: String::new(),
                                 reasoning: None,
                                 metrics: None,
-                                time_ms: None,
+                                time_ms: tool.duration_ms,
                                 tool: Some(tool.clone()),
                             });
                         }
@@ -2706,6 +3234,8 @@ const TRAJ_LANE_MAX_PX: f32 = 880.0;
 const TRAJ_CELL_GAP_PX: f32 = 10.0;
 const TRAJ_BODY_PAD_T_PX: f32 = 8.0;
 const TRAJ_BODY_PAD_B_PX: f32 = 22.0;
+/// 折叠摘要行高（上游 collapsed-summary td 20px）。
+const TRAJ_SUMMARY_PX: f32 = 20.0;
 
 /// 轨迹台账 cell（上游 TrajectoryCellProps 的 rustdsh 子集）。
 struct TrajCell {
@@ -2735,10 +3265,89 @@ enum TrajKind {
 }
 
 /// 台账平坦行（uniform_list 虚拟化 item）：轮头条或 cell（cells 下标）。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum TrajRow {
     Header(u64),
     Cell(usize),
+    /// 折叠轮摘要行（上游 collapsedSummary turn，20px）
+    TurnSummary(u64, String),
+    /// 折叠助手摘要行（上游 collapsedSummary assistant，20px；携带消息 cell 序号）
+    AssistantSummary(usize, String),
+}
+
+/// 工具栏按钮（上游 .toggle/.action：20px、12 字、三级色、hover 底；
+/// pressed 态着底——轮次/调用为整表折叠态，时长为时间条模式）。
+fn traj_tool_btn(
+    id: &'static str,
+    label: &'static str,
+    pressed: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(20.0))
+        .px(px(6.0))
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .rounded(px(3.0))
+        .cursor_pointer()
+        .map(|d| {
+            if pressed {
+                d.bg(theme::t().hover).text_color(theme::t().text)
+            } else {
+                d.text_color(theme::t().text_3)
+            }
+        })
+        .hover(|s| s.bg(theme::t().hover).text_color(theme::t().text))
+        .on_click(on_click)
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(16.0))
+                .child(label),
+        )
+}
+
+/// 折叠摘要行（上游 collapsed-summary：20px、省略号 + 单行省略文本、
+/// 点击展开；turn 省略号 600 三级色，文本二级色 12/16）。
+fn traj_summary_row(turn: u64, idx: Option<usize>, text: String) -> Stateful<Div> {
+    let t = theme::t();
+    let id: SharedString = match idx {
+        Some(i) => format!("traj-sum-a-{i}").into(),
+        None => format!("traj-sum-t-{turn}").into(),
+    };
+    div()
+        .id(id)
+        .h(px(TRAJ_SUMMARY_PX))
+        .w(px(848.0))
+        .flex()
+        .items_center()
+        .gap_1()
+        .px(px(10.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme::t().hover))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .line_height(px(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.text_3)
+                .child("…"),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .text_size(px(12.0))
+                .line_height(px(16.0))
+                .text_color(t.text_2)
+                .child(text),
+        )
 }
 
 /// 指标/时间列单元（71px 定宽三级色，上游 .metric/.time）。

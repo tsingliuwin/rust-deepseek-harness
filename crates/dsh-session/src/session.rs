@@ -73,7 +73,13 @@ pub struct RequestContext {
 pub enum SessionEvent {
     TurnStart { turn: u64 },
     TurnEnd { turn: u64, reason: TurnEndReason },
-    StepStart { turn: u64, step: u64 },
+    StepStart {
+        turn: u64,
+        step: u64,
+        /// 信封 time（epoch ms）的回传承载；写侧缺省用落盘时刻。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        time_ms: Option<u64>,
+    },
     StepEnd { turn: u64, step: u64 },
     /// `surfaceOp: append` — the message itself is the model-visible node.
     UserMessage(dsh_llm::Message),
@@ -83,6 +89,9 @@ pub enum SessionEvent {
         message: dsh_llm::Message,
         interrupted: bool,
         usage: Option<dsh_llm::TokenUsage>,
+        /// 信封 time（epoch ms）的回传承载；写侧缺省用落盘时刻。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        time_ms: Option<u64>,
     },
     /// Raw chunk, preserved for replay fidelity (log-only, not model-visible).
     AssistantChunk { turn: u64, step: u64, chunk: dsh_llm::StreamChunk },
@@ -98,6 +107,9 @@ pub enum SessionEvent {
         turn: u64,
         step: u64,
         message: dsh_llm::Message,
+        /// 信封 time（epoch ms）的回传承载；写侧缺省用落盘时刻。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        time_ms: Option<u64>,
     },
     RequestHeader {
         header: EpochHeader,
@@ -358,6 +370,7 @@ mod tests {
         s.append(SessionEvent::UserMessage(Message::user_text("hello")));
         let assistant = Message::assistant(vec![ContentBlock::text("hi there")], "mock", "mock");
         s.append(SessionEvent::AssistantMessage {
+            time_ms: None,
             turn: 1,
             step: 1,
             message: assistant,
@@ -429,7 +442,7 @@ mod tests {
             vec![ContentBlock::text("42")],
             false,
         );
-        s.append(SessionEvent::ToolResult { turn: 1, step: 1, message: result_msg });
+        s.append(SessionEvent::ToolResult { turn: 1, step: 1, message: result_msg, time_ms: None });
         let msgs = s.derive_messages();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, Role::User);

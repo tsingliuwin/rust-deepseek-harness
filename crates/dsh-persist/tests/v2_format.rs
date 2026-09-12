@@ -103,6 +103,7 @@ fn v2_chunks_embed_into_settlement_stream() {
         &id,
         "/tmp/ws",
         &SessionEvent::AssistantMessage {
+            time_ms: None,
             turn: 1,
             step: 1,
             message: Message::assistant(vec![ContentBlock::text("你好！")], "mock", "mock"),
@@ -200,6 +201,7 @@ fn v2_failed_attempt_flushes_as_assistant_attempt() {
         &id,
         "/tmp/ws",
         &SessionEvent::AssistantMessage {
+            time_ms: None,
             turn: 1,
             step: 1,
             message: Message::assistant(vec![ContentBlock::text("ok")], "mock", "mock"),
@@ -240,7 +242,7 @@ fn v2_tool_result_and_compaction_shapes() {
         vec![ContentBlock::text("r")],
         false,
     );
-    rec.append(&id, "/tmp/ws", &SessionEvent::ToolResult { turn: 1, step: 1, message: msg })
+    rec.append(&id, "/tmp/ws", &SessionEvent::ToolResult { turn: 1, step: 1, message: msg, time_ms: None })
         .unwrap();
     rec.append(
         &id,

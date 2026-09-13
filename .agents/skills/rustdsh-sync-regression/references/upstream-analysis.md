@@ -3,7 +3,7 @@
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
 > **当前同步点：dsh-v0.1.5-rc.2（fb2c4b9e69）**——2026-09-11 同步（rc.1+rc.2；发布点后 master 增量 30 提交全部 subprocess/desktop/ci 面外）。此前 b2e3b2a012（0.1.5-alpha.2，2026-09-09 同步）。
 > 0.1.5-alpha.1 主面：**会话格式 v3**（system prompt 晋升 system/message 行 + request/header 去 system + PTC 改名 + canonical 信封）、composer 统计行改双图标 pill + 互斥统计对话框、SystemPromptRow（系统提示词折叠行）；Sidebar 工作区文件树/dockkit/textpreview/remotes 全链面外。
-> **最近检查：2026-09-11（定时轮 #6，同步轮）**——上游发布 0.1.5-rc.1/rc.2（184 文件 +1293/-1144，存储零变更），面内两项实施（deepseek 模型目录 V41 Flash 首项默认 + Usage 对话框 cacheWrite 为 0 省行）。
+> **最近检查：2026-09-11（定时轮 #7，零更新轮）**——上游 pull 经仓库局部代理（http.proxy=127.0.0.1:7897，SSH/HTTPS 直连被墙后的固定修复）成功，Already up to date（HEAD=master=rc.2 发布点 fb2c4b9e69），五段零差异，无动作。上轮 #6 同步结论不变。
 
 ## 1. 一键差异分析
 

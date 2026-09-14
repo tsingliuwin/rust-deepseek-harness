@@ -14,9 +14,6 @@ use crate::layout::{self, SIDEBAR_AUTO_COLLAPSE, SIDEBAR_COLLAPSED};
 use crate::theme;
 use crate::widgets::{icon_btn, rail_icon, session_row, tip};
 use crate::{AppView, SessionMeta, WorkspaceInfo};
-use dsh_gpui::{
-    DirEntry, DirLevel, FilesErrorKind, child_path, files_failure_line, order_entries,
-};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -25,14 +22,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
-
-/// 侧栏面板内容（上游左栏=会话；「文件」经 dock 面板呈现——rustdsh 以
-/// 面板切换等价承载，偏差见 upstream-analysis）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SidebarPane {
-    Conversations,
-    Files,
-}
 
 pub(crate) struct SidebarView {
     /// 宿主句柄（动作回写 + 数据快照来源）
@@ -45,15 +34,6 @@ pub(crate) struct SidebarView {
     current_id: dsh_llm::SessionId,
     /// 运行中会话 id（agent 会话且 agent_busy；运行态状态点）
     running_id: Option<dsh_llm::SessionId>,
-    /// 面板内容：会话列表 | 工作区文件树（上游 sidebar-right「文件」tab 的
-    /// 本地形态；dock tab 引擎面外，品牌行胶囊切换）
-    pub(crate) pane: SidebarPane,
-    /// 文件树根 = 视图会话的工作区 cwd（refresh 推送；变化即整树重置）
-    files_root: Option<String>,
-    /// 每层目录的列表结果（键 = 绝对路径；Err = 上游失败行来源）
-    files_levels: HashMap<String, Result<DirLevel, (FilesErrorKind, String)>>,
-    /// 展开的目录路径集
-    files_expanded: HashSet<String>,
     current_workspace: Option<String>,
     /// 布局镜像（AppView::sidebar_collapsed / sidebar_width）
     layout_collapsed: bool,
@@ -104,10 +84,6 @@ impl SidebarView {
             archived: Default::default(),
             current_id: dsh_llm::SessionId::new(String::new()),
             running_id: None,
-            pane: SidebarPane::Conversations,
-            files_root: None,
-            files_levels: HashMap::new(),
-            files_expanded: HashSet::new(),
             current_workspace: None,
             layout_collapsed: false,
             layout_width: layout::SIDEBAR_DEFAULT,
@@ -154,7 +130,6 @@ impl SidebarView {
         archived: HashSet<String>,
         current_id: dsh_llm::SessionId,
         running_id: Option<dsh_llm::SessionId>,
-        files_root: Option<String>,
         current_workspace: Option<String>,
         layout_collapsed: bool,
         layout_width: f32,
@@ -164,15 +139,6 @@ impl SidebarView {
         self.archived = archived;
         self.current_id = current_id;
         self.running_id = running_id;
-        // 工作区换了 = 整树作废（键是绝对路径，跨根复用必错）
-        if self.files_root != files_root {
-            self.files_root = files_root;
-            self.files_levels.clear();
-            self.files_expanded.clear();
-            if self.pane == SidebarPane::Files {
-                self.files_open_root();
-            }
-        }
         self.current_workspace = current_workspace;
         self.layout_collapsed = layout_collapsed;
         self.layout_width = layout_width;
@@ -180,304 +146,6 @@ impl SidebarView {
 }
 
 impl SidebarView {
-    /// 打开文件面板（或根变化后重载）：根层必载。
-    pub(crate) fn files_open_root(&mut self) {
-        let Some(root) = self.files_root.clone() else {
-            return;
-        };
-        if !self.files_levels.contains_key(&root) {
-            self.files_load(&root);
-        }
-    }
-
-    fn files_load(&mut self, path: &str) {
-        let Some(root) = self.files_root.clone() else { return };
-        let r = dsh_gpui::list_dir(&root, path);
-        self.files_levels.insert(path.to_string(), r);
-    }
-
-    /// 目录开合：首次展开时同步列表（本地面无异步 in-flight 代际）。
-    fn files_toggle(&mut self, path: &str) {
-        if !self.files_expanded.remove(path) {
-            self.files_expanded.insert(path.to_string());
-            if !self.files_levels.contains_key(path) {
-                self.files_load(path);
-            }
-        }
-    }
-
-    /// 重载：丢全部层，重问展开中的层（上游 reload 语义）。
-    fn files_reload(&mut self) {
-        let paths: Vec<String> = self.files_expanded.iter().cloned().collect();
-        self.files_levels.clear();
-        for p in &paths {
-            self.files_load(p);
-        }
-    }
-
-    /// 文件面板主体：路径头（38px：directory 灰 + name 全墨 + 重载钮）+
-    /// 树体（滚动）。行规格照上游 FilesBody.module.css（行 30px r10、
-    /// 层级步进 18px、note 12px 三级）。
-    fn files_pane(&self, sb: &Entity<Self>, app: &Entity<AppView>) -> Div {
-        let Some(root) = self.files_root.clone() else {
-            // noWorkspace：会话无工作区目录
-            return div()
-                .flex_grow()
-                .min_h_0()
-                .flex()
-                .items_start()
-                .px(px(10.0))
-                .py(px(12.0))
-                .child(
-                    div()
-                        .text_size(px(theme::FONT_ROW))
-                        .line_height(px(24.0))
-                        .text_color(theme::t().text_2)
-                        .child("这个会话没有工作区目录。"),
-                );
-        };
-        // 路径头：上游 pathPartsOf——尾段全墨，其余 directory 灰
-        let (dir_part, name_part) = match root.rsplit_once(['/', '\\']) {
-            Some((d, n)) if !n.is_empty() => (d.to_string(), n.to_string()),
-            _ => (String::new(), root.clone()),
-        };
-        let t_reload = sb.clone();
-        let header = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap_1()
-            .h(px(38.0))
-            .pl(px(16.0))
-            .pr(px(6.0))
-            .border_b(px(0.5))
-            .border_color(theme::t().border_l3)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .justify_end()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_size(px(12.0))
-                    .line_height(px(18.0))
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .when(!dir_part.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .text_color(theme::t().text_3)
-                                        .child(format!("{dir_part}/")),
-                                )
-                            })
-                            .child(div().text_color(theme::t().text).child(name_part)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("sb-files-reload")
-                    .size(px(28.0))
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .text_color(theme::t().text_2)
-                    .cursor_pointer()
-                    .hover(|st| {
-                        st.bg(theme::t().hover)
-                            .text_color(theme::t().text)
-                    })
-                    .on_click(move |_, _, cx| {
-                        t_reload.update(cx, |v, cx| {
-                            v.files_reload();
-                            cx.notify();
-                        });
-                    })
-                    .child(
-                        svg()
-                            .path("icons/refresh.svg")
-                            .size(px(15.0))
-                            .text_color(theme::t().text_2),
-                    ),
-            );
-        let mut rows: Vec<AnyElement> = Vec::new();
-        self.files_level_rows(&root, &mut rows, 0, sb, app);
-        let body = div()
-            .id("sidebar-files-list")
-            .flex_grow()
-            .min_h_0()
-            .overflow_y_scroll()
-            .v_flex()
-            .pt(px(8.0))
-            .pb(px(8.0))
-            .pl(px(8.0))
-            .pr(px(2.0))
-            .children(rows);
-        div().flex_grow().min_h_0().v_flex().child(header).child(body)
-    }
-
-    /// 一层目录的行（含嵌套展开层）。未加载的层不渲染（根在打开时必载，
-    /// 其余层在展开时同步载入）。
-    fn files_level_rows(
-        &self,
-        parent: &str,
-        out: &mut Vec<AnyElement>,
-        depth: usize,
-        sb: &Entity<Self>,
-        app: &Entity<AppView>,
-    ) {
-        let Some(level) = self.files_levels.get(parent) else {
-            return;
-        };
-        let note = |text: String| {
-            div()
-                .pl(px(10.0 + depth as f32 * 18.0))
-                .pr(px(10.0))
-                .py(px(3.0))
-                .text_size(px(12.0))
-                .line_height(px(18.0))
-                .text_color(theme::t().text_3)
-                .child(text)
-        };
-        let level = match level {
-            Ok(l) => l,
-            Err((kind, msg)) => {
-                out.push(note(files_failure_line(*kind, msg)).into_any_element());
-                return;
-            }
-        };
-        if level.entries.is_empty() {
-            out.push(note("空目录".into()).into_any_element());
-        }
-        for e in order_entries(&level.entries) {
-            let path = child_path(parent, &e.name);
-            let indent = px(10.0 + depth as f32 * 18.0);
-            match e.kind {
-                dsh_gpui::DirEntryKind::Directory => {
-                    let expanded = self.files_expanded.contains(&path);
-                    let t_toggle = sb.clone();
-                    let p = path.clone();
-                    out.push(
-                        div()
-                            .id(SharedString::from(format!("sb-file-dir-{path}")))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .pl(indent)
-                            .pr(px(10.0))
-                            .h(px(30.0))
-                            .rounded(px(10.0))
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(20.0))
-                            .text_color(theme::t().text)
-                            .cursor_pointer()
-                            .hover(|st| st.bg(theme::t().hover))
-                            .on_click(move |_, _, cx| {
-                                let p = p.clone();
-                                t_toggle.update(cx, |v, cx| {
-                                    v.files_toggle(&p);
-                                    cx.notify();
-                                });
-                            })
-                            .child(
-                                Icon::new(if expanded {
-                                    IconName::FolderOpen
-                                } else {
-                                    IconName::FolderClosed
-                                })
-                                .size(px(16.0))
-                                .text_color(theme::t().text_3),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(e.name),
-                            )
-                            .into_any_element(),
-                    );
-                    if expanded {
-                        self.files_level_rows(&path, out, depth + 1, sb, app);
-                    }
-                }
-                dsh_gpui::DirEntryKind::File => {
-                    let t_open = app.clone();
-                    let p = path.clone();
-                    out.push(
-                        div()
-                            .id(SharedString::from(format!("sb-file-file-{path}")))
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .pl(indent)
-                            .pr(px(10.0))
-                            .h(px(30.0))
-                            .rounded(px(10.0))
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(20.0))
-                            .text_color(theme::t().text)
-                            .cursor_pointer()
-                            .hover(|st| st.bg(theme::t().hover))
-                            .on_click(move |_, _, cx| {
-                                let p = p.clone();
-                                t_open.update(cx, |v, cx| {
-                                    v.open_file_preview(p, cx);
-                                });
-                            })
-                            .child(crate::widgets::file_kind_icon(
-                                crate::chat::classify_file_type(&e.name),
-                                16.0,
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(e.name),
-                            )
-                            .into_any_element(),
-                    );
-                }
-                dsh_gpui::DirEntryKind::Other => {
-                    // 既非文件也非目录：照实列出、灰显不可开（上游 entry.other）
-                    out.push(
-                        div()
-                            .flex()
-                            .items_center()
-                            .pl(indent)
-                            .pr(px(10.0))
-                            .h(px(30.0))
-                            .rounded(px(10.0))
-                            .text_size(px(theme::FONT_ROW))
-                            .line_height(px(20.0))
-                            .text_color(theme::t().text_3)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_ellipsis()
-                                    .child(e.name),
-                            )
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
-        if level.truncated {
-            out.push(note("条目太多，只显示了一部分。".into()).into_any_element());
-        }
-    }
 }
 
 impl Render for SidebarView {
@@ -883,54 +551,13 @@ impl Render for SidebarView {
                                         .child("MIRROR"),
                                 ),
                         )
-                        .child({
-                            // 文件树入口（上游 guide 胶囊的本地形态：amber
-                            // folder sheet + chevron；dock strip 面外，落在品牌行）
-                            let t_capsule = sb.clone();
-                            let pane_files = self.pane == SidebarPane::Files;
-                            div()
-                                .id("sb-files-capsule")
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap(px(2.0))
-                                .h(px(28.0))
-                                .pl(px(6.0))
-                                .pr(px(4.0))
-                                .rounded(px(8.0))
-                                .map(|d| if pane_files { d.bg(theme::t().hover) } else { d })
-                                .when(!pane_files, |d| d.hover(|st| st.bg(theme::t().hover)))
-                                .cursor_pointer()
-                                .tooltip(tip("工作区文件"))
-                                .on_click(move |_, _, cx| {
-                                    t_capsule.update(cx, |v, cx| {
-                                        v.pane = match v.pane {
-                                            SidebarPane::Files => SidebarPane::Conversations,
-                                            SidebarPane::Conversations => SidebarPane::Files,
-                                        };
-                                        if v.pane == SidebarPane::Files {
-                                            v.files_open_root();
-                                        }
-                                        cx.notify();
-                                    });
-                                })
-                                .child(crate::widgets::file_kind_icon(
-                                    crate::chat::FileKind::Folder,
-                                    18.0,
-                                ))
-                                .child(
-                                    Icon::new(IconName::ChevronDown)
-                                        .size(px(12.0))
-                                        .text_color(theme::t().text_3),
-                                )
-                        })
                         .child(
                             icon_btn("sb-collapse", IconName::PanelLeftClose, theme::t().text_2, "收起侧边栏", move |_, _, cx| {
                                 t_collapse.update(cx, |v, cx| { v.sidebar_collapsed = true; v.refresh_sidebar(cx); });
                             }),
                         ),
                 )
-                .when(self.pane == SidebarPane::Conversations, |col| col.child(
+                .child(
                     // 新建会话：38px、r12、白 12% 描边（web .newSession）
                     div()
                         .id("sb-new-session")
@@ -958,8 +585,8 @@ impl Render for SidebarView {
                         })
                         .child(Icon::new(IconName::Plus).size(px(16.0)))
                         .child("新建会话"),
-                ))
-                .when(self.pane == SidebarPane::Conversations, |col| col.child(
+                )
+                .child(
                     // 区块头：会话 + 搜索 / 视图 / 新建工作区（web .sectionHeader）
                     div()
                         .h(px(36.0))
@@ -1129,11 +756,8 @@ impl Render for SidebarView {
                                 })
                             )
                         }),
-                ))
-                .when(self.pane == SidebarPane::Files, |col| {
-                    col.child(self.files_pane(&sb, &this))
-                })
-                .when(self.pane == SidebarPane::Conversations, |col| col.child(
+                )
+                .child(
                     // 会话列表 + 底部渐隐（web .fade）
                     div()
                         .relative()
@@ -1170,7 +794,7 @@ impl Render for SidebarView {
                                     linear_color_stop(theme::t().sidebar_bg, 1.0),
                                 )),
                         ),
-                ))
+                )
                 .when_some(self.sidebar_menu.clone(), |col, (kind, target, y)| {
                     // 点外关闭（同 hero 面板）：定位壳铺满侧栏来承接菜单
                     // （taffy 绝对定位以直接父容器为基准），菜单 bounds 经

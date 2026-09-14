@@ -169,10 +169,9 @@ impl Render for SidebarView {
                             t_expand.update(cx, |v, cx| { v.sidebar_collapsed = false; v.refresh_sidebar(cx); });
                         })
                         .child(
-                            gpui::svg()
-                                .path("brands/fish.svg")
-                                .w(px(24.0)).h(px(17.65))
-                                .text_color(theme::t().text),
+                            // 鲸像标（499 画布可视区 90%×60%，30px 方图可见约 27×18）
+                            gpui::img(theme::brand_logo())
+                                .size(px(30.0)),
                         ),
                 )
                 .child(
@@ -490,7 +489,7 @@ impl Render for SidebarView {
                 .px_3()
                 .py_1p5()
                 .child(
-                    // 品牌行：logo + 名字 + HARNESS pill + 折叠按钮（60px 高）
+                    // 品牌行：logo + 名字 + MIRROR pill + 折叠按钮（60px 高）
                     div()
                         .h(px(60.0))
                         .flex_none()
@@ -501,18 +500,16 @@ impl Render for SidebarView {
                         .child(
                             div().flex_1().min_w_0().flex().items_center().gap_2()
                                 .child(
-                                    // 官方鲸鱼标记（web FishLogo，currentColor 随主题）
-                                    gpui::svg()
-                                        .path("brands/fish.svg")
-                                        .w(px(24.0)).h(px(17.65))
-                                        .text_color(theme::t().text),
+                                    // 鲸像标（白鲸/深鲸随主题，28px 方图可见约 25×17）
+                                    gpui::img(theme::brand_logo())
+                                        .size(px(28.0)),
                                 )
                                 .child(
                                     div()
                                         .text_size(px(theme::FONT_BRAND))
                                         .line_height(px(24.0))
                                         .font_weight(FontWeight::SEMIBOLD)
-                                        .child("deepseek"),
+                                        .child("鲸像"),
                                 )
                                 .child(
                                     // 徽牌（web buildRevision：品牌色底 + 反色字）
@@ -524,7 +521,7 @@ impl Render for SidebarView {
                                         .font_family(crate::widgets::theme_mono())
                                         .text_size(px(8.0))
                                         .line_height(px(16.0))
-                                        .child("HARNESS"),
+                                        .child("MIRROR"),
                                 ),
                         )
                         .child(

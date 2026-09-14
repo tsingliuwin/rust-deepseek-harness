@@ -37,3 +37,7 @@ serde_json.workspace = true
 [dev-dependencies]
 usvg = "0.45.1"
 resvg = "0.45.1"
+
+# Windows exe/任务栏图标与版本信息资源（gpui 从资源 ID 1 LoadImageW 取窗口图标）
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

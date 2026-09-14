@@ -8,7 +8,11 @@ use std::borrow::Cow;
 
 /// 本地自有资产（官方 icons 目录之外的全部）。
 const LOCAL: &[(&str, &[u8])] = &[
-    ("brands/fish.svg", include_bytes!("../assets/brands/fish.svg")),
+    // 鲸像品牌标（双鲸镜像，499×499 RGBA 可视区占 90%宽×60%高）：
+    // whale-light = 白鲸（暗色主题用）、whale-black = 深鲸（浅色主题用），
+    // 按 *图形颜色* 命名而非目标主题，选图用 theme::brand_logo()
+    ("brands/whale-light.png", include_bytes!("../assets/brands/whale-light.png")),
+    ("brands/whale-black.png", include_bytes!("../assets/brands/whale-black.png")),
     ("brands/hero-glow.png", include_bytes!("../assets/brands/hero-glow.png")),
     ("icons/context-injection.svg", include_bytes!("../assets/icons/context-injection.svg")),
     ("icons/paperclip.svg", include_bytes!("../assets/icons/paperclip.svg")),

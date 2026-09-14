@@ -1,6 +1,11 @@
-# rustdsh
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="logo_light.png">
+  <img src="logo_black.png" width="160" alt="鲸像 WhaleMirror">
+</picture>
 
-[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) Web 端的 **Rust / GPUI 1:1 原生复刻** —— 把 DeepSeek Harness 的 agent 体验做成 Windows 桌面应用，存储层与 Web 版共享 `~/.dsh`：会话日志（zstd JSONL v3）、附件内容寻址存储、项目缓存（projcache）双向互通。
+# 鲸像 WhaleMirror
+
+> rustdsh —— [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) Web 端的 **Rust / GPUI 1:1 原生复刻** —— 把 DeepSeek Harness 的 agent 体验做成 Windows 桌面应用，存储层与 Web 版共享 `~/.dsh`：会话日志（zstd JSONL v3）、附件内容寻址存储、项目缓存（projcache）双向互通。因不可使用 DeepSeek 品牌，对外名称为**鲸像（WhaleMirror）**。
 
 技术栈：**Rust（edition 2024）+ GPUI 0.2.2 + gpui-component 0.5.1**（vendored 微调，见[备注](#备注)）。agent 层为手写 LLM adapter —— 不用 rig-core，其 deepseek `reasoning_content` 在带 tool-call 的多轮循环里会丢失（[rig #1434](https://github.com/0xPlaygrounds/rig/issues/1434) / [#1440](https://github.com/0xPlaygrounds/rig/issues/1440)）。
 

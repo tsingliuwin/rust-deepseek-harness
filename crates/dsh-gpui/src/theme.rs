@@ -218,6 +218,15 @@ pub fn is_dark() -> bool {
     t().bg_base == DARK.bg_base
 }
 
+/// 鲸像品牌标资产路径（暗色主题用白鲸、浅色主题用深鲸）。
+pub fn brand_logo() -> &'static str {
+    if is_dark() {
+        "brands/whale-light.png"
+    } else {
+        "brands/whale-black.png"
+    }
+}
+
 fn set_tokens(tokens: Tokens) {
     *ACTIVE.write().unwrap() = tokens;
 }

@@ -3858,7 +3858,7 @@ impl AppView {
                             .h(px(glow_h)),
                     )
                     .child(
-                        // 标题行：fish + 探索未至之境 + 预览版 badge
+                        // 标题行：鲸像标 + 探索未至之境 + 预览版 badge
                         div().flex().items_center().justify_center().gap_2p5().child(
                             div()
                                 .flex()
@@ -3869,10 +3869,9 @@ impl AppView {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::t().text)
                                 .child(
-                                    gpui::svg()
-                                        .path("brands/fish.svg")
-                                        .w(px(34.0)).h(px(25.0))
-                                        .text_color(theme::t().text),
+                                    // 鲸像标（白鲸/深鲸随主题，36px 方图可见约 32×22）
+                                    gpui::img(theme::brand_logo())
+                                        .size(px(36.0)),
                                 )
                                 .child("探索未至之境")
                                 .child(
@@ -5266,7 +5265,7 @@ fn main() {
             provider: provider.clone(),
             model: model.clone(),
             max_tokens: None,
-            system_prompt: Some("You are DeepSeek Harness (Rust), a helpful coding agent.".into()),
+            system_prompt: Some("You are WhaleMirror (Rust), a helpful coding agent.".into()),
             compaction: dsh_compaction::CompactionConfig::default(),
             workdir: workdir.clone(),
             // 附件存储根：DSH_HOME/attachments/v1（与 web 同布局；请求
@@ -5385,7 +5384,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                window.set_window_title("DeepSeek Harness");
+                window.set_window_title("鲸像 WhaleMirror");
                 let input = cx.new(|cx: &mut Context<InputState>| {
                     InputState::new(window, cx)
                         .placeholder("给智能体发消息")

@@ -201,3 +201,57 @@ pub fn traj_layout(
         }
         (rows, tops)
     }
+
+/// 会话显示态与 agent 运行态的分离模型（运行中「查看式切换」）。
+///
+/// 背景：agent 驱动只持有一个会话槽（`set_session` 原地替换），运行中
+/// 切换会让进行中的轮次滑到新会话、事件写错文件——原实现因此整段禁止
+/// 切换。本模型把「视图指向」与「agent 运行」拆开：运行中允许视图指向
+/// 其它会话（peek），但
+/// - 运行会话的事件不进视图（照常落盘，切回时从日志重载）；
+/// - composer 让位给状态条（异会话期间不可发送/命令，避免写到运行会话）；
+/// - 轮次边界后收敛：agent 切到视图会话（保持"空闲时视图=agent"不变量）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ViewSplit {
+    /// agent 是否有轮次在跑（轮次边界事件驱动，与视图 running 无关）。
+    pub agent_busy: bool,
+    /// 视图是否指向了非 agent 会话（仅运行中可能出现）。
+    pub peeking: bool,
+}
+
+impl ViewSplit {
+    /// 事件是否进视图（显示路由）：peek 中丢弃运行会话的事件。
+    pub fn routes_to_view(&self) -> bool {
+        !self.peeking
+    }
+
+    /// composer 是否处于「异会话运行中」让位态。
+    pub fn composer_inert(&self) -> bool {
+        self.agent_busy && self.peeking
+    }
+
+    /// 是否该把 agent 收敛到视图会话（轮终 / 发送前的安全网）。
+    pub fn needs_commit(&self) -> bool {
+        self.peeking && !self.agent_busy
+    }
+
+    pub fn on_turn_start(&mut self) {
+        self.agent_busy = true;
+    }
+
+    /// 轮次边界（TurnEnded / Error）：返回是否需要收敛到视图会话。
+    pub fn on_turn_end(&mut self) -> bool {
+        self.agent_busy = false;
+        self.needs_commit()
+    }
+
+    /// 视图切到非 agent 会话。
+    pub fn peek(&mut self) {
+        self.peeking = true;
+    }
+
+    /// 视图回到 agent 会话（或收敛完成）。
+    pub fn settle(&mut self) {
+        self.peeking = false;
+    }
+}

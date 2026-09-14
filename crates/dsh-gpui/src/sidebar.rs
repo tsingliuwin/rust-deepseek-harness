@@ -30,8 +30,10 @@ pub(crate) struct SidebarView {
     sessions: Vec<SessionMeta>,
     workspaces: Vec<WorkspaceInfo>,
     archived: HashSet<String>,
-    /// 当前列表高亮的会话 id
+    /// 当前列表高亮的会话 id（= 视图会话：peek 时指向被查看的会话）
     current_id: dsh_llm::SessionId,
+    /// 运行中会话 id（agent 会话且 agent_busy；运行态状态点）
+    running_id: Option<dsh_llm::SessionId>,
     current_workspace: Option<String>,
     /// 布局镜像（AppView::sidebar_collapsed / sidebar_width）
     layout_collapsed: bool,
@@ -75,12 +77,13 @@ impl SidebarView {
                 cx.notify();
             }
         });
-        Self {
+        let view = Self {
             app,
             sessions: Vec::new(),
             workspaces: Vec::new(),
             archived: Default::default(),
             current_id: dsh_llm::SessionId::new(String::new()),
+            running_id: None,
             current_workspace: None,
             layout_collapsed: false,
             layout_width: layout::SIDEBAR_DEFAULT,
@@ -96,7 +99,26 @@ impl SidebarView {
             group_flat: false,
             order_manual: false,
             _search_subscription: search_subscription,
-        }
+        };
+        // 运行态状态点（像素追逐）需要自驱 tick：侧栏在流式期间按设计不随
+        // delta 失效（元素缓存），动画元素的 request_layout 不会重跑，点会
+        // 冻在初始相位。仅在「有会话运行」时以 125ms（= 上游每格步进）自
+        // notify 推进；空闲时空转（每拍只读一个 bool）。
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let mut cx = cx.clone();
+            loop {
+                Timer::after(Duration::from_millis(125)).await;
+                let Some(view) = this.upgrade() else { return };
+                let Ok(running) = view.update(&mut cx, |v, _| v.running_id.is_some()) else {
+                    return;
+                };
+                if running && view.update(&mut cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+        view
     }
 
     /// 宿主数据推送（AppView 在 sessions/workspaces/归档/选中/布局变更后
@@ -107,6 +129,7 @@ impl SidebarView {
         workspaces: Vec<WorkspaceInfo>,
         archived: HashSet<String>,
         current_id: dsh_llm::SessionId,
+        running_id: Option<dsh_llm::SessionId>,
         current_workspace: Option<String>,
         layout_collapsed: bool,
         layout_width: f32,
@@ -115,6 +138,7 @@ impl SidebarView {
         self.workspaces = workspaces;
         self.archived = archived;
         self.current_id = current_id;
+        self.running_id = running_id;
         self.current_workspace = current_workspace;
         self.layout_collapsed = layout_collapsed;
         self.layout_width = layout_width;
@@ -231,7 +255,7 @@ impl Render for SidebarView {
                     let active = meta.id == current_id;
                     all_rows.push(anchored_row(
                         key,
-                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
+                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, self.running_id.as_ref().is_some_and(|r| r == &meta.id), move |_, _, cx| {
                             let id = id.clone();
                             t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
                         }, move |click, _, cx| {
@@ -416,7 +440,7 @@ impl Render for SidebarView {
                                 let slot = row_bounds.clone();
                                 all_rows.push(anchored_row(
                                     key,
-                                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
+                                    session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, self.running_id.as_ref().is_some_and(|r| r == &meta.id), move |_, _, cx| {
                                         let id = id.clone();
                                         t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
                                     }, move |click, _, cx| {
@@ -461,7 +485,7 @@ impl Render for SidebarView {
                     let slot = row_bounds.clone();
                     all_rows.push(anchored_row(
                         key,
-                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, move |_, _, cx| {
+                        session_row(row_index, meta.title.clone(), meta.time_label.clone(), active, meta.blank, self.running_id.as_ref().is_some_and(|r| r == &meta.id), move |_, _, cx| {
                             let id = id.clone();
                             t_sw.update(cx, |v, cx| { v.switch_session(id, cx); });
                         }, move |click, _, cx| {

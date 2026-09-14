@@ -265,6 +265,7 @@ pub(crate) fn session_row(
     time_label: String,
     active: bool,
     blank: bool,
+    running: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_more: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
@@ -282,10 +283,26 @@ pub(crate) fn session_row(
         .pr_2()
         .gap_1()
         .rounded(px(8.0))
+        .relative()
         .cursor_pointer()
         .map(|d| if active { d.bg(theme::t().hover) } else { d })
         .hover(|s| s.bg(theme::t().hover))
         .on_click(on_click)
+        .when(running, |d| {
+            // 运行中状态点（上游 Rows SessionStatusDots：ongoing 像素追逐）。
+            // 上游行右侧另有 16px 状态槽 + 4px 标题距，rustdsh 行的 pl16 里
+            // 直接落点——不占位避免全量行位移（槽位对齐留待行结构专项）。
+            d.child(
+                div()
+                    .absolute()
+                    .left(px(3.0))
+                    .top_0()
+                    .bottom_0()
+                    .flex()
+                    .items_center()
+                    .child(state_dot_ongoing(("sb-run-dot", index as u64))),
+            )
+        })
         .child(
             div()
                 .flex_1()
@@ -360,6 +377,54 @@ pub(crate) fn state_dot(color: gpui::Rgba) -> Div {
                 .rounded_full()
                 .bg(color),
         )
+}
+
+/// 运行中状态点的静态落位（10×10 方框；动画由调用点的 with_animation
+/// 每帧驱动 `state_dot_ongoing_phase` 重绘八格亮度）。
+pub(crate) fn state_dot_ongoing(id: impl Into<gpui::ElementId> + 'static) -> gpui::AnyElement {
+    gpui::div()
+        .size(px(10.0))
+        .flex_none()
+        .with_animation(
+            id,
+            gpui::Animation::new(std::time::Duration::from_millis(1000)).repeat(),
+            |el, delta| el.child(state_dot_ongoing_phase(delta)),
+        )
+        .into_any_element()
+}
+
+/// ongoing 像素追逐（web StateDot .matrix：10px 网格八枚 2×2 外圈格，
+/// 每格 base 0.15 不透明度，1s 步进关键帧 峰值 1 → 0.6 → 0.35 → 0.15，
+/// 相位差 125ms/格顺时针；色 = 静态 deepseek-450 档）。
+pub(crate) fn state_dot_ongoing_phase(delta: f32) -> Div {
+    // 上游 MATRIX_CELLS：3×3 外圈顺时针（左上起）
+    const MATRIX_CELLS: [(i32, i32); 8] =
+        [(0, 0), (4, 0), (8, 0), (8, 4), (8, 8), (4, 8), (0, 8), (0, 4)];
+    let color = gpui::rgba(theme::STATE_ONGOING_RGBA);
+    let mut el = div().size(px(10.0)).relative().flex_none();
+    let n = MATRIX_CELLS.len() as f32;
+    for (i, (x, y)) in MATRIX_CELLS.iter().enumerate() {
+        // 相位 = delta + (n - i)·0.125（对应上游 animation-delay (i-n)·125ms）
+        let phase = (delta + (n - i as f32) * 0.125).fract();
+        let opacity = if phase < 0.125 {
+            1.0
+        } else if phase < 0.25 {
+            0.6
+        } else if phase < 0.375 {
+            0.35
+        } else {
+            0.15
+        };
+        el = el.child(
+            div()
+                .absolute()
+                .left(px(*x as f32))
+                .top(px(*y as f32))
+                .size(px(2.0))
+                .bg(gpui::Rgba { a: opacity, ..color }),
+        );
+    }
+    el
 }
 
 /// 运行中的行扫光（web .row::after：300px 带自左滑向右，2.6s ease-out +

@@ -34,7 +34,7 @@ use gpui_component::{Icon, IconName, StyledExt};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// 单轮折叠派生（web turn-process 节点数据的对应物）。
@@ -284,6 +284,18 @@ pub(crate) struct ChatView {
     entries: Vec<ChatEntry>,
     running: bool,
     turn_started_at: Option<Instant>,
+    /// 运行中查看式切换的显示会话快照（Some = 视图指向非 agent 会话；
+    /// 工具详情回读/轨迹 outline 等读面全走 session_handle）
+    pub(crate) display_session: Option<Arc<Mutex<dsh_session::Session>>>,
+    /// 回放遗留的运行中轮次（日志最后 TurnStart 无对应 TurnEnd 时为
+    /// Some(turn)）——切回运行中会话时由 resume_running 消费。
+    replay_unfinished_turn: Option<u64>,
+    /// 运行中轮次的时间锚（该轮首个 StepStart 的 time_ms）：resume 时
+    /// 反推 turn_started_at，让轮次时长计时穿过 peek 窗口连续。
+    replay_turn_anchor_ms: Option<u64>,
+    /// 运行中步骤的时间锚（该轮最后一个 StepStart 的 time_ms）：resume
+    /// 时反推 step_start_inst，让进行中那一步的步时长可算。
+    replay_step_anchor_ms: Option<u64>,
     pub(crate) tab: CenterTab,
     /// 轨迹 tab 虚拟化列表滚动句柄（Inspect pill 跳转 scroll_to_item）
     traj_ul: UniformListScrollHandle,
@@ -386,6 +398,10 @@ impl ChatView {
             entries: Vec::new(),
             running: false,
             turn_started_at: None,
+            display_session: None,
+            replay_unfinished_turn: None,
+            replay_turn_anchor_ms: None,
+            replay_step_anchor_ms: None,
             tab: CenterTab::Conversation,
             traj_ul: UniformListScrollHandle::new(),
             traj_search,
@@ -617,6 +633,9 @@ impl ChatView {
         self.entries.clear();
         self.running = false;
         self.turn_started_at = None;
+        self.replay_unfinished_turn = None;
+        self.replay_turn_anchor_ms = None;
+        self.replay_step_anchor_ms = None;
         self.stats_turns = 0;
         self.stats_tools = 0;
         self.stats_steps = 0;
@@ -637,14 +656,32 @@ impl ChatView {
         self.sync_chat_list(true);
     }
 
-    /// Rebuild the transcript from the agent's session log (restore/switch).
+    /// 读面会话句柄：默认为 agent 会话（显示与运行一致）；运行中查看
+    /// 式切换时指向 display_session 快照（工具详情回读/轨迹 outline 等
+    /// 读面必须与视图同源，否则 peek 期间读到的是运行会话的日志）。
+    pub(crate) fn session_handle(&self) -> Arc<Mutex<dsh_session::Session>> {
+        self.display_session
+            .clone()
+            .unwrap_or_else(|| self.agent.session())
+    }
+
+    /// Rebuild the transcript from the displayed session log (restore/switch).
     pub(crate) fn rebuild_from_session(&mut self) {
+        let handle = self.session_handle();
+        let session = handle.lock().unwrap();
+        self.rebuild_from(&session);
+    }
+
+    /// 回放指定会话（`rebuild_from_session` 的显式快照版：运行中查看式
+    /// 切换用非 agent 会话直接回放）。
+    pub(crate) fn rebuild_from(&mut self, session: &dsh_session::Session) {
         self.reset_empty();
         self.turn_expanded.clear();
         self.turn_open = None; // 回放态全部视为已关闭（可折叠判定成立）
-        let session = self.agent.session();
-        let session = session.lock().unwrap();
         let mut cur_turn = 0u64;
+        // 运行中轮次判定：TurnStart 置位、任一 TurnEnd 清位
+        let mut unfinished = false;
+        let mut anchor_ms: Option<u64> = None;
         let mut step_starts: std::collections::HashMap<(u64, u64), u64> =
             std::collections::HashMap::new();
         let mut last_msg_time: Option<u64> = None;
@@ -652,9 +689,12 @@ impl ChatView {
             match &entry.event {
                 SessionEvent::TurnStart { turn } => {
                     cur_turn = *turn;
+                    unfinished = true;
+                    anchor_ms = None;
                     self.stats_turns += 1;
                 }
                 SessionEvent::TurnEnd { reason: TurnEndReason::Error { failure }, .. } => {
+                    unfinished = false;
                     // 失败轮次在历史里也要可见（实时路径由 AgentEvent::Error
                     // 入列；回放此前只有用户气泡、轮次看起来凭空蒸发）
                     self.entries.push(ChatEntry {
@@ -668,6 +708,10 @@ impl ChatView {
                         context: None,
                         open: false,
                     });
+                }
+                // 其余收尾（completed/aborted/…）：只清运行中标记
+                SessionEvent::TurnEnd { .. } => {
+                    unfinished = false;
                 }
                 SessionEvent::AssistantMessage { usage, message, step, time_ms, .. } => {
                     self.stats_steps += 1;
@@ -856,6 +900,10 @@ impl ChatView {
                 }
                 SessionEvent::StepStart { turn, step, time_ms: Some(t), .. } => {
                     step_starts.insert((*turn, *step), *t);
+                    // 运行中轮次的时间锚 = 该轮首个带时的 StepStart
+                    if unfinished && anchor_ms.is_none() {
+                        anchor_ms = Some(*t);
+                    }
                 }
                 SessionEvent::ToolResult { message, time_ms, .. } => {
                     if let Some(ContentBlock::ToolResult { tool_call_id, content, is_error }) =
@@ -895,9 +943,44 @@ open: false,
             }
         }
         self.ui_turn = cur_turn;
+        self.replay_unfinished_turn = unfinished.then_some(cur_turn);
+        self.replay_turn_anchor_ms = if unfinished { anchor_ms } else { None };
+        self.replay_step_anchor_ms = if unfinished {
+            step_starts
+                .iter()
+                .filter(|((t, _), _)| *t == cur_turn)
+                .map(|(_, v)| *v)
+                .max()
+        } else {
+            None
+        };
         // 回放后条目总数已变：标记整体替换，下一次 sync reset + 滚底
         self.chat_reset_pending = true;
         self.sync_chat_list(true);
+    }
+
+    /// 切回运行中会话：把回放态接到实时流上。peek 期间运行会话的轮次
+    /// 边界事件被显示路由丢弃，running/轮次计时/步号/步计时都得从这里
+    /// 按回放锚补回，否则实时 delta 会落进上一个已完成步的条目里。
+    pub(crate) fn resume_running(&mut self) {
+        let Some(turn) = self.replay_unfinished_turn else {
+            return;
+        };
+        self.running = true;
+        self.turn_open = Some(turn);
+        self.ui_turn = turn;
+        // 步号 = 回放到的最大已完成步：live 的下一条 AssistantMessage 会
+        // +1 落到进行中的那一步（与实时路径 ui_step 语义一致）
+        self.ui_step = self
+            .entries
+            .iter()
+            .filter(|e| e.turn == turn)
+            .filter_map(|e| e.step)
+            .max()
+            .unwrap_or(0);
+        self.turn_started_at = ms_ago(self.replay_turn_anchor_ms).or(Some(Instant::now()));
+        self.step_start_inst = ms_ago(self.replay_step_anchor_ms);
+        self.heights_dirty.set(false);
     }
 
     fn last_assistant(&mut self) -> &mut ChatEntry {
@@ -1206,7 +1289,7 @@ open: false,
 
     /// 从会话日志回读指定工具调用的最新结果文本。
     fn latest_tool_result_text(&self, call_id: &str) -> (String, bool) {
-        let session = self.agent.session();
+        let session = self.session_handle();
         let session = session.lock().unwrap();
         for entry in session.entries().iter().rev() {
             if let SessionEvent::ToolResult { message, .. } = &entry.event
@@ -3512,7 +3595,7 @@ impl ChatView {
     /// 宿主 `turnOutline` wire 视图（身份门控缓存：轮内 draft-only 变化
     /// 返回同一个 Arc，这里的反序列化结果随之稳定）。
     fn rail_outline(&self) -> Vec<dsh_session_projection::turn_outline::TurnOutlineEntry> {
-        let session = self.agent.session();
+        let session = self.session_handle();
         let session = session.lock().unwrap();
         self.agent
             .projections()
@@ -3928,6 +4011,12 @@ impl Render for ChatView {
 }
 
 // --- footer/统计面板（web TurnUsagePanel / TurnTimePanel） ---------------------
+
+/// 墙钟毫秒锚 → Instant：距今 `now_ms - t` 毫秒（缺锚/时钟回拨给 None）。
+fn ms_ago(anchor_ms: Option<u64>) -> Option<Instant> {
+    let d = Duration::from_millis(now_ms().checked_sub(anchor_ms?)?);
+    Instant::now().checked_sub(d)
+}
 
 /// 时长格式（web formatDuration 风格：<60s 一位小数秒，否则 分+秒）。
 fn fmt_duration(d: std::time::Duration) -> String {

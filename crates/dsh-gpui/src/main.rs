@@ -1388,6 +1388,12 @@ struct AppView {
     archived: std::collections::HashSet<String>,
     /// 当前会话的 project cwd（写入 web 布局用）
     current_cwd: String,
+    /// agent 是否有轮次在跑（轮次边界事件驱动；与视图 running 解耦——
+    /// 视图 running 只描述「当前显示的这一屏」的流式态）
+    agent_busy: bool,
+    /// 运行中「查看式切换」的目标会话（Some = 视图指向非 agent 会话；
+    /// 仅运行中可能为 Some，轮终自动收敛回 None）
+    peek_session: Option<SessionId>,
     /// 侧栏列的窗口 bounds（与 SidebarView 共享的 Rc：root 的
     /// on_children_prepainted 捕获首子元素，侧栏菜单锚定换算消费）
     sb_col_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
@@ -1579,6 +1585,14 @@ impl AppView {
                         cx.notify();
                         return;
                     }
+                    if chat.view_split().composer_inert() {
+                        // 异会话运行中：编辑器已让位，保险拦回车
+                        return;
+                    }
+                    if chat.view_split().needs_commit() {
+                        // 空闲但视图在别处：先收敛到视图会话再发送
+                        chat.commit_peek(cx);
+                    }
                     chat.dispatch_user_text(&text, cx);
                     chat.pending_clear = true;
                     cx.notify();
@@ -1629,6 +1643,8 @@ impl AppView {
             current_workspace: None,
             archived: load_archived_ids().into_iter().collect(),
             current_cwd: String::new(),
+            agent_busy: false,
+            peek_session: None,
             sb_col_bounds,
             renaming_workspace: None,
             renaming_session: None,
@@ -1704,12 +1720,14 @@ impl AppView {
         let sessions = self.sessions.clone();
         let workspaces = self.workspaces.clone();
         let archived = self.archived.clone();
-        let current = self.current_session_id();
+        let current = self.viewed_session_id();
+        // 运行态状态点只画 agent 会话那一行（单 runtime，同时至多一轮在跑）
+        let running = self.agent_busy.then(|| self.current_session_id());
         let current_ws = self.current_workspace.clone();
         let collapsed = self.sidebar_collapsed;
         let width = self.sidebar_width;
         self.sidebar.update(cx, |s, cx| {
-            s.refresh(sessions, workspaces, archived, current, current_ws, collapsed, width);
+            s.refresh(sessions, workspaces, archived, current, running, current_ws, collapsed, width);
             cx.notify();
         });
     }
@@ -1784,7 +1802,7 @@ impl AppView {
     /// 隐藏；日志保留、workspace 归属不动（web：archiving never touches
     /// workspace accounting，unarchive 时原位恢复）。单向，无取消 UI。
     fn archive_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
-        if self.running(cx) && self.current_session_id() == *id {
+        if self.agent_busy && self.current_session_id() == *id {
             return;
         }
         archive_session_doc(id.as_str());
@@ -1827,7 +1845,7 @@ impl AppView {
     /// 会话分叉（web Rows 菜单 fork → sessions.fork increaseTitle）：
     /// 复制整条日志为新会话，子标题按 `标题 (N)` 自增，然后切过去。
     fn fork_session(&mut self, id: &SessionId, cx: &mut Context<Self>) {
-        if self.running(cx) {
+        if self.agent_busy {
             return;
         }
         let Some(meta) = self.sessions.iter().find(|m| &m.id == id) else {
@@ -1871,8 +1889,121 @@ impl AppView {
     /// 运行中禁止切换：单 agent 架构下轮次输出随 agent 的当前会话走，
     /// 切换会把旧对话的流式输出写进新会话（web 为每会话独立 agent，
     /// 此处是与 web 的已文档化偏差）。
+    /// 事件泵入口：更新宿主运行态、按视图路由事件、轮终收敛视图。
+    /// 返回是否需要宿主级刷新（原 apply_event 的 app_level 语义 + 边界事件）。
+    fn on_agent_event(
+        &mut self,
+        ev: dsh_agent_loop::AgentEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let boundary = matches!(
+            ev,
+            dsh_agent_loop::AgentEvent::TurnStarted { .. }
+                | dsh_agent_loop::AgentEvent::TurnEnded { .. }
+                | dsh_agent_loop::AgentEvent::Error { .. }
+        );
+        if boundary {
+            self.agent_busy = matches!(ev, dsh_agent_loop::AgentEvent::TurnStarted { .. });
+            // 侧栏是数据推送制（不随 notify 自动重算）：运行态状态点与行的
+            // 运行标记要在边界上显式刷新，否则点要么不出、要么不消失
+            self.refresh_sidebar(cx);
+        }
+        let app_level = if self.view_split().routes_to_view() {
+            self.chat.update(cx, |c, cx| {
+                let r = c.apply_event(ev);
+                cx.notify();
+                r
+            })
+        } else {
+            // peek：运行会话事件不进视图（sink 已落盘，切回时从日志重载）。
+            // 也不升级为宿主刷新——delta/步结都只属运行会话，视图里的统计
+            // 来自被查看会话的回放，不随运行会话事件变化（否则每个 delta
+            // 都会 notify 壳层，违背流式失效域收窄的设计）。
+            false
+        };
+        if boundary && self.view_split().needs_commit() {
+            self.commit_peek(cx);
+        }
+        app_level
+    }
+
+    /// 收敛视图：agent 切到被查看的会话（轮终 / 发送前的安全网）。
+    fn commit_peek(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.peek_session.clone() {
+            self.switch_session_inner(id, false, cx);
+        }
+    }
+
+    /// 运行中查看式切换：只改显示面（会话快照 + 视图重建 + 高亮），不碰
+    /// agent/沙箱/persist_cwd/prompt 节——运行中会话的执行基准与落盘桶位
+    /// 必须保持原样（换掉会让进行中的轮次滑到新会话、事件写错文件）。
+    fn view_only_switch(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        let agent_id = self.current_session_id();
+        let cwd_hint = self
+            .sessions
+            .iter()
+            .find(|m| m.id == id)
+            .and_then(|m| m.cwd.clone());
+        let Ok((session, cwd)) = self.recorder.load(&id, cwd_hint.as_deref()) else {
+            return;
+        };
+        if id == agent_id {
+            // 切回运行中的会话：显示交还 agent 会话，并把回放态接到实时流
+            //（running/轮次计时/步号由 resume_running 从回放锚补回）。
+            // 回放必须走磁盘快照而非 agent 内存态：time_ms 是持久化层写盘时
+            // 补的信封时间，内存事件没有——用内存态回放会取不到时间锚，
+            // 轮次计时退回「切回时刻」起算（实测少了整个 peek 窗口）。
+            self.peek_session = None;
+            self.chat.update(cx, |c, cx| {
+                c.display_session = None;
+                if let Some(cw) = cwd.clone() {
+                    c.cwd = cw;
+                }
+                c.rebuild_from(&session);
+                c.tab = CenterTab::Conversation;
+                c.turn_expanded.clear();
+                c.turn_open = None;
+                c.resume_running();
+                cx.notify();
+            });
+        } else {
+            // 查看其它会话：显示快照会话（工具详情/轨迹 outline 等读面
+            // 经 session_handle 同源走快照，不读运行会话的日志）
+            let handle = Arc::new(std::sync::Mutex::new(session));
+            self.peek_session = Some(id);
+            self.chat.update(cx, |c, cx| {
+                if let Some(cw) = cwd.clone() {
+                    c.cwd = cw;
+                }
+                c.display_session = Some(handle.clone());
+                let snap = handle.lock().unwrap();
+                c.rebuild_from(&snap);
+                drop(snap);
+                c.tab = CenterTab::Conversation;
+                c.turn_expanded.clear();
+                c.turn_open = None;
+                cx.notify();
+            });
+        }
+        self.selected_tool = None;
+        self.selected_message = None;
+        self.command_menu = false;
+        self.command_notice = None;
+        self.permission_menu = false;
+        self.full_access_confirm = false;
+        self.refresh_sidebar(cx);
+        cx.notify();
+    }
+
     fn switch_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        if self.running(cx) {
+        self.switch_session_inner(id, true, cx)
+    }
+
+    /// 切换会话（reload_chat=false：显示面已就位——轮终收敛用）。
+    fn switch_session_inner(&mut self, id: SessionId, reload_chat: bool, cx: &mut Context<Self>) {
+        if self.agent_busy {
+            // 运行中：允许查看式切换（agent 不动、事件照常落盘）
+            self.view_only_switch(id, cx);
             return;
         }
         let cwd_hint = self
@@ -1923,20 +2054,28 @@ impl AppView {
         // 条目整体换血，splice 会保留旧测高，scroll_to_reveal 按陈旧高度
         // 算偏移会落进空白区——切后看不到内容）
         self.chat.update(cx, |c, cx| {
-            c.rebuild_from_session();
-            c.tab = CenterTab::Conversation;
-            // 折叠状态属于会话本身：跨会话残留会让新会话按旧轮次开合
-            c.turn_expanded.clear();
-            c.turn_open = None;
+            c.display_session = None;
+            if reload_chat {
+                c.rebuild_from_session();
+                c.tab = CenterTab::Conversation;
+                // 折叠状态属于会话本身：跨会话残留会让新会话按旧轮次开合
+                c.turn_expanded.clear();
+                c.turn_open = None;
+            }
             cx.notify();
         });
+        self.peek_session = None;
         self.refresh_sidebar(cx);
         cx.notify();
     }
 
     /// Create a fresh session and make it current.
     fn new_session(&mut self, cx: &mut Context<Self>) {
-        if self.running(cx) {
+        if self.agent_busy {
+            // 新建要动 agent 会话槽（pin 事件/沙箱基准），运行中不可——
+            // 明确告知而非静默吞点击（查看其它会话仍可用）
+            self.command_notice = Some("会话运行中，完成后可新建".into());
+            cx.notify();
             return;
         }
         // web startSession：目标 = 显式选择 ?? 当前会话所属 ?? 最近工作区；
@@ -2079,7 +2218,7 @@ impl AppView {
     /// 决定会话落点）。仅当当前会话为空时重绑——新建一份挂到所选工作区
     /// 的会话，删除旧的 header-only 文件，同步 cwd/沙箱/工具工作目录。
     fn rebind_empty_session_to_workspace(&mut self, cx: &mut Context<Self>) {
-        if self.running(cx) || !self.is_empty_session(cx) {
+        if self.agent_busy || !self.is_empty_session(cx) {
             return;
         }
         let ws_path = self
@@ -2155,6 +2294,21 @@ impl AppView {
 
     fn running(&self, cx: &App) -> bool {
         self.chat.read_with(cx, |c, _| c.running())
+    }
+
+    /// 视图/运行分离模型（运行中查看式切换的三条判定收口，含单测）。
+    fn view_split(&self) -> dsh_gpui::ViewSplit {
+        dsh_gpui::ViewSplit {
+            agent_busy: self.agent_busy,
+            peeking: self.peek_session.is_some(),
+        }
+    }
+
+    /// 视图会话 id：peek 时 = 被查看的会话，否则 = agent 会话。
+    fn viewed_session_id(&self) -> SessionId {
+        self.peek_session
+            .clone()
+            .unwrap_or_else(|| self.current_session_id())
     }
 
     fn is_empty_session(&self, cx: &App) -> bool {
@@ -2632,13 +2786,21 @@ impl AppView {
             cx.notify();
             return;
         }
+        if self.view_split().composer_inert() {
+            // 异会话运行中：composer 已让位为状态条，双保险拦发送
+            return;
+        }
+        if self.view_split().needs_commit() {
+            // 空闲但视图在别处（收敛漏网）：先切到视图会话再发送
+            self.commit_peek(cx);
+        }
         let text: String =
             self.input.read_with(cx, |s, _| s.value().to_string()).trim().to_string();
         // 附件-only 发送合法（上游：draft 为空但有附件直接 commitSend）
         if text.is_empty() && self.attachments.is_empty() {
             return;
         }
-        if self.running(cx) {
+        if self.agent_busy {
             // 通用设置「繁忙时 Enter 行为」：排队投递，或打断当前轮
             match self.settings.enter {
                 EnterBehavior::Queue => {}
@@ -3596,7 +3758,7 @@ impl AppView {
         let title = self
             .sessions
             .iter()
-            .find(|s| s.id == self.current_session_id())
+            .find(|s| s.id == self.viewed_session_id())
             .map(|s| s.title.clone())
             .unwrap_or_else(|| "会话".into());
         let t_details = this.clone();
@@ -4366,9 +4528,86 @@ impl AppView {
             )))
     }
 
+    /// 异会话运行中的让位卡：状态点 + 运行会话标题 + 「返回运行中的会话」。
+    /// 上游没有这个态（web 每会话独立 runtime，切走照常能发）；rustdsh 单
+    /// runtime，运行期间只能查看——做成显式状态条而不是禁用态输入框。
+    fn composer_foreign_card(&self, this: &Entity<AppView>, card_w: f32) -> Stateful<Div> {
+        let running_id = self.current_session_id();
+        let running_title = self
+            .sessions
+            .iter()
+            .find(|m| m.id == running_id)
+            .map(|m| m.title.clone())
+            .unwrap_or_else(|| "会话".into());
+        let t_back = this.clone();
+        div()
+            .id("composer-foreign")
+            .w_full()
+            .max_w(px(card_w))
+            .mx_auto()
+            .flex_none()
+            .h(px(64.0))
+            .px(px(16.0))
+            .flex()
+            .items_center()
+            .gap_2()
+            .rounded(px(22.0))
+            .bg(theme::t().surface)
+            .shadow(theme::elevation_soft_inert())
+            // 点整条也可返回（与右侧按钮同动作）
+            .cursor_pointer()
+            .on_click({
+                let t_row = this.clone();
+                let id = running_id.clone();
+                move |_, _, cx| {
+                    let id = id.clone();
+                    t_row.update(cx, |v, cx| { v.switch_session(id, cx); });
+                }
+            })
+            .child(state_dot_ongoing("composer-run-dot"))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_size(px(theme::FONT_ROW))
+                    .line_height(px(20.0))
+                    .text_color(theme::t().text_2)
+                    .child(format!("「{running_title}」正在运行，本轮结束后可在此继续")),
+            )
+            .child(
+                div()
+                    .id("composer-foreign-back")
+                    .flex_none()
+                    .px_2()
+                    .h(px(28.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(8.0))
+                    .border(px(0.5))
+                    .border_color(theme::t().border_l3)
+                    .text_size(px(theme::FONT_ROW))
+                    .line_height(px(20.0))
+                    .text_color(theme::t().text)
+                    .hover(|s| s.bg(theme::t().surface_2))
+                    .on_click(move |_, _, cx| {
+                        let id = running_id.clone();
+                        t_back.update(cx, |v, cx| { v.switch_session(id, cx); });
+                    })
+                    .child("返回运行中的会话"),
+            )
+    }
+
     /// 输入卡（web InputBar .card）：r22、白 6% 描边、850 表面、
     /// 文本在上（16/24），控件行在下（+ / 模式 | 模型 / 发送）。
     fn composer_card(&self, this: Entity<AppView>, has_text: bool, card_w: f32, running: bool, locked: bool, slash_query: Option<&str>) -> Stateful<Div> {
+        if self.view_split().composer_inert() {
+            // 异会话运行中：整卡让位给状态条（编辑器/工具行整体卸载，
+            // 从根上避免命令、权限、模型等入口写到运行中的会话）
+            return self.composer_foreign_card(&this, card_w);
+        }
         let t_model_menu = this.clone();
 
         // 模型菜单（模型牌弹出）：各提供方分组 + 模型行，当前项带勾
@@ -5478,24 +5717,20 @@ fn main() {
                     )
                 });
 
-                // 事件泵：delta 级事件只打 ChatView——AppView 不被逐事件
-                // mutate，侧栏等兄弟子视图的 element 缓存保持有效（notify
-                // 仍沿祖先链让 AppView 壳层重渲染）；轮次边界/统计变化才
-                // 提升为宿主级 notify。
-                let chat_view = app.read(cx).chat.clone();
+                // 事件泵：走 AppView 的路由入口（运行态翻转 + 视图路由 +
+                // 轮终收敛）。delta 级事件仍只 notify ChatView——AppView
+                // 不被逐事件 notify，侧栏等兄弟子视图的 element 缓存保持
+                // 有效；peek 中运行会话的事件不进视图（照常落盘）。
                 let view = app.clone();
                 cx.spawn(move |cx: &mut AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
                         while let Ok(ev) = event_rx.recv_async().await {
-                            let app_level = cx.update_entity(&chat_view, |c: &mut ChatView, cx: &mut Context<ChatView>| {
-                                let r = c.apply_event(ev);
-                                cx.notify();
-                                r
+                            let _ = cx.update_entity(&view, |v: &mut AppView, cx: &mut Context<AppView>| {
+                                if v.on_agent_event(ev, cx) {
+                                    cx.notify();
+                                }
                             });
-                            if matches!(app_level, Ok(true)) {
-                                let _ = cx.update_entity(&view, |_: &mut AppView, cx: &mut Context<AppView>| cx.notify());
-                            }
                         }
                     }
                 })

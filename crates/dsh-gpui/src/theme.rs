@@ -218,6 +218,10 @@ pub fn is_dark() -> bool {
     t().bg_base == DARK.bg_base
 }
 
+/// 运行中状态点色（上游 StateDot ongoing：静态 scale deepseek-450，
+/// 非主题别名 token——亮暗同值）。
+pub const STATE_ONGOING_RGBA: u32 = 0x5686feff;
+
 /// 鲸像品牌标资产路径（暗色主题用白鲸、浅色主题用深鲸）。
 pub fn brand_logo() -> &'static str {
     if is_dark() {

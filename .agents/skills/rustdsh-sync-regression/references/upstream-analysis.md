@@ -3,7 +3,7 @@
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
 > **当前同步点：dsh-v0.1.5-rc.2（fb2c4b9e69）**——2026-09-11 同步（rc.1+rc.2；发布点后 master 增量 30 提交全部 subprocess/desktop/ci 面外）。此前 b2e3b2a012（0.1.5-alpha.2，2026-09-09 同步）。
 > 0.1.5-alpha.1 主面：**会话格式 v3**（system prompt 晋升 system/message 行 + request/header 去 system + PTC 改名 + canonical 信封）、composer 统计行改双图标 pill + 互斥统计对话框、SystemPromptRow（系统提示词折叠行）；Sidebar 工作区文件树/dockkit/textpreview/remotes 全链面外。
-> **最近检查：2026-09-11（定时轮 #7，零更新轮）**——上游 pull 经仓库局部代理（http.proxy=127.0.0.1:7897，SSH/HTTPS 直连被墙后的固定修复）成功，Already up to date（HEAD=master=rc.2 发布点 fb2c4b9e69），五段零差异，无动作。上轮 #6 同步结论不变。
+> **最近检查：2026-09-14（文件浏览器面重判 + 实施轮）**——上游无需新拉（本地 master c291e7961a 已含 ui-sidebar-files/documentpreview 全链；网络面 GitHub SSH/HTTPS 双断、系统代理 7897 出口坏，SSH443 握手可成但传输被掐，改用本地既有树分析）； **最近检查：2026-09-11（定时轮 #7，零更新轮）**——上游 pull 经仓库局部代理（http.proxy=127.0.0.1:7897，SSH/HTTPS 直连被墙后的固定修复）成功，Already up to date（HEAD=master=rc.2 发布点 fb2c4b9e69），五段零差异，无动作。上轮 #6 同步结论不变。
 
 ## 1. 一键差异分析
 
@@ -58,7 +58,7 @@
 | 会话格式 v3（0.1.5-alpha.1：header version 3 + agentPreset code→ptc + system prompt 晋升 `system/message` 行（head 保护/精确 replace/startSeq,endSeq 富形）+ request/header 去 system/空 tools/空 adapterDefaults + tool/code-dispatch→tool/ptc-dispatch + tools-code-mode→tools-ptc）| **面内**（已实施）| 磁盘互通；rustdsh 写 v3 + 读 v2/v3 + 写打开 v0/v1→v2→v3 级联迁移（v2.rs migrate_v2_to_v3：system promotion/PTC 改名/canonical/seq 重映射，id=v2-to-v3-system+sha256）；dsh-agent-loop 落盘序 step/start→system→user，head 归一化 replace（非 in-history 路线）|
 | SystemPromptRow（0.1.5-alpha.1：system prompt 折叠行「系统提示词」/更新行「系统提示词更新」，展开体 141px 代码块）| **面内**（已实施）| chat.rs 渲染 system/message 为 Role::Context 折叠行；上游 surface replace 语义 rustdsh 线性显示每条（偏差）|
 | composer 统计条改双图标 pill + 互斥统计对话框（3997f36999：gauge pill=轮步+TPS 开「会话统计」，database pill=总 token+缓存命中开「Token 用量」；stats.counts 去 ·；stats.dialog.* 词汇）| **面内**（已实施）| SessionStats 窗口累计（上游 deriveStats fallback fold 语义）；TTFT 会话平均；TPS 以 llm−ttft 近似 decode 窗口 |
-| Sidebar 工作区文件树全链（workspace-files 双面 API/remotes/resources/file 资源订阅/dockkit 引擎/sidebar tab+文件树/textpreview 分页 tab/deliverables 产出文件/聊天点击文件改侧栏打开）| 面外 | rustdsh 无工作区文件浏览器面（既有判定先例）；聊天文件链接维持既有打开行为（7f0a613 守卫）|
+| Sidebar 工作区文件树（ui-sidebar-files 树面 + 文本预览）| **面内**（2026-09-14 重判并实施，用户显式要求）| 曾两次判面外（rustdsh 无文件浏览器面）；用户指向 web 实装后重判：复刻用户可见面——品牌行 amber folder 胶囊切换侧栏「会话/文件」面板、文件树（懒加载层级/目录优先自然序/filetype 图标/路径头 directory 灰+name 全墨/重载/空/截断/失败行/noWorkspace）、文件点击开详情面板文本预览（分页 5000 行/换行开关/重载/失败行）。数据面本地 fs 直接实现（canonicalize 围栏 outside-workspace、条目上限 2000、页字节 2MB、整读 32MB、NUL/非 UTF-8 判非文本），词汇照 ui-sidebar-files/ui-sidebar-documentpreview locales。仍面外：dockkit tab 引擎（+/×/guide 页/多 tab）、documentpreview 富渲染器（html/pdf/markdown/image）、fs watch 变更通告（changed/reloadNow 条）、openResource 地址体系、deliverables 产出文件、聊天点击文件改侧栏打开（rustdsh 维持既有打开行为）|
 | Send busy 态系列（9a5ed6fb60 跟随 busy-Enter、2f630626b8 纯文本草稿才显模式名、8935c3d725 上传 pending 保 Send）| 面外 | rustdsh 发送钮无 busy 文案形态 |
 | 附件卡文件类型图标（0.1.5-alpha.2：4ee9e055d5 shared file type icons——FileCard 的 DocumentFileIcon → FileTypeIcon，扩展名/文件名分类 12+ 类，类色文件底 + 白 mark 双层 glyph）| **面内**（已实施）| 分类逻辑与色值照抄（传统类 + code 归并单类）；glyph 以 body/mark 双 svg 分层 tint 复刻（assets/filetype/），fold 与 body 同色（单 tint 白折角对比损失）、48 语言 CodeFileIcon 细分收敛通用 code glyph（资产不可得）|
 | transcript 设置文案中文化（'Normal'→'标准'、'Compact'→'紧凑'）| **面内**（已实施）| rustdsh 原为「常规」，改「标准」对齐 |

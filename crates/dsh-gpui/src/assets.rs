@@ -18,6 +18,10 @@ const LOCAL: &[(&str, &[u8])] = &[
     ("icons/paperclip.svg", include_bytes!("../assets/icons/paperclip.svg")),
     ("icons/document-file.svg", include_bytes!("../assets/icons/document-file.svg")),
     ("icons/clock.svg", include_bytes!("../assets/icons/clock.svg")),
+    // 工作区文件树/预览的重载钮（上游 IconRefreshOutline16 path 实值）
+    ("icons/refresh.svg", include_bytes!("../assets/icons/refresh.svg")),
+    ("icons/wrap.svg", include_bytes!("../assets/icons/wrap.svg")),
+    ("icons/nowrap.svg", include_bytes!("../assets/icons/nowrap.svg")),
     ("icons/database.svg", include_bytes!("../assets/icons/database.svg")),
     // 权限预设盾标（上游 PermissionSelect permissionGlyphs 三态 + 纯轮廓）
     ("icons/shield.svg", include_bytes!("../assets/icons/shield.svg")),
@@ -33,6 +37,8 @@ const LOCAL: &[(&str, &[u8])] = &[
         "icons/permission-full.svg",
         include_bytes!("../assets/icons/permission-full.svg"),
     ),
+    ("filetype/folder-body.svg", include_bytes!("../assets/filetype/folder-body.svg")),
+    ("filetype/folder-mark.svg", include_bytes!("../assets/filetype/folder-mark.svg")),
     ("filetype/code-body.svg", include_bytes!("../assets/filetype/code-body.svg")),
     ("filetype/excel-body.svg", include_bytes!("../assets/filetype/excel-body.svg")),
     ("filetype/html-body.svg", include_bytes!("../assets/filetype/html-body.svg")),

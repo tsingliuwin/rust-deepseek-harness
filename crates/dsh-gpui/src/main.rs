@@ -1361,7 +1361,24 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
-struct AppView {
+/// 文件预览（上游 ui-sidebar-documentpreview TextPreview 的文本子集；
+/// 宿主 = 详情面板第三变体）。分页：页 5000 行（上游 maxLines 默认）。
+pub(crate) struct FilePreview {
+    /// 绝对路径（树行经 childPath 传入）
+    pub(crate) path: String,
+    /// 已载行
+    lines: Vec<String>,
+    /// 下一页起始行号（= 已载行数）
+    loaded_through: usize,
+    /// 已到文件尾
+    eof: bool,
+    /// 自动换行（上游 wrap 开关）
+    wrap: bool,
+    /// 读取失败（失败行按上游 locales）
+    failure: Option<dsh_gpui::PreviewErrorKind>,
+}
+
+pub(crate) struct AppView {
     agent: Arc<ReactLoopAgent>,
     recorder: Arc<SessionRecorder>,
     llm: Arc<LlmRuntime>,
@@ -1489,6 +1506,8 @@ struct AppView {
     sidebar_collapsed: bool,
     sidebar_width: f32,
     details_open: bool,
+    /// 文件预览（与 selected_tool/selected_message 互斥——打开即清其余）
+    pub(crate) selected_file: Option<FilePreview>,
     /// 轨迹消息/用户 cell 详情（与 selected_tool 互斥）
     selected_message: Option<MessageDetail>,
     details_width: f32,
@@ -1698,6 +1717,7 @@ impl AppView {
             sidebar_width: SIDEBAR_DEFAULT,
             // web ui-layout init：details 0 = 启动收起，布局不持久化
             details_open: false,
+            selected_file: None,
             selected_message: None,
             details_width: DETAILS_DEFAULT,
             viewport: 1280.0,
@@ -1723,11 +1743,17 @@ impl AppView {
         let current = self.viewed_session_id();
         // 运行态状态点只画 agent 会话那一行（单 runtime，同时至多一轮在跑）
         let running = self.agent_busy.then(|| self.current_session_id());
+        // 文件树根 = 视图会话的工作区 cwd（与会话切换联动）
+        let files_root = self
+            .sessions
+            .iter()
+            .find(|m| m.id == current)
+            .and_then(|m| m.cwd.clone());
         let current_ws = self.current_workspace.clone();
         let collapsed = self.sidebar_collapsed;
         let width = self.sidebar_width;
         self.sidebar.update(cx, |s, cx| {
-            s.refresh(sessions, workspaces, archived, current, running, current_ws, collapsed, width);
+            s.refresh(sessions, workspaces, archived, current, running, files_root, current_ws, collapsed, width);
             cx.notify();
         });
     }
@@ -1925,6 +1951,92 @@ impl AppView {
             self.commit_peek(cx);
         }
         app_level
+    }
+
+    /// 打开文件预览（侧栏文件树行点击）：详情面板第三变体，互斥清其余。
+    fn open_file_preview(&mut self, path: String, cx: &mut Context<Self>) {
+        self.selected_tool = None;
+        self.selected_message = None;
+        self.details_open = true;
+        let mut preview = FilePreview {
+            path: path.clone(),
+            lines: Vec::new(),
+            loaded_through: 0,
+            eof: false,
+            wrap: self.selected_file.as_ref().map(|f| f.wrap).unwrap_or(false),
+            failure: None,
+        };
+        self.load_preview_page(&mut preview);
+        self.selected_file = Some(preview);
+        cx.notify();
+    }
+
+    /// 读一页接进预览（根 = 视图会话的工作区 cwd，与文件树同源）。
+    fn load_preview_page(&self, preview: &mut FilePreview) {
+        let Some(root) = self
+            .sessions
+            .iter()
+            .find(|m| m.id == self.viewed_session_id())
+            .and_then(|m| m.cwd.clone())
+        else {
+            preview.failure = Some(dsh_gpui::PreviewErrorKind::Unavailable(
+                "会话没有工作区目录。".into(),
+            ));
+            return;
+        };
+        match dsh_gpui::read_text_page(&root, &preview.path, preview.loaded_through) {
+            Ok(page) => {
+                preview.lines.extend(page.text.split('\n').map(str::to_string));
+                preview.loaded_through += page.lines;
+                preview.eof = page.eof;
+                preview.failure = None;
+            }
+            Err(e) => {
+                // 页失败即整预览失败面（首页失败无内容；续页失败保留已载行）
+                preview.failure = Some(e);
+            }
+        }
+    }
+
+    /// 「加载更多」：下一页。
+    fn preview_load_more(&mut self, cx: &mut Context<Self>) {
+        let mut take = false;
+        if let Some(p) = self.selected_file.as_mut() {
+            if !p.eof {
+                let p2 = std::mem::replace(
+                    p,
+                    FilePreview {
+                        path: String::new(),
+                        lines: Vec::new(),
+                        loaded_through: 0,
+                        eof: true,
+                        wrap: false,
+                        failure: None,
+                    },
+                );
+                let mut p2 = p2;
+                self.load_preview_page(&mut p2);
+                take = true;
+                self.selected_file = Some(p2);
+            }
+        }
+        let _ = take;
+        cx.notify();
+    }
+
+    /// 重读文件（上游 reload：从头再载）。
+    fn preview_reload(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_file.as_ref().map(|f| f.path.clone()) {
+            self.open_file_preview(path, cx);
+        }
+    }
+
+    /// 自动换行开关（上游 wrap.enable/disable）。
+    fn preview_toggle_wrap(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.selected_file.as_mut() {
+            p.wrap = !p.wrap;
+        }
+        cx.notify();
     }
 
     /// 收敛视图：agent 切到被查看的会话（轮终 / 发送前的安全网）。
@@ -5030,8 +5142,180 @@ impl AppView {
     fn render_details(&self, width: f32, this: Entity<AppView>) -> Div {
         let t = this.clone();
         let mut body = div().id("details-body").flex_1().min_h_0().overflow_y_scroll().px_4().py_3();
-        match (&self.selected_tool, &self.selected_message) {
-            (_, Some(m)) => {
+        match (&self.selected_file, &self.selected_tool, &self.selected_message) {
+            // 文件预览（上游 TextPreview 的文本子集）：钉住的路径头（directory
+            // 灰 + name 全墨 + 换行/重载钮）+ 滚动正文（等宽 12/20，尾页前
+            // 「加载更多」）。失败行/重试按上游 locales。
+            (Some(f), _, _) => {
+                let t_more = this.clone();
+                let t_reload = this.clone();
+                let t_wrap = this.clone();
+                let (dir_part, name_part) = match f.path.rsplit_once(['/', '\\']) {
+                    Some((d, n)) if !n.is_empty() => (d.to_string(), n.to_string()),
+                    _ => (String::new(), f.path.clone()),
+                };
+                let path_header = div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(38.0))
+                    .pl(px(12.0))
+                    .pr(px(6.0))
+                    .border_b(px(0.5))
+                    .border_color(theme::t().border_l3)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .justify_end()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_size(px(12.0))
+                            .line_height(px(18.0))
+                            .child(
+                                div().flex_none().flex()
+                                    .when(!dir_part.is_empty(), |d| {
+                                        d.child(div().text_color(theme::t().text_3).child(format!("{dir_part}/")))
+                                    })
+                                    .child(div().text_color(theme::t().text).child(name_part)),
+                            ),
+                    )
+                    .child(
+                        // 换行开关（上游 wrap.enable/disable）
+                        div()
+                            .id("preview-wrap")
+                            .size(px(28.0))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .text_color(theme::t().text_2)
+                            .cursor_pointer()
+                            .hover(|st| st.bg(theme::t().hover).text_color(theme::t().text))
+                            .tooltip(tip(if f.wrap { "取消换行" } else { "自动换行" }))
+                            .on_click(move |_, _, cx| {
+                                t_wrap.update(cx, |v, cx| v.preview_toggle_wrap(cx));
+                            })
+                            .child(
+                                svg()
+                                    .path(if f.wrap { "icons/wrap.svg" } else { "icons/nowrap.svg" })
+                                    .size(px(15.0))
+                                    .text_color(theme::t().text_2),
+                            ),
+                    )
+                    .child(
+                        // 重载（上游 reload：从头再读）
+                        div()
+                            .id("preview-reload")
+                            .size(px(28.0))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .text_color(theme::t().text_2)
+                            .cursor_pointer()
+                            .hover(|st| st.bg(theme::t().hover).text_color(theme::t().text))
+                            .tooltip(tip("重新读取文件"))
+                            .on_click(move |_, _, cx| {
+                                t_reload.update(cx, |v, cx| v.preview_reload(cx));
+                            })
+                            .child(
+                                svg()
+                                    .path("icons/refresh.svg")
+                                    .size(px(15.0))
+                                    .text_color(theme::t().text_2),
+                            ),
+                    );
+                let mut text_children: Vec<AnyElement> = Vec::new();
+                if f.lines.is_empty() {
+                    text_children.push(
+                        div()
+                            .py_2()
+                            .text_size(px(13.0))
+                            .line_height(px(20.0))
+                            .text_color(theme::t().text_2)
+                            .child(match &f.failure {
+                                Some(e) => dsh_gpui::preview_failure_line(e),
+                                None => "正在读取…".into(),
+                            })
+                            .into_any_element(),
+                    );
+                } else {
+                    for line in &f.lines {
+                        text_children.push(
+                            div()
+                                .when(!f.wrap, |d| d.whitespace_nowrap())
+                                .text_size(px(12.0))
+                                .line_height(px(20.0))
+                                .font_family(widgets::theme_mono())
+                                .text_color(theme::t().text)
+                                .child(line.clone())
+                                .into_any_element(),
+                        );
+                    }
+                }
+                if let Some(e) = &f.failure {
+                    if !f.lines.is_empty() {
+                        // 续页失败：保留已载行，失败行压在加载钮前
+                        text_children.push(
+                            div()
+                                .pt_2()
+                                .text_size(px(12.0))
+                                .line_height(px(18.0))
+                                .text_color(theme::t().error)
+                                .child(dsh_gpui::preview_failure_line(e))
+                                .into_any_element(),
+                        );
+                    }
+                }
+                if !f.eof && !f.lines.is_empty() {
+                    text_children.push(
+                        div()
+                            .id("preview-load-more")
+                            .mt_2()
+                            .mb_2()
+                            .h(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .rounded(px(8.0))
+                            .border(px(0.5))
+                            .border_color(theme::t().border_l3)
+                            .text_size(px(theme::FONT_ROW))
+                            .text_color(theme::t().text_2)
+                            .cursor_pointer()
+                            .hover(|st| st.bg(theme::t().hover).text_color(theme::t().text))
+                            .on_click(move |_, _, cx| {
+                                t_more.update(cx, |v, cx| v.preview_load_more(cx));
+                            })
+                            .child(format!("加载更多（已载 {} 行）", f.loaded_through))
+                            .into_any_element(),
+                    );
+                }
+                let text_body = div()
+                    .id("details-file-text")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_x_scroll()
+                    .overflow_y_scroll()
+                    .px_3()
+                    .py_2()
+                    .v_flex()
+                    .children(text_children);
+                body = div()
+                    .id("details-file")
+                    .flex_1()
+                    .min_h_0()
+                    .v_flex()
+                    .child(path_header)
+                    .child(text_body);
+            }
+            (None, _, Some(m)) => {
                 // 消息/用户 cell 详情：种类行 + 思考 + 正文 + usage
                 body = body
                     .child(detail_section(
@@ -5068,7 +5352,7 @@ impl AppView {
                         ))
                     });
             }
-            (None, None) => {
+            (None, None, None) => {
                 body = body.child(
                     div()
                         .py_2()
@@ -5078,7 +5362,7 @@ impl AppView {
                         .child("点击台账或消息流中的工具/消息行查看详情"),
                 );
             }
-            (Some(tool), None) => {
+            (None, Some(tool), None) => {
                 body = body
                     .child(detail_section("工具", div().text_color(theme::t().text).child(tool.name.clone())))
                     .child(detail_section(

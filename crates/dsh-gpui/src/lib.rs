@@ -255,3 +255,266 @@ impl ViewSplit {
         self.peeking = false;
     }
 }
+
+
+// --- 工作区文件树 + 文本预览（上游 ui-sidebar-files / ui-sidebar-documentpreview） ---
+
+/// 目录条目类型（上游 WorkspaceDirectoryEntry.type）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirEntryKind {
+    File,
+    Directory,
+    Other,
+}
+
+/// 目录条目（上游 WorkspaceDirectoryEntry：name/type + 文件字节数可选）。
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: DirEntryKind,
+    pub size: Option<u64>,
+}
+
+/// 一层目录的内容（上游 DirLevel）。
+#[derive(Debug, Clone)]
+pub struct DirLevel {
+    pub entries: Vec<DirEntry>,
+    /// 命中条目上限被截断（条目缺失）。
+    pub truncated: bool,
+}
+
+/// 目录列表失败（上游 workspace-file/* 代码）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesErrorKind {
+    NotFound,
+    OutsideWorkspace,
+    NotDirectory,
+    Unavailable,
+}
+
+/// 上游 ui-sidebar-files locales 的失败行。
+pub fn files_failure_line(kind: FilesErrorKind, message: &str) -> String {
+    match kind {
+        FilesErrorKind::NotFound => "这个目录不在了。可能已被移动或删除。".into(),
+        FilesErrorKind::OutsideWorkspace => "这个目录在工作区之外，侧栏不会读取它。".into(),
+        FilesErrorKind::NotDirectory => "这不是一个目录。".into(),
+        FilesErrorKind::Unavailable => format!("读取失败：{message}"),
+    }
+}
+
+/// 预览失败（上游 sidebarDocumentPreview locales 的失败行）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewErrorKind {
+    NotFound,
+    TooLarge { limit: u64 },
+    NotText,
+    NotRegularFile,
+    OutsideWorkspace,
+    Unavailable(String),
+}
+
+/// 上游 humanBytes：MB/KB 取整。
+pub fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{} MB", bytes / (1024 * 1024))
+    } else if bytes >= 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+pub fn preview_failure_line(kind: &PreviewErrorKind) -> String {
+    match kind {
+        PreviewErrorKind::NotFound => "文件不存在，可能已被移动或删除。".into(),
+        PreviewErrorKind::TooLarge { limit } => {
+            format!("单页内容超过 {} 上限，无法读取。", human_bytes(*limit))
+        }
+        PreviewErrorKind::NotText => "非文本文件，暂时无法预览。".into(),
+        PreviewErrorKind::NotRegularFile => "该路径不是普通文件，没有可显示的内容。".into(),
+        PreviewErrorKind::OutsideWorkspace => "这个文件在工作区之外，侧栏不会读取它。".into(),
+        PreviewErrorKind::Unavailable(message) => format!("读取失败：{message}"),
+    }
+}
+
+/// 自然序（上游 Intl.Collator { numeric: true, sensitivity: 'base' } 的子集：
+/// 大小写不敏感、数字段按数值比较——file2 在 file10 前）。
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn digits_from(s: &[u8], i: usize) -> (u128, usize) {
+        let mut n = 0u128;
+        let mut j = i;
+        while j < s.len() && s[j].is_ascii_digit() {
+            n = n.saturating_mul(10).saturating_add((s[j] - b'0') as u128);
+            j += 1;
+        }
+        (n, j)
+    }
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    loop {
+        if i >= ab.len() && j >= bb.len() {
+            return a.cmp(b);
+        }
+        if i >= ab.len() {
+            return std::cmp::Ordering::Less;
+        }
+        if j >= bb.len() {
+            return std::cmp::Ordering::Greater;
+        }
+        let (ca, cb) = (ab[i], bb[j]);
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let (na, ni) = digits_from(ab, i);
+            let (nb, nj) = digits_from(bb, j);
+            if na != nb {
+                return na.cmp(&nb);
+            }
+            (i, j) = (ni, nj);
+            continue;
+        }
+        let la = (ca as char).to_ascii_lowercase();
+        let lb = (cb as char).to_ascii_lowercase();
+        if la != lb {
+            return la.cmp(&lb);
+        }
+        i += 1;
+        j += 1;
+    }
+}
+
+/// 上游 orderEntries：目录在前，其余其后，组内自然序。
+pub fn order_entries(entries: &[DirEntry]) -> Vec<DirEntry> {
+    let mut v: Vec<DirEntry> = entries.to_vec();
+    v.sort_by(|left, right| {
+        let group = (right.kind == DirEntryKind::Directory)
+            .cmp(&(left.kind == DirEntryKind::Directory));
+        if group != std::cmp::Ordering::Equal {
+            group
+        } else {
+            natural_cmp(&left.name, &right.name)
+        }
+    });
+    v
+}
+
+/// 上游 childPath：父尾分隔符归一后以 `/` 拼接（只作稳定键，不涉真实分隔符）。
+pub fn child_path(parent: &str, name: &str) -> String {
+    format!("{}/{name}", parent.trim_end_matches(['/', '\\']))
+}
+
+/// 路径是否在工作区根内（分隔符归一 + 边界比较；root 本身算在内）。
+pub fn within_root(root: &str, path: &str) -> bool {
+    let norm = |s: &str| {
+        let mut t = s.replace('\\', "/");
+        while t.len() > 1 && t.ends_with('/') {
+            t.pop();
+        }
+        t.to_ascii_lowercase()
+    };
+    let (r, p) = (norm(root), norm(path));
+    p == r || p.starts_with(&format!("{r}/"))
+}
+
+/// 目录列表（本地面：上游 workspaceFiles.list 的等价；canonicalize 围栏
+/// outside-workspace 覆盖符号链接逃逸）。条目上限 2000（上游 maxEntries 默认）。
+pub const DIR_MAX_ENTRIES: usize = 2000;
+
+pub fn list_dir(root: &str, path: &str) -> Result<DirLevel, (FilesErrorKind, String)> {
+    let root_canon =
+        std::fs::canonicalize(root).map_err(|e| (FilesErrorKind::Unavailable, e.to_string()))?;
+    let canon = match std::fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err((FilesErrorKind::NotFound, String::new()));
+        }
+        Err(e) => return Err((FilesErrorKind::Unavailable, e.to_string())),
+    };
+    let (r, p) = (
+        root_canon.to_string_lossy().to_string(),
+        canon.to_string_lossy().to_string(),
+    );
+    if !within_root(&r, &p) {
+        return Err((FilesErrorKind::OutsideWorkspace, String::new()));
+    }
+    let meta = std::fs::metadata(&canon).map_err(|e| (FilesErrorKind::Unavailable, e.to_string()))?;
+    if !meta.is_dir() {
+        return Err((FilesErrorKind::NotDirectory, String::new()));
+    }
+    let rd = std::fs::read_dir(&canon).map_err(|e| (FilesErrorKind::Unavailable, e.to_string()))?;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for item in rd {
+        if entries.len() >= DIR_MAX_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let Ok(item) = item else { continue };
+        let name = item.file_name().to_string_lossy().to_string();
+        let ft = item.file_type().map_err(|e| (FilesErrorKind::Unavailable, e.to_string()))?;
+        let (kind, size) = if ft.is_dir() {
+            (DirEntryKind::Directory, None)
+        } else if ft.is_file() {
+            (DirEntryKind::File, item.metadata().ok().map(|m| m.len()))
+        } else {
+            (DirEntryKind::Other, None)
+        };
+        entries.push(DirEntry { name, kind, size });
+    }
+    Ok(DirLevel { entries, truncated })
+}
+
+/// 文本分页规格（上游 workspace-files：页行数上限 5000、页字节上限 2MB、
+/// 完整读取 32MB 拒绝、NUL 或不可解码 UTF-8 判非文本）。
+pub const PAGE_MAX_LINES: usize = 5000;
+pub const PAGE_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub const FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 一页文本（text = 本页行以 \n 连接；lines = 行数；eof = 已到文件尾）。
+#[derive(Debug, Clone)]
+pub struct TextPage {
+    pub text: String,
+    pub lines: usize,
+    pub eof: bool,
+}
+
+/// 读取一页文本：先按完整文件规格读取（32MB 上限），再切行页。
+/// 行页字节超 2MB 判 too-large（上游同语义：页超限整体拒绝，不截断）。
+pub fn read_text_page(
+    root: &str,
+    path: &str,
+    offset: usize,
+) -> Result<TextPage, PreviewErrorKind> {
+    let root_canon = std::fs::canonicalize(root)
+        .map_err(|e| PreviewErrorKind::Unavailable(e.to_string()))?;
+    let canon = match std::fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PreviewErrorKind::NotFound);
+        }
+        Err(e) => return Err(PreviewErrorKind::Unavailable(e.to_string())),
+    };
+    if !within_root(&root_canon.to_string_lossy(), &canon.to_string_lossy()) {
+        return Err(PreviewErrorKind::OutsideWorkspace);
+    }
+    let meta =
+        std::fs::metadata(&canon).map_err(|e| PreviewErrorKind::Unavailable(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(PreviewErrorKind::NotRegularFile);
+    }
+    if meta.len() > FILE_MAX_BYTES {
+        return Err(PreviewErrorKind::TooLarge { limit: FILE_MAX_BYTES });
+    }
+    let bytes = std::fs::read(&canon).map_err(|e| PreviewErrorKind::Unavailable(e.to_string()))?;
+    if bytes.contains(&0) {
+        return Err(PreviewErrorKind::NotText);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| PreviewErrorKind::NotText)?;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let start = offset.min(lines.len());
+    let end = (offset + PAGE_MAX_LINES).min(lines.len());
+    let page_lines = &lines[start..end];
+    let joined = page_lines.join("\n");
+    if joined.len() > PAGE_MAX_BYTES {
+        return Err(PreviewErrorKind::TooLarge { limit: PAGE_MAX_BYTES as u64 });
+    }
+    Ok(TextPage { text: joined, lines: page_lines.len(), eof: end >= lines.len() })
+}

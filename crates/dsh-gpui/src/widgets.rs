@@ -13,6 +13,7 @@ use gpui_component::{
 };
 
 use crate::theme;
+use crate::chat::FileKind;
 
 /// markdown 拆分：文本段 + 围栏代码段。
 enum MdSegment {
@@ -351,6 +352,33 @@ pub(crate) fn session_row(
             )
         })
 }
+/// 按类型 + 尺寸渲染的文件类型图标（上游 FileTypeIcon：28×28 方形画布
+/// body/mark 双层，body 按类色 tint、mark 白——树行/胶囊的 16px 用途；
+/// 附件卡的 24×28 拉伸形仍走 chat::file_type_icon）。
+pub(crate) fn file_kind_icon(kind: FileKind, size: f32) -> Div {
+    let stem = kind.asset_stem();
+    let mut d = div()
+        .flex_none()
+        .size(px(size))
+        .relative()
+        .child(
+            svg()
+                .path(SharedString::from(format!("filetype/{stem}-body.svg")))
+                .size_full()
+                .text_color(kind.color()),
+        );
+    if kind != FileKind::Other {
+        d = d.child(
+            svg()
+                .path(SharedString::from(format!("filetype/{stem}-mark.svg")))
+                .absolute()
+                .size_full()
+                .text_color(gpui::white()),
+        );
+    }
+    d
+}
+
 /// 行内 2×2 分隔点（web .sep）。
 pub(crate) fn dot_sep() -> Div {
     div().size(px(2.0)).rounded(px(1.0)).bg(theme::t().caption).mx_2()

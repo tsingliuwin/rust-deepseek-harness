@@ -157,6 +157,9 @@ pub(crate) struct SessionStats {
 /// 细分收敛为单一 code——语言级 glyph 资产不可得，见偏差表）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileKind {
+    /// 目录（上游 FileTypeIcon kind="folder"：amber 色板；classify 不产出，
+    /// 由文件树/胶囊直接构造）
+    Folder,
     Code,
     Excel,
     Html,
@@ -170,8 +173,9 @@ pub(crate) enum FileKind {
 }
 
 impl FileKind {
-    fn asset_stem(self) -> &'static str {
+    pub(crate) fn asset_stem(self) -> &'static str {
         match self {
+            FileKind::Folder => "folder",
             FileKind::Code => "code",
             FileKind::Excel => "excel",
             FileKind::Html => "html",
@@ -187,8 +191,9 @@ impl FileKind {
 
     /// 上游 FileTypeIcon.module.css 每类色（设计平台 static token 实值；
     /// image/video 为 css 自定义 violet）。
-    fn color(self) -> gpui::Rgba {
+    pub(crate) fn color(self) -> gpui::Rgba {
         let (r, g, b): (u8, u8, u8) = match self {
+            FileKind::Folder => (247, 173, 49),
             FileKind::Code | FileKind::Html | FileKind::Markdown => (65, 118, 230),
             FileKind::Excel => (34, 197, 94),
             FileKind::Image | FileKind::Video => (139, 118, 246),

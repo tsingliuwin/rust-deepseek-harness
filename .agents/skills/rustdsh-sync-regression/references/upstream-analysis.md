@@ -1,10 +1,10 @@
 # 上游更新分析法（模式 A 详细步骤）
 
 上游仓库：`E:\aiproject\deepseek-harness`（git）。rustdsh 是其 **web 前端（packages/client/*）+ 存储行为（storage/session）+ llm-deepseek 适配层** 的 Rust/GPUI 1:1 复刻。
-> **当前同步点：dsh-v0.1.5-rc.2（fb2c4b9e69）**——2026-09-11 同步（rc.1+rc.2；发布点后 master 增量 30 提交全部 subprocess/desktop/ci 面外）。此前 b2e3b2a012（0.1.5-alpha.2，2026-09-09 同步）。
+> **当前同步点：dsh-v0.1.6-alpha.1（0d1f50007f）**——2026-09-16 同步（发布点=master HEAD）。此前 fb2c4b9e69（0.1.5-rc.2，2026-09-11 同步）。
 > 0.1.5-alpha.1 主面：**会话格式 v3**（system prompt 晋升 system/message 行 + request/header 去 system + PTC 改名 + canonical 信封）、composer 统计行改双图标 pill + 互斥统计对话框、SystemPromptRow（系统提示词折叠行）；Sidebar 工作区文件树/dockkit/textpreview/remotes 全链面外。
 > **最近检查：2026-09-14（文件浏览器面重判 + 实施轮）**——上游无需新拉（本地 master c291e7961a 已含 ui-sidebar-files/documentpreview 全链；网络面 GitHub SSH/HTTPS 双断、系统代理 7897 出口坏，SSH443 握手可成但传输被掐，改用本地既有树分析）； **最近检查：2026-09-11（定时轮 #7，零更新轮）**——上游 pull 经仓库局部代理（http.proxy=127.0.0.1:7897，SSH/HTTPS 直连被墙后的固定修复）成功，Already up to date（HEAD=master=rc.2 发布点 fb2c4b9e69），五段零差异，无动作。上轮 #6 同步结论不变。
-> **最近检查：2026-09-15（定时轮 #8，零更新轮）**——上游 pull（SSH 首试失败、HTTPS+局部代理通道重试成功）HEAD 仍 c291e7961a（= master = rc.2 发布点，与 09-14 文件浏览器轮分析基准一致），零功能更新，无代码动作；期间本地新增鲸像更名/查看式切换/文件树右栏 dock 五提交一并随本轮推送。
+> **最近检查：2026-09-16（定时轮 #9，同步轮）**——上游发布 0.1.6-alpha.1（833 文件 +25354/-14977，存储零变更），面内一项实施（时长格式化小时段）；面内零增补外全为面外（browser-use/boot 桌面打包/terminal controller/Mermaid docs viewer）。
 
 ## 1. 一键差异分析
 
@@ -65,6 +65,11 @@
 | transcript 设置文案中文化（'Normal'→'标准'、'Compact'→'紧凑'）| **面内**（已实施）| rustdsh 原为「常规」，改「标准」对齐 |
 | deepseek 模型目录（0.1.5-rc.1/rc.2：DEFAULT_MODELS 头部插 deepseek-flash/DeepSeek-V41-Flash（vision+in-history），目录净态 V41 Flash/V4 Flash/V4 Pro/V4 Flash Vision Exp；默认 Chat Completions → V41 Flash）| **面内**（已实施）| rustdsh 落点：设置页 deepseek 内置模型行 4 条 + 启动/AppSettings 默认模型 deepseek-chat→deepseek-flash；description 文案与 image 字段无显示面不落（CatalogModel 结构差异既有偏差）|
 | Usage 对话框 cacheWrite 为 0 省行（3435dbd690 stats review 修正）| **面内**（已实施）| 统计对话框 Token 用量分支条件化 |
+| 时长格式化小时段（0.1.6-alpha.1 duration.hours：≥1h 出现「X小时X分X秒」，分秒补零）| **面内**（已实施）| format_run_duration 补小时段（统计对话框/轨迹时长列消费）；顺手清理 pill 化后的死代码链（stats_line/stats_line_text/fmt_duration）|
+| fix(chat) restore collapsed thinking by default + revert historical timing recovery（#3880 系）| 面外净零 | 两笔均 revert 上游 #3880 引入的行为；rustdsh 从未引入（思考行恒折叠、时间列走自有 time_ms 承载），净态一致 |
+| Think/compaction 头滚动吸顶（67271a921b）| 面外 | 聊天流无 sticky 渲染机制（与轨迹吸顶的固定行高模型不同构）|
+| browser-use 实验后端/MCP、boot 桌面打包（pkg/asar/runtime）、terminal-controller 新包 + 终端 launcher/shell 记忆、guide 终端菜单、draft editor 隔离、session-log 上传、Mermaid docs viewer | 面外 | 各无对应面（browser-use 工具集无/Node 打包层/终端与 guide 面/docs 站 viewer）|
+| markdown 表格 hover 高度稳定（55a17d2e57）| 面外 | vendor TextView 表格渲染面 |
 | category.service-stability 文案改「稳定性和速度」/ guide.description | 面外 | feedback 分类与 sidebar guide 面无镜像 |
 | CodeBlock contentRef/display:contents、TurnTailNodeView actions margin-top 4px | 面外 | web DOM 缝（ref/滚动端口挂载）与 DOM 流间距补偿，vendor TextView 布局模型无对应结构 |
 | sidebar guide 起始页/documentpreview 精修/preview scrollports | 面外 | Sidebar 全链面外（既有判定）|

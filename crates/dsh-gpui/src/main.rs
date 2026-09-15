@@ -1314,10 +1314,14 @@ fn format_tokens_exact(value: u64) -> String {
 /// 用时（web formatRunDuration：分秒 `{m}分{ss}秒` / `{s}秒`）。
 fn format_run_duration(ms: u64) -> String {
     let total = ms / 1000;
-    let minutes = total / 60;
+    let hours = total / 3600;
+    let minutes = (total / 60) % 60;
     let seconds = total % 60;
-    if minutes > 0 {
-        format!("{minutes}分{:02}秒", seconds)
+    if hours > 0 {
+        // 0.1.6-alpha.1 duration.hours：小时段出现时分秒补零（上游 message-chrome 同式）
+        format!("{hours}小时{minutes:02}分{seconds:02}秒")
+    } else if minutes > 0 {
+        format!("{minutes}分{seconds:02}秒")
     } else {
         format!("{seconds}秒")
     }

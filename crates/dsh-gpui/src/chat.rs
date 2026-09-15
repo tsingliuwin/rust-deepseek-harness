@@ -579,18 +579,6 @@ impl ChatView {
         self.list_bottom.get()
     }
 
-    /// web StatsLine 文本（组内数据缺失时整组省略）。
-    pub(crate) fn stats_line(&self) -> String {
-        stats_line_text(
-            self.stats_turns,
-            self.stats_steps,
-            self.session_llm_time,
-            self.session_tool_time,
-            self.stats_input_tokens,
-            self.stats_output_tokens,
-            self.stats_cache_read,
-        )
-    }
 
     /// composer 下方统计 pill 的数据（web StatsPills：窗口 fold fallback 语义，
     /// 持久投影无镜像——数值为实时窗口累计）。
@@ -4023,52 +4011,7 @@ fn ms_ago(anchor_ms: Option<u64>) -> Option<Instant> {
     Instant::now().checked_sub(d)
 }
 
-/// 时长格式（web formatDuration 风格：<60s 一位小数秒，否则 分+秒）。
-fn fmt_duration(d: std::time::Duration) -> String {
-    let secs = d.as_secs_f64();
-    if secs < 60.0 {
-        format!("{secs:.1}s")
-    } else {
-        format!("{}m{}s", secs as u64 / 60, (secs as u64) % 60)
-    }
-}
 
-/// web StatsLine 文本：组按「 | 」连接，无数据的组整段丢弃——
-/// 计数（轮·步）、耗时（LLM/工具调用）、token（缓存命中 + 输入/输出）。
-fn stats_line_text(
-    turns: u64,
-    steps: u64,
-    llm: std::time::Duration,
-    tool: std::time::Duration,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read: u64,
-) -> String {
-    let mut groups: Vec<String> = Vec::new();
-    if steps > 0 {
-        groups.push(format!("{turns} 轮 · {steps} 步"));
-        let mut durations: Vec<String> = Vec::new();
-        if llm.as_secs_f64() > 0.0 {
-            durations.push(format!("LLM {}", fmt_duration(llm)));
-        }
-        if tool.as_secs_f64() > 0.0 {
-            durations.push(format!("工具调用 {}", fmt_duration(tool)));
-        }
-        if !durations.is_empty() {
-            groups.push(durations.join(" · "));
-        }
-    }
-    if input_tokens > 0 || output_tokens > 0 {
-        // 计费输入 = 总输入 − 缓存读（web billedInputTokens）
-        let billed = input_tokens.saturating_sub(cache_read);
-        if cache_read > 0 {
-            let pct = cache_read as f64 / (cache_read + billed) as f64 * 100.0;
-            groups.push(format!("缓存命中 {pct:.0}%"));
-        }
-        groups.push(format!("输入 {billed} tok · 输出 {output_tokens} tok"));
-    }
-    groups.join(" | ")
-}
 
 /// 助手消息完成后的 footer（web turn tail）：复制按钮（悬停显现）+
 /// 「用量」「用时」两个统计药丸（各自点击弹出详情对话框，TurnUsagePanel
